@@ -2,9 +2,8 @@
 
 > **Your AI agent can look. For everything else — nyet.**
 
-Бренд/крейт — `nyetdb`, бинарник — `nyet`. Статус: черновик до начала
-разработки. Решения ниже — предложения; спорные места помечены `[?]` и собраны
-в конце в «Открытых вопросах».
+Бренд/крейт — `nyetdb`, бинарник — `nyet`. Статус: решения согласованы
+(июль 2026), можно начинать v0.1.
 
 ---
 
@@ -112,9 +111,14 @@ format = "json"
 engine = "postgres"                    # postgres | mysql | sqlite (v0.2) | ...
 url = "postgres://nyet_ro@db.internal:5432/app"
 password_env = "PROD_DB_PASSWORD"      # имя env-переменной; в конфиге пароля нет
-allowed_dirs = ["~/Workspace/app"]     # пусто/отсутствует = запрещено везде [?]
+allowed_dirs = ["~/Workspace/app"]     # пусто/отсутствует = запрещено везде
 row_limit = 500
 timeout_secs = 10
+
+[connections.prod.validator]
+allow_functions = ["pg_sleep"]         # убрать из встроенного denylist (осознанный риск)
+deny_functions  = ["my_scary_fn"]      # добавить свои запреты
+# для Redis/Mongo (v0.4) — та же пара: allow_commands / deny_commands
 
 [connections.prod.ssh]
 host = "deploy@bastion.corp:22"
@@ -133,11 +137,16 @@ allowed_dirs = ["~/Workspace/app"]
   `${VAR}` в любых строковых значениях. Отсутствующая переменная — жёсткая
   ошибка (exit 3), не пустая строка.
 - **Права файла**: если у конфига есть group/other-биты — warning в stderr при
-  каждом запуске + пункт в `doctor`. `[?]` не отказ, чтобы не ломать нестандартные
+  каждом запуске + пункт в `doctor`. Не отказ — чтобы не ломать нестандартные
   сетапы (CI, контейнеры).
 - **`allowed_dirs`**: сравнение канонизированных путей (realpath, симлинки
   разрешаются, `~` раскрывается) по префиксу. Глобов в v0.1 нет. cwd берётся
   из процесса; это UX-барьер, не security boundary (см. threat model).
+  Пустой или отсутствующий `allowed_dirs` = запрещено везде (fail closed);
+  «доступно отовсюду» задаётся явно: `allowed_dirs = ["~"]`.
+- **`validator.allow_functions` / `deny_functions`**: правят встроенный
+  denylist per-connection. Policy настраивается; внутренняя механика
+  (как получается классификация) — нет.
 - Неизвестные ключи в конфиге — жёсткая ошибка (fail loud, ловит опечатки).
 
 ---
@@ -169,8 +178,9 @@ allowed_dirs = ["~/Workspace/app"]
    функции, которые работают даже в read-only транзакции — для PostgreSQL:
    `pg_terminate_backend`, `pg_cancel_backend`, `pg_reload_conf`, `pg_promote`,
    `pg_sleep`, `pg_read_file`, `lo_import`, `dblink*` → deny `DENIED_FUNCTION`.
-   `[?]` — список стартовый, пополняется; `pg_sleep` спорен (DoS vs легитимный
-   тест).
+   Список стартовый и пополняется. `pg_sleep` — deny (тихий DoS через занятие
+   пула соединений; агенту незачем, легитимный кейс редкий и ручной).
+   Переопределяется в конфиге: `validator.allow_functions` / `deny_functions`.
 
 Вердикт: `Allow { warnings } | Deny { reason, message, hint }`.
 
@@ -195,7 +205,10 @@ zero-width unicode, denylist-функции), а также представит
 ### Не-SQL движки (v0.4, эскиз)
 
 - Redis: классификация по флагам из `COMMAND INFO` (write/readonly) — allowlist
-  генерируется из самой базы; `[?]` кэшировать или запрашивать на коннект.
+  генерируется из самой базы. Без кэша: запрашивается при коннекте (один
+  дешёвый roundtrip, всегда соответствует версии сервера); кэш станет
+  естественным свойством connection daemon (v0.5), если тот появится.
+  Переопределение policy — `validator.allow_commands` / `deny_commands`.
 - MongoDB: собственный allowlist read-команд (find, aggregate без `$out`/`$merge`,
   count, distinct, listCollections, ...). Aggregate-пайплайны сканируются на
   пишущие стадии.
@@ -239,13 +252,17 @@ zero-width unicode, denylist-функции), а также представит
 
 ---
 
-## Открытые вопросы `[?]`
+## Журнал решений (июль 2026)
 
-1. Пустой/отсутствующий `allowed_dirs` — «запрещено везде» (безопаснее) или
-   «разрешено везде» (удобнее для localdev)? Предложение: запрещено; для
-   localdev пользователь явно пишет `allowed_dirs = ["~"]`.
-2. Права конфига: warning или отказ при group/other-битах?
-3. `pg_sleep` в denylist — deny или warn?
-4. jsonl: конверт в stderr — ок для агентов или лучше финальной строкой в
-   stdout с ключом-маркером?
-5. Кэшировать ли `COMMAND INFO` Redis между запусками.
+1. Пустой/отсутствующий `allowed_dirs` → **запрещено везде** (fail closed);
+   «отовсюду» — явный `allowed_dirs = ["~"]`.
+2. Права конфига с group/other-битами → **warning** в stderr + пункт в
+   `doctor`, не отказ (не ломаем CI/контейнеры).
+3. `pg_sleep` → **deny** (тихий DoS через пул соединений); denylist
+   переопределяется в конфиге (`validator.allow_functions`/`deny_functions`).
+4. jsonl → **конверт одной JSON-строкой в stderr**, stdout — чистый поток
+   строк данных.
+5. Redis `COMMAND INFO` → **без кэша**, запрос при коннекте; кэш — только
+   как естественное свойство connection daemon (v0.5). Механика получения
+   классификации не настраивается — настраивается только policy
+   (`allow_commands`/`deny_commands`).
