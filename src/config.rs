@@ -18,6 +18,10 @@ pub struct Config {
 pub struct Defaults {
     pub row_limit: Option<u64>,
     pub timeout_secs: Option<u64>,
+    // Routing reads this via peek_defaults_format() BEFORE the semantic parse
+    // (so a config error still routes by it); the field stays only so
+    // deny_unknown_fields accepts the key here.
+    #[allow(dead_code)]
     pub format: Option<String>,
 }
 
@@ -40,8 +44,6 @@ pub struct Connection {
     pub ssh: Option<Ssh>,
 }
 
-// Accepted now so configs written for later steps stay valid; used in step 3.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Validator {
@@ -115,6 +117,22 @@ pub fn parse(text: &str, env: EnvLookup) -> Result<Config, ConfigError> {
         )?;
     }
     Ok(config)
+}
+
+/// The raw `[defaults].format` string, read from a structural TOML parse
+/// only — no substitution, no semantic validation. The cli resolves the
+/// envelope-routing format from this BEFORE the full semantic parse, so a
+/// config error (e.g. `row_limit = 0`) still routes its error envelope by
+/// the configured format instead of defaulting to json/stdout. Returns None
+/// if the TOML is malformed or the key is absent/non-string (routing then
+/// falls back to the flag, then json).
+pub fn peek_defaults_format(text: &str) -> Option<String> {
+    toml::from_str::<toml::Value>(text)
+        .ok()?
+        .get("defaults")?
+        .get("format")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Zero limits are footguns: row_limit = 0 returns nothing (looking like an

@@ -1,6 +1,7 @@
 # Golden corpus — statements that must be denied (SQLite dialect).
-# Every deny carries a reason from the closed list:
-# PARSE_FAILED | MULTI_STATEMENT | WRITE_OPERATION | TXN_CONTROL.
+# Every deny carries a reason from the closed list (see enum DenyReason in
+# src/validator.rs): PARSE_FAILED | MULTI_STATEMENT | WRITE_OPERATION |
+# TXN_CONTROL | LOCKING_CLAUSE | DENIED_FUNCTION.
 
 # --- writes / DDL ---
 - query: INSERT INTO users (id, email) VALUES (1, 'a@b.c')
@@ -114,3 +115,103 @@
 - query: SELECT * FROM
   verdict: deny
   reason: PARSE_FAILED
+
+# --- writes nested deeper in the tree (recursive AST walk, DESIGN §3 п.5) ---
+- query: WITH x AS (DELETE FROM t) SELECT 1
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: WITH x AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM x
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SELECT * FROM (DELETE FROM t RETURNING *) d
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SELECT * FROM users JOIN (UPDATE t SET a = 1 RETURNING *) u ON u.id = users.id
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SELECT 1 WHERE EXISTS (SELECT 1 FROM (DELETE FROM t) q)
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SELECT (SELECT 1 FROM (INSERT INTO t VALUES (1) RETURNING id) q)
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: EXPLAIN SELECT * FROM (DELETE FROM t) d
+  verdict: deny
+  reason: WRITE_OPERATION
+# nested EXPLAIN is a parser error in sqlparser -> fail closed
+- query: EXPLAIN EXPLAIN SELECT 1
+  verdict: deny
+  reason: PARSE_FAILED
+
+# --- locking clauses (DESIGN §3 п.6) ---
+- query: SELECT * FROM users FOR UPDATE
+  verdict: deny
+  reason: LOCKING_CLAUSE
+- query: SELECT * FROM users FOR SHARE
+  verdict: deny
+  reason: LOCKING_CLAUSE
+- query: WITH x AS (SELECT 1) SELECT * FROM x FOR UPDATE
+  verdict: deny
+  reason: LOCKING_CLAUSE
+
+# --- function denylist (DESIGN §3 п.7; rationale in docs/DEV.md) ---
+- query: SELECT load_extension('/tmp/evil.so')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# case-insensitive
+- query: SELECT LOAD_EXTENSION('/tmp/evil.so')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# qualified name
+- query: SELECT main.load_extension('/tmp/evil.so')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT writefile('/tmp/x', 'data')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT readfile('/etc/passwd')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT edit('x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT fts3_tokenizer('simple')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# denied function outside the projection
+- query: SELECT 1 FROM t WHERE load_extension('x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# table-valued-function call syntax
+- query: SELECT * FROM load_extension('x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# denied function via LATERAL table factor (TableFactor::Function — bypassed
+# the projection/Table-args checks before the fix)
+- query: SELECT * FROM LATERAL load_extension('x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# denied function via TABLE(...) table factor (inner Expr::Function)
+- query: SELECT * FROM TABLE(load_extension('x'))
+  verdict: deny
+  reason: DENIED_FUNCTION
+# nested locking clause: FOR UPDATE on a CTE's inner query (pins that
+# pre_visit_query runs for nested queries, not just the outer one)
+- query: WITH x AS (SELECT * FROM users FOR UPDATE) SELECT * FROM x
+  verdict: deny
+  reason: LOCKING_CLAUSE
+
+# savepoint statements are transaction control
+- query: SAVEPOINT s
+  verdict: deny
+  reason: TXN_CONTROL
+- query: RELEASE SAVEPOINT s
+  verdict: deny
+  reason: TXN_CONTROL
+# ROLLBACK TO SAVEPOINT parses as Rollback -> same TXN_CONTROL branch
+- query: ROLLBACK TO SAVEPOINT s
+  verdict: deny
+  reason: TXN_CONTROL

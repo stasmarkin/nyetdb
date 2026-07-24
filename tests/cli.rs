@@ -729,7 +729,7 @@ fn defaults_format_applies_to_query_and_list_flag_wins() {
 
 #[test]
 fn unsupported_defaults_format_is_exit_3() {
-    let (tmp, cfg) = sqlite_fixture("[defaults]\nformat = \"csv\"\n");
+    let (tmp, cfg) = sqlite_fixture("[defaults]\nformat = \"xml\"\n");
     let out = nyet(tmp.path())
         .args(["query", "db", "SELECT 1", "--config"])
         .arg(&cfg)
@@ -796,6 +796,27 @@ fn zero_limits_in_config_are_exit_3() {
         assert_eq!(v["error"]["code"], "CONFIG_INVALID");
         assert!(v["error"]["hint"].as_str().unwrap().contains("at least 1"));
     }
+}
+
+#[test]
+fn defaults_format_csv_routes_config_error_envelope_to_stderr() {
+    // The routing format is resolved from a raw peek of [defaults].format
+    // BEFORE the semantic config parse, so a config error (row_limit = 0)
+    // under format = "csv" still routes: stdout is data-only (empty here),
+    // the error envelope goes to stderr. Exit 3 either way.
+    let (tmp, cfg) = sqlite_fixture("[defaults]\nformat = \"csv\"\nrow_limit = 0\n");
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(stdout(&out), "");
+    let all = stderr(&out);
+    let v: serde_json::Value = serde_json::from_str(all.trim().lines().last().unwrap()).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "CONFIG_INVALID");
 }
 
 #[test]
@@ -872,6 +893,255 @@ fn nyet_refusal_with_table_format_goes_to_stderr() {
     let v: serde_json::Value = serde_json::from_str(line.trim().lines().last().unwrap()).unwrap();
     assert_eq!(v["error"]["code"], "NYET");
     assert_eq!(v["error"]["reason"], "WRITE_OPERATION");
+}
+
+#[test]
+fn query_jsonl_streams_rows_on_stdout_envelope_on_stderr() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id, email FROM users ORDER BY id",
+            "--format",
+            "jsonl",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    // Snapshot: one compact JSON object per row, column order preserved.
+    assert_eq!(
+        stdout(&out),
+        "{\"id\":1,\"email\":\"a@b.c\"}\n{\"id\":2,\"email\":\"d@e.f\"}\n{\"id\":3,\"email\":null}\n"
+    );
+    let v = success_envelope(stderr(&out).trim().lines().last().unwrap());
+    assert_eq!(v["meta"]["row_count"], 3);
+    assert!(
+        v.get("rows").is_none(),
+        "jsonl envelope must not carry rows"
+    );
+}
+
+#[test]
+fn query_jsonl_error_keeps_stdout_empty() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "DELETE FROM users",
+            "--format",
+            "jsonl",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    // Envelope placement is decided by the format, not the outcome.
+    assert_eq!(stdout(&out), "");
+    let all = stderr(&out);
+    let v: serde_json::Value = serde_json::from_str(all.trim().lines().last().unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "NYET");
+    assert_eq!(v["error"]["reason"], "WRITE_OPERATION");
+}
+
+#[test]
+fn query_csv_quotes_commas_quotes_and_newlines() {
+    let (tmp, cfg) = sqlite_fixture("");
+    // A fixture row exercising every RFC 4180 quoting trigger + NULL.
+    let sql = "SELECT 'com,ma' AS a, 'qu\"ote' AS b, 'li' || char(10) || 'ne' AS c, \
+               NULL AS d, 42 AS e";
+    let out = nyet(tmp.path())
+        .args(["query", "db", sql, "--format", "csv", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // Snapshot: header + one record; NULL renders as an empty field.
+    assert_eq!(
+        stdout(&out),
+        "a,b,c,d,e\n\"com,ma\",\"qu\"\"ote\",\"li\nne\",,42\n"
+    );
+    let v = success_envelope(stderr(&out).trim().lines().last().unwrap());
+    assert_eq!(v["meta"]["row_count"], 1);
+}
+
+#[test]
+fn query_csv_error_keeps_stdout_empty() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT * FROM no_such_table",
+            "--format",
+            "csv",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(stdout(&out), "");
+    let all = stderr(&out);
+    let v: serde_json::Value = serde_json::from_str(all.trim().lines().last().unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "DB_ERROR");
+}
+
+#[test]
+fn list_rejects_jsonl_and_csv_flags_as_usage_errors() {
+    // DESIGN gives list only json|table; jsonl/csv are row-stream formats.
+    let (tmp, cfg) = sqlite_fixture("");
+    for format in ["jsonl", "csv"] {
+        let out = nyet(tmp.path())
+            .args(["list", "--format", format, "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{format}");
+    }
+}
+
+#[test]
+fn list_degrades_jsonl_config_default_to_json() {
+    // [defaults].format = "jsonl" serves query workflows; list has no row
+    // stream, so it falls back to json instead of failing.
+    let (tmp, cfg) = sqlite_fixture("[defaults]\nformat = \"jsonl\"\n");
+    let out = nyet(tmp.path())
+        .args(["list", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["ok"], true);
+    assert!(v["connections"].is_array(), "{v}");
+}
+
+#[test]
+fn list_degrades_csv_config_default_to_json() {
+    // Same degrade path for csv (symmetric with the jsonl case): list has no
+    // row stream, so a csv [defaults].format falls back to a json envelope.
+    let (tmp, cfg) = sqlite_fixture("[defaults]\nformat = \"csv\"\n");
+    let out = nyet(tmp.path())
+        .args(["list", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["ok"], true);
+    assert!(v["connections"].is_array(), "{v}");
+}
+
+#[test]
+fn unicode_stripped_query_succeeds_with_warning() {
+    let (tmp, cfg) = sqlite_fixture("");
+    // Zero-width joiner inside SELECT: stripped, validated, executed.
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SEL\u{200D}ECT count(*) AS n FROM users",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["rows"], serde_json::json!([{"n": 3}]));
+    assert_eq!(v["warnings"][0]["code"], "UNICODE_STRIPPED");
+    assert!(v["warnings"][0]["message"].is_string());
+}
+
+#[test]
+fn denied_function_is_exit_5_with_reason_and_hint() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT load_extension('/tmp/evil.so')",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "NYET");
+    assert_eq!(v["error"]["reason"], "DENIED_FUNCTION");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("load_extension"),
+        "{v}"
+    );
+    assert!(
+        v["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("allow_functions"),
+        "{v}"
+    );
+}
+
+#[test]
+fn config_deny_functions_blocks_and_allow_functions_permits() {
+    // deny_functions adds a builtin SQLite function to the denylist...
+    let (tmp, cfg) = sqlite_fixture("");
+    let cfg_text = format!(
+        "{}\n[connections.db.validator]\ndeny_functions = [\"abs\"]\n",
+        fs::read_to_string(&cfg).unwrap()
+    );
+    fs::write(&cfg, cfg_text).unwrap();
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT abs(-1) AS a", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["reason"], "DENIED_FUNCTION");
+
+    // ...allow_functions removes a builtin denylist entry: the validator
+    // passes and the refusal (if any) now comes from the database, not nyet.
+    let (tmp, cfg) = sqlite_fixture("");
+    let cfg_text = format!(
+        "{}\n[connections.db.validator]\nallow_functions = [\"load_extension\"]\n",
+        fs::read_to_string(&cfg).unwrap()
+    );
+    fs::write(&cfg, cfg_text).unwrap();
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT load_extension('/no/such.so')",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(5), "validator must not refuse");
+    let all = stdout(&out);
+    let v: serde_json::Value = serde_json::from_str(all.trim()).unwrap();
+    assert_ne!(v["error"]["code"], "NYET", "{v}");
 }
 
 #[cfg(unix)]

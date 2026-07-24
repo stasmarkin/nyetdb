@@ -11,7 +11,7 @@ mod validator;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use engine::Engine;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -37,7 +37,7 @@ enum Command {
     List {
         /// Output format (default: [defaults].format from the config, then json)
         #[arg(long, value_enum)]
-        format: Option<Format>,
+        format: Option<ListFormat>,
     },
     /// Run a read-only query against a connection
     Query {
@@ -62,7 +62,27 @@ enum Command {
 #[derive(Clone, Copy, ValueEnum)]
 enum Format {
     Json,
+    Jsonl,
     Table,
+    Csv,
+}
+
+/// `list` has no row stream, so jsonl/csv make no sense there (DESIGN §1
+/// gives list json|table only); a separate clap enum makes `--format jsonl`
+/// a native usage error (exit 2) instead of a runtime refusal.
+#[derive(Clone, Copy, ValueEnum)]
+enum ListFormat {
+    Json,
+    Table,
+}
+
+impl ListFormat {
+    fn as_format(self) -> Format {
+        match self {
+            ListFormat::Json => Format::Json,
+            ListFormat::Table => Format::Table,
+        }
+    }
 }
 
 /// Closed list of error codes: the single owner of the code<->exit mapping.
@@ -133,20 +153,49 @@ impl Failure {
 
 /// The single owner of stream routing (DESIGN §1): the envelope's place is
 /// decided by the format, not the outcome. json — the envelope is the whole
-/// stdout output; table — data on stdout, envelope as one JSON line on
-/// stderr. Write failures (closed pipe) are ignored, not panics — the exit
-/// code still carries the contract; the writes are independent so a failed
-/// stdout write cannot swallow the stderr envelope.
-fn emit(format: Format, data: &str, envelope: &str) {
+/// stdout output; table/jsonl/csv — data on stdout, envelope as one JSON
+/// line on stderr. The stderr envelope write is always best-effort (a gone
+/// consumer must not swallow it). The stdout (data) write is best-effort for
+/// a closed pipe — the consumer walked away, that is graceful — but a real
+/// failure (e.g. a full disk) is returned as Err so the caller does NOT
+/// then claim success: silently dropping query output while reporting ok is
+/// exactly the data loss to avoid. No panics either way.
+fn emit(format: Format, data: &str, envelope: &str) -> io::Result<()> {
     match format {
-        Format::Json => {
-            let _ = writeln!(std::io::stdout(), "{envelope}");
-        }
-        Format::Table => {
-            let _ = write!(std::io::stdout(), "{data}");
+        // The envelope IS the whole stdout output here, so it is the data.
+        Format::Json => write_stdout(format!("{envelope}\n").as_bytes()),
+        Format::Jsonl | Format::Table | Format::Csv => {
+            let result = write_stdout(data.as_bytes());
             let _ = writeln!(std::io::stderr(), "{envelope}");
+            result
         }
     }
+}
+
+/// Write to stdout, treating a closed pipe (consumer exited) as graceful
+/// success and surfacing every other error (the data was lost).
+fn write_stdout(bytes: &[u8]) -> io::Result<()> {
+    match std::io::stdout().write_all(bytes) {
+        Err(e) if !broken_pipe(&e) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// A closed pipe means the consumer walked away — graceful, exit 0. Any
+/// other write error is real output loss and must fail loudly.
+fn broken_pipe(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::BrokenPipe
+}
+
+/// stdout write failed for something other than a gone consumer (e.g. a
+/// full disk): the query output is lost, so fail loudly instead of claiming
+/// success.
+fn output_write_failure(e: io::Error) -> Failure {
+    Failure::new(
+        ErrorCode::Internal,
+        format!("failed to write query output to stdout: {e}"),
+        "check the output stream and free disk space, then retry",
+    )
 }
 
 fn main() -> ExitCode {
@@ -155,7 +204,8 @@ fn main() -> ExitCode {
     // Effective format for envelope routing. Before the config is read only
     // the flag is known; run() updates this once [defaults].format applies.
     let mut format = match &cli.command {
-        Command::List { format } | Command::Query { format, .. } => *format,
+        Command::List { format } => format.map(ListFormat::as_format),
+        Command::Query { format, .. } => *format,
     }
     .unwrap_or(Format::Json);
     match run(cli, &mut format) {
@@ -163,7 +213,9 @@ fn main() -> ExitCode {
         Err(f) => {
             let envelope =
                 output::error_json(f.code.as_str(), f.code.reason(), &f.message, &f.hint);
-            emit(format, "", &envelope);
+            // Best-effort: we are already failing, and there is no data to
+            // lose (the envelope goes out; its write failing changes nothing).
+            let _ = emit(format, "", &envelope);
             ExitCode::from(f.code.exit())
         }
     }
@@ -174,16 +226,28 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
     let text = read_config(&path)?;
     warn_bad_permissions(&path);
 
+    // Routing format is settled from a raw peek of [defaults].format BEFORE
+    // the semantic config parse — so a config error (e.g. row_limit = 0)
+    // under [defaults].format = "csv" still routes its envelope by that
+    // format (data stream on stdout, envelope on stderr) instead of
+    // defaulting to json on stdout.
+    let format = resolve_format(
+        match &cli.command {
+            Command::List { format } => format.map(ListFormat::as_format),
+            Command::Query { format, .. } => *format,
+        },
+        config::peek_defaults_format(&text).as_deref(),
+    )?;
+    // list has no row stream, so a jsonl/csv [defaults].format (set for
+    // query workflows) degrades to json for it — documented in README.
+    let format = match (&cli.command, format) {
+        (Command::List { .. }, Format::Jsonl | Format::Csv) => Format::Json,
+        (_, f) => f,
+    };
+    *route_format = format;
+
     let cfg = config::parse(&text, &|name: &str| std::env::var(name))
         .map_err(|e| config_failure(e, &path))?;
-
-    // Format is settled immediately after the config parses — before any
-    // other check — so every later error routes to the right stream.
-    let format = match &cli.command {
-        Command::List { format } | Command::Query { format, .. } => *format,
-    };
-    let format = resolve_format(format, cfg.defaults.format.as_deref())?;
-    *route_format = format;
 
     let cwd = std::env::current_dir()
         .and_then(|d| d.canonicalize())
@@ -212,10 +276,11 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 })
                 .collect();
             let (data, envelope) = match format {
-                Format::Json => (String::new(), output::list_json(&items)),
                 Format::Table => (output::list_table(&items), output::bare_success()),
+                // Only Json remains: jsonl/csv were degraded to json above.
+                _ => (String::new(), output::list_json(&items)),
             };
-            emit(format, &data, &envelope);
+            emit(format, &data, &envelope).map_err(output_write_failure)?;
             Ok(())
         }
         Command::Query {
@@ -292,18 +357,40 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             };
 
             // Layer 1: the validator. Any deny -> code NYET + reason, exit 5.
-            if let validator::Verdict::Deny {
-                reason,
-                message,
-                hint,
-            } = validator::validate(&query)
-            {
-                return Err(Failure::new(
-                    ErrorCode::Nyet(reason.as_str()),
+            // The per-connection policy tunes only the function denylist.
+            let policy = match &conn.validator {
+                Some(v) => validator::Policy::sqlite(
+                    v.allow_functions.as_deref().unwrap_or(&[]),
+                    v.deny_functions.as_deref().unwrap_or(&[]),
+                ),
+                None => validator::Policy::sqlite(&[], &[]),
+            };
+            let (query, mut warnings) = match validator::validate(&query, &policy) {
+                validator::Verdict::Deny {
+                    reason,
                     message,
                     hint,
-                ));
-            }
+                } => {
+                    return Err(Failure::new(
+                        ErrorCode::Nyet(reason.as_str()),
+                        message,
+                        hint,
+                    ))
+                }
+                // Execute the NORMALIZED text — it is what the validator
+                // classified; running the original would reopen the gap
+                // Unicode stripping closes.
+                validator::Verdict::Allow { sql, warnings } => (
+                    sql,
+                    warnings
+                        .into_iter()
+                        .map(|w| output::Warning {
+                            code: w.code,
+                            message: w.message,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            };
 
             // Flag > per-connection > [defaults] > built-in.
             let limit = limit
@@ -369,7 +456,6 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 rs.rows
                     .truncate(usize::try_from(limit).unwrap_or(usize::MAX));
             }
-            let mut warnings = Vec::new();
             if truncated {
                 warnings.push(output::Warning {
                     code: "TRUNCATED",
@@ -378,16 +464,16 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     ),
                 });
             }
-            // Duplicate column names collapse in json row objects (later
-            // values overwrite earlier ones in most JSON parsers) — never
-            // let that happen silently.
+            // Warned for every format (json/jsonl collapse same-named keys to
+            // the last value; table/csv keep the columns but the ambiguity is
+            // still worth flagging) — so the message stays format-neutral.
             let duplicates = duplicate_columns(&rs.columns);
             if !duplicates.is_empty() {
                 warnings.push(output::Warning {
                     code: "DUPLICATE_COLUMNS",
                     message: format!(
-                        "duplicate column names in the result: {}; in json rows the last \
-                         value wins — use AS aliases to keep every column",
+                        "duplicate column name(s): {}; disambiguate with AS aliases — \
+                         in JSON/JSONL output duplicates collapse to the last value",
                         duplicates.join(", ")
                     ),
                 });
@@ -403,12 +489,20 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     String::new(),
                     output::query_json(&rs.columns, &rs.rows, &meta, &warnings),
                 ),
+                Format::Jsonl => (
+                    output::query_jsonl(&rs.columns, &rs.rows),
+                    output::query_meta_json(&meta, &warnings),
+                ),
                 Format::Table => (
                     output::query_table(&rs.columns, &rs.rows),
                     output::query_meta_json(&meta, &warnings),
                 ),
+                Format::Csv => (
+                    output::query_csv(&rs.columns, &rs.rows),
+                    output::query_meta_json(&meta, &warnings),
+                ),
             };
-            emit(format, &data, &envelope);
+            emit(format, &data, &envelope).map_err(output_write_failure)?;
             Ok(())
         }
     }
@@ -558,5 +652,22 @@ fn warn_bad_permissions(path: &Path) {
                 let _ = writeln!(std::io::stderr(), "warning: {}: {warning}", path.display());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broken_pipe_is_the_only_graceful_write_error() {
+        // A gone consumer (closed pipe) is graceful; a full disk (or any
+        // other write error) is real output loss and must fail loudly.
+        assert!(broken_pipe(&io::Error::from(io::ErrorKind::BrokenPipe)));
+        assert!(!broken_pipe(&io::Error::from(io::ErrorKind::Other)));
+        // Naming an exit code for the loud path: INTERNAL -> exit 1.
+        let f = output_write_failure(io::Error::from(io::ErrorKind::Other));
+        assert_eq!(f.code.exit(), 1);
+        assert!(!f.hint.is_empty());
     }
 }

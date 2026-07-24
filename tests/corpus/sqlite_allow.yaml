@@ -67,3 +67,19 @@
   verdict: allow
 - query: SHOW CHARSET
   verdict: allow
+
+# --- functions: the denylist blocks calls, not names in general ---
+- query: SELECT length(email), abs(id) FROM users
+  verdict: allow
+- query: SELECT * FROM pragma_table_info('users')
+  verdict: allow
+# a COLUMN merely named like a denied function is not a call
+- query: SELECT load_extension FROM t
+  verdict: allow
+# a plain TABLE named like a denied function is not a call either
+- query: SELECT * FROM load_extension
+  verdict: allow
+# derived table (subquery in FROM) with a plain read -> allowed (the deny
+# twin `FROM (DELETE ...)` lives in sqlite_deny.yaml; guards against over-deny)
+- query: SELECT * FROM (SELECT id FROM users) d
+  verdict: allow

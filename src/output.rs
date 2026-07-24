@@ -153,6 +153,69 @@ pub fn query_meta_json(meta: &QueryMeta, warnings: &[Warning]) -> String {
     })
 }
 
+/// jsonl data stream: one compact JSON object per row, keys in column order.
+/// The envelope (without rows) goes to stderr — see emit() in the cli layer.
+pub fn query_jsonl(columns: &[String], rows: &[Vec<Value>]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(&to_json(&RowObject { columns, row }));
+        out.push('\n');
+    }
+    out
+}
+
+/// csv data stream: header + rows, RFC 4180 quoting (commas, quotes and
+/// newlines in values), NULL as an empty field, \n record separator, plus
+/// spreadsheet formula-injection defense (CWE-1236). ~20 lines by hand —
+/// a csv crate is not worth the supply-chain surface (Д8).
+pub fn query_csv(columns: &[String], rows: &[Vec<Value>]) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    // Headers and text cells can be attacker-influenced -> defuse formulas;
+    // numbers/bool/NULL cannot be a formula, so they pass through verbatim
+    // (defusing them would turn `-2` into the text `'-2`).
+    let mut push_record = |fields: Vec<(String, bool)>| {
+        let quoted: Vec<String> = fields
+            .iter()
+            .map(|(f, defuse)| csv_field(f, *defuse))
+            .collect();
+        out.push_str(&quoted.join(","));
+        out.push('\n');
+    };
+    push_record(columns.iter().map(|c| (c.clone(), true)).collect());
+    for row in rows {
+        push_record(
+            row.iter()
+                .map(|v| (table_cell(v), matches!(v, Value::String(_))))
+                .collect(),
+        );
+    }
+    out
+}
+
+/// RFC 4180 quoting, plus (when `defuse`) spreadsheet formula-injection
+/// defense (CWE-1236): database content can be attacker-influenced, and a
+/// text value starting with `= + - @` (or a tab/CR that Excel trims to
+/// reveal one) is executed as a formula on open. A leading `'` neutralizes
+/// it — the standard mitigation — altering the value by one character; a
+/// human-facing format trades exact fidelity for not running attacker
+/// formulas. `defuse` is false for non-string cells (a number is never a
+/// formula), so numeric output stays byte-exact.
+fn csv_field(field: &str, defuse: bool) -> String {
+    let defused = if defuse && field.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{field}")
+    } else {
+        field.to_string()
+    };
+    if defused.contains(['"', ',', '\n', '\r']) {
+        format!("\"{}\"", defused.replace('"', "\"\""))
+    } else {
+        defused
+    }
+}
+
 pub fn query_table(columns: &[String], rows: &[Vec<Value>]) -> String {
     if columns.is_empty() {
         return String::new();
@@ -300,6 +363,76 @@ mod tests {
         assert_eq!(
             query_meta_json(&meta, &[]),
             r#"{"v":1,"ok":true,"meta":{"row_count":2,"truncated":false,"duration_ms":42,"connection":"localdev"}}"#
+        );
+    }
+
+    #[test]
+    fn query_jsonl_is_one_compact_object_per_row_in_column_order() {
+        let (columns, rows, _) = sample();
+        assert_eq!(
+            query_jsonl(&columns, &rows),
+            "{\"id\":1,\"email\":\"a@b.c\"}\n{\"id\":2,\"email\":null}\n"
+        );
+        assert_eq!(query_jsonl(&columns, &[]), "");
+    }
+
+    #[test]
+    fn query_csv_quotes_per_rfc4180_and_renders_null_empty() {
+        let columns = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let rows = vec![vec![
+            Value::from("plain"),
+            Value::from("com,ma"),
+            Value::from("qu\"ote"),
+            Value::from("line\nbreak"),
+        ]];
+        assert_eq!(
+            query_csv(&columns, &rows),
+            "a,b,c,d\nplain,\"com,ma\",\"qu\"\"ote\",\"line\nbreak\"\n"
+        );
+        // NULL -> empty field; numbers unquoted; header only for empty results.
+        let (columns, rows, _) = sample();
+        assert_eq!(query_csv(&columns, &rows), "id,email\n1,a@b.c\n2,\n");
+        assert_eq!(query_csv(&columns, &[]), "id,email\n");
+        assert_eq!(query_csv(&[], &[]), "");
+        // A column NAME with a comma is quoted too.
+        assert_eq!(query_csv(&["x,y".to_string()], &[]), "\"x,y\"\n");
+    }
+
+    #[test]
+    fn query_csv_defuses_formula_injection() {
+        // CWE-1236: values starting with =/+/-/@ (or tab/CR) get a leading
+        // apostrophe so a spreadsheet does not execute them as formulas.
+        let columns = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let rows = vec![vec![
+            Value::from("=1+2"),
+            Value::from("+cmd"),
+            Value::from("-2"),
+            Value::from("@ref"),
+        ]];
+        // "'-2" contains no quoting trigger -> bare; the others likewise.
+        assert_eq!(
+            query_csv(&columns, &rows),
+            "a,b,c,d\n'=1+2,'+cmd,'-2,'@ref\n"
+        );
+        // A tab-led value both defuses AND (via the CR/comma-free bare path)
+        // stays unquoted; a CR-led value gets defused then quoted (CR trigger).
+        assert_eq!(
+            query_csv(&["x".to_string()], &[vec![Value::from("\rboom")]]),
+            "x\n\"'\rboom\"\n"
+        );
+    }
+
+    #[test]
+    fn query_csv_defuse_only_touches_strings_not_numbers() {
+        // A negative NUMBER must stay `-2`, not become the text `'-2` — only
+        // string cells (and headers) can carry a formula.
+        let columns = vec!["balance".into(), "note".into()];
+        let rows = vec![vec![Value::from(-2), Value::from("=SUM(A1)")]];
+        assert_eq!(query_csv(&columns, &rows), "balance,note\n-2,'=SUM(A1)\n");
+        // A string that merely looks like a negative number is still defused.
+        assert_eq!(
+            query_csv(&["x".to_string()], &[vec![Value::from("-2")]]),
+            "x\n'-2\n"
         );
     }
 

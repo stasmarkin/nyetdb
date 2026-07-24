@@ -17,9 +17,10 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
 - config: parsing, validation (unknown keys are hard errors), `${VAR}`
   substitution, `password_env`, file permission warnings;
 - directory scoping (`allowed_dirs`) and `nyet list`;
-- `nyet query` for **SQLite**: SQL validation (read-only allowlist), the
-  database file opened read-only (`mode=ro`), row limit, timeout, json and
-  table output;
+- `nyet query` for **SQLite**: the full SQL validator (read-only allowlist,
+  recursive AST walk, Unicode stripping, locking clauses, function denylist
+  with per-connection policy), the database file opened read-only
+  (`mode=ro`), row limit, timeout, json / jsonl / csv / table output;
 - the stable JSON envelope and exit-code contract.
 
 Server engines (PostgreSQL, MySQL) arrive in later releases; `nyet query`
@@ -56,7 +57,7 @@ Full annotated example:
 [defaults]
 row_limit = 1000       # max rows returned per query
 timeout_secs = 30      # per-query timeout
-format = "json"        # default output format: json | table
+format = "json"        # default output format: json | jsonl | table | csv
 
 [connections.prod]
 engine = "postgres"                    # postgres | mysql | sqlite | ...
@@ -69,8 +70,8 @@ allowed_dirs = ["~/Workspace/app"]
 row_limit = 500
 timeout_secs = 10
 
-# Validator policy tuning (parsed and validated now; takes effect when the
-# function denylist lands).
+# Validator policy tuning — see the Security section below.
+# CAUTION: every allow_functions entry is a conscious risk you take.
 [connections.prod.validator]
 allow_functions = ["pg_sleep"]         # remove from the built-in denylist
 deny_functions = ["my_scary_fn"]       # add your own bans
@@ -114,7 +115,7 @@ Rules:
 ```sh
 nyet list                  # connections available from the current directory
 nyet list --format table   # human-friendly table (envelope goes to stderr)
-nyet query <alias> <sql> [--format json|table] [--limit N] [--timeout SECS]
+nyet query <alias> <sql> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
 ```
 
 `nyet list` prints aliases and engines only — never URLs or credentials:
@@ -144,14 +145,68 @@ it is cut off and marked — both in `meta` and in `warnings`:
 `warnings` is omitted when empty. If the result has duplicate column names
 (`SELECT 1 AS a, 2 AS a`), json row objects keep both keys but most JSON
 parsers let the last value win — nyet flags this with a `DUPLICATE_COLUMNS`
-warning suggesting `AS` aliases. With `--format table` the rows go to
-stdout as an aligned table and the envelope (without `rows`) goes to stderr
-as one JSON line.
+warning suggesting `AS` aliases.
+
+### Output formats
+
+With `--format json` (the default) the whole answer is one envelope on
+stdout. The other three formats stream the data on stdout and put the
+envelope (without `rows`) on stderr as one JSON line:
+
+- `table` — aligned columns for human eyes;
+- `jsonl` — one compact JSON object per row, keys in column order:
+
+  ```sh
+  $ nyet query localdev "SELECT id, email FROM users" --format jsonl
+  {"id":1,"email":"a@b.c"}
+  {"id":2,"email":null}
+  ```
+
+  ```
+  # stderr: {"v":1,"ok":true,"meta":{"row_count":2,...}}
+  ```
+
+- `csv` — header + rows with RFC 4180 quoting (commas, quotes and newlines
+  in values are quoted, inner quotes doubled), NULL as an empty field:
+
+  ```sh
+  $ nyet query localdev "SELECT id, note FROM notes" --format csv
+  id,note
+  1,"contains, a comma"
+  2,
+  ```
+
+  A value beginning with `=`, `+`, `-`, `@` (or a tab/CR) is prefixed with a
+  leading `'` to prevent spreadsheet formula injection (CWE-1236) — database
+  content can be attacker-influenced, and such a value would otherwise run as
+  a formula when opened in Excel/Sheets. This alters those values by one
+  character; use `json`/`jsonl` for byte-exact data.
+
+`nyet list` supports `json` and `table` only (it has no row stream); if
+`[defaults].format` is `jsonl`/`csv`, `list` falls back to `json`.
+
+## Security
+
+`nyet` enforces read-only in layers, assuming a cooperative but fallible
+agent (see the threat model in [docs/DESIGN.md](docs/DESIGN.md)):
+
+1. **SQL validator** (this section) — pure AST classification before
+   anything touches the database; fail closed: anything not understood is
+   denied.
+2. **Session/file read-only** — SQLite files are opened `mode=ro`; server
+   engines will get read-only sessions when they land.
+3. **Read-only database roles** — recommended; makes even direct access
+   (bypassing nyet) read-only.
+
+The validator pipeline: strip invisible Unicode (Cf/Cc) characters → parse
+(SQLite dialect) → exactly one statement → recursive AST walk. The walk
+denies write/DDL statements anywhere in the tree (CTE bodies, derived
+tables, subqueries), locking clauses, and denylisted functions.
 
 ### How to read a refusal
 
-Every query passes a SQL validator before touching the database. A refusal
-has `code = "NYET"`, exits with 5, and always says why and what to do:
+A refusal has `code = "NYET"`, exits with 5, and always says why and what
+to do:
 
 ```json
 {"v":1,"ok":false,"error":{"code":"NYET","reason":"WRITE_OPERATION","message":"nyet: 'DELETE FROM' is not a read operation","hint":"nyet is read-only; only SELECT, EXPLAIN, SHOW and DESCRIBE statements are accepted — rewrite the task as a read query"}}
@@ -163,14 +218,54 @@ has `code = "NYET"`, exits with 5, and always says why and what to do:
 |---|---|
 | `PARSE_FAILED` | the query could not be parsed — anything not understood is denied (fail closed) |
 | `MULTI_STATEMENT` | more than one statement in a single query |
-| `WRITE_OPERATION` | not a read statement (DML/DDL/PRAGMA/ATTACH/..., including writes dressed as reads: `WITH ... DELETE`, `SELECT INTO`, `EXPLAIN <write>`) |
+| `WRITE_OPERATION` | not a read statement (DML/DDL/PRAGMA/ATTACH/...), anywhere in the query: top level, CTE bodies (`WITH x AS (DELETE ...)`), derived tables (`SELECT * FROM (DELETE ...)`), subqueries, `SELECT INTO`, `EXPLAIN <write>` |
 | `TXN_CONTROL` | transaction or session control (BEGIN/COMMIT/ROLLBACK/SET) |
+| `LOCKING_CLAUSE` | `SELECT ... FOR UPDATE` / `FOR SHARE` — takes row locks, not a plain read |
+| `DENIED_FUNCTION` | a function on the denylist for this connection (the message names it) |
 
 PRAGMA is refused with a pointer instead of a dead end: schema questions
 have a SELECT answer (`SELECT name, sql FROM sqlite_master WHERE type = 'table'`).
 
+### Unicode normalization
+
+Invisible Unicode format/control characters (categories Cf and Cc, except
+`\t` `\n` `\r`) are stripped before validation and execution — they can
+smuggle keywords past a reviewer (`SEL<zero-width joiner>ECT`). The verdict
+applies to the cleaned text; if anything was stripped from an accepted
+query, the success envelope carries a `UNICODE_STRIPPED` warning.
+
+### Function denylist
+
+Some functions are dangerous even inside a read-only query. The built-in
+SQLite list: `load_extension`, `fts3_tokenizer`, `readfile`, `writefile`,
+`edit` (rationale in [docs/DEV.md](docs/DEV.md)). Matching is
+case-insensitive and sees qualified names (`main.load_extension`) and
+table-valued calls (`SELECT * FROM load_extension(...)`); a mere column or
+table *named* like a denied function is not a call and stays allowed.
+
+Per-connection tuning in the config:
+
+```toml
+[connections.localdev.validator]
+allow_functions = ["load_extension"]   # remove a built-in entry — a conscious risk
+deny_functions = ["my_scary_fn"]       # add your own bans
+```
+
+`allow_functions` removes entries from the built-in list, `deny_functions`
+adds new ones; if a name appears in both, deny wins. **Every
+`allow_functions` entry is a risk you consciously accept** — the function
+runs with the database user's privileges even in a read-only session.
+
+### Warning codes
+
+`warnings[].code` is a closed list: `TRUNCATED` (row limit cut the result),
+`DUPLICATE_COLUMNS` (json rows would collapse same-named keys),
+`UNICODE_STRIPPED` (invisible characters removed from the query).
+
 The full allow/deny specification is the public test corpus in
-[`tests/corpus/`](tests/corpus/).
+[`tests/corpus/`](tests/corpus/): every validator rule exists there as at
+least one allow and one deny case, and every known bypass is pinned as a
+corpus case first, then fixed.
 
 ## Output contract
 
@@ -187,7 +282,7 @@ otherwise human-readable diagnostics. Errors:
 Every error carries an actionable `hint`. Error codes today:
 `CONFIG_INVALID`, `DIR_NOT_ALLOWED`, `NOT_IMPLEMENTED`, `INTERNAL`, `NYET`
 (with `reason`, see above), `CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
-Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`.
+Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`.
 
 Exit codes:
 

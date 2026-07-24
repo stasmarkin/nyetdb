@@ -1,0 +1,44 @@
+# Golden corpus — Unicode Cf/Cc stripping (DESIGN §3 п.1, SQLite dialect).
+# CAUTION: the queries below contain REAL invisible characters (zero-width
+# joiner U+200D, zero-width space U+200B, RTL override U+202E, BOM U+FEFF,
+# control U+0001). The validator strips Cf/Cc (keeping \t \n \r) BEFORE
+# parsing; the verdict applies to the final (stripped) text, and any
+# stripping on an allowed query surfaces as the UNICODE_STRIPPED warning.
+
+# zero-width joiner inside the SELECT keyword -> allowed, with a warning
+- query: SEL‍ECT 1
+  verdict: allow
+  warnings: UNICODE_STRIPPED
+# RTL override before the literal -> allowed, with a warning
+- query: SELECT ‮1
+  verdict: allow
+  warnings: UNICODE_STRIPPED
+# BOM in the middle of the query -> allowed, with a warning
+- query: SELECT﻿ 1
+  verdict: allow
+  warnings: UNICODE_STRIPPED
+# BOM at the start (a file copy-paste classic) -> allowed, with a warning
+- query: ﻿SELECT 1
+  verdict: allow
+  warnings: UNICODE_STRIPPED
+# a Cc control character (U+0001) between tokens -> allowed, with a warning
+- query: SELECT 1
+  verdict: allow
+  warnings: UNICODE_STRIPPED
+
+# the attack the rule exists for: a write keyword split by an invisible
+# character reassembles after stripping -> denied by the FINAL text
+- query: DE​LETE FROM t
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: DR‍OP TABLE users
+  verdict: deny
+  reason: WRITE_OPERATION
+# invisible character hiding a second statement
+- query: SELECT 1;​ DELETE FROM t
+  verdict: deny
+  reason: MULTI_STATEMENT
+# PRAGMA smuggled through a zero-width joiner
+- query: P‍RAGMA user_version
+  verdict: deny
+  reason: WRITE_OPERATION
