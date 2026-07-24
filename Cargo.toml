@@ -2,7 +2,7 @@
 name = "nyetdb"
 version = "0.0.1"
 edition = "2021"
-description = "Read-only database access for AI agents. Your agent can look; for everything else — nyet. (early placeholder)"
+description = "Read-only database access for AI agents. Your agent can look; for everything else — nyet."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/stasmarkin/nyetdb"
 readme = "README.md"
@@ -12,3 +12,12 @@ categories = ["command-line-utilities", "database"]
 [[bin]]
 name = "nyet"
 path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.4", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"
