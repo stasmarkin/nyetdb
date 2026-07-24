@@ -1,0 +1,14 @@
+[package]
+name = "nyetdb"
+version = "0.0.1"
+edition = "2021"
+description = "Read-only database access for AI agents. Your agent can look; for everything else — nyet. (early placeholder)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stasmarkin/nyetdb"
+readme = "README.md"
+keywords = ["database", "cli", "ai", "agent", "read-only"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "nyet"
+path = "src/main.rs"
