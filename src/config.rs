@@ -7,16 +7,12 @@ use std::collections::BTreeMap;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    // Validated now; defaults get applied when query execution lands (step 2).
-    #[allow(dead_code)]
     #[serde(default)]
     pub defaults: Defaults,
     #[serde(default)]
     pub connections: BTreeMap<String, Connection>,
 }
 
-// Parsed and schema-validated now; consumed by later steps (query/formats).
-#[allow(dead_code)]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
@@ -25,7 +21,7 @@ pub struct Defaults {
     pub format: Option<String>,
 }
 
-// url/path/password_env/limits are validated now, used by engines in step 2+.
+// url/password_env are validated now, used by server engines in step 4+.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,6 +73,9 @@ pub enum ConfigError {
     /// `${VAR}` in an allowed_dirs entry: the environment is controlled by
     /// the calling agent, so substitution there would let it widen the scope.
     EnvVarInAllowedDir { alias: String, dir: String },
+    /// `row_limit = 0` / `timeout_secs = 0`: zero would mean "no rows" /
+    /// "every query times out" — never what anyone wants. Fail loud.
+    ZeroValue { key: String },
 }
 
 /// Environment lookup, injected for purity (cli passes `std::env::var`).
@@ -106,7 +105,27 @@ pub fn parse(text: &str, env: EnvLookup) -> Result<Config, ConfigError> {
             }
         }
     }
+    reject_zero(config.defaults.row_limit, "defaults.row_limit")?;
+    reject_zero(config.defaults.timeout_secs, "defaults.timeout_secs")?;
+    for (alias, conn) in &config.connections {
+        reject_zero(conn.row_limit, &format!("connections.{alias}.row_limit"))?;
+        reject_zero(
+            conn.timeout_secs,
+            &format!("connections.{alias}.timeout_secs"),
+        )?;
+    }
     Ok(config)
+}
+
+/// Zero limits are footguns: row_limit = 0 returns nothing (looking like an
+/// empty table), timeout_secs = 0 times every query out.
+fn reject_zero(value: Option<u64>, key: &str) -> Result<(), ConfigError> {
+    if value == Some(0) {
+        return Err(ConfigError::ZeroValue {
+            key: key.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// `allowed_dirs` must be static literals: `${VAR}` there would let the
@@ -504,6 +523,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.connections["a"].url.as_deref(), Some("${not closed"));
+    }
+
+    #[test]
+    fn zero_limits_are_rejected() {
+        for (text, key) in [
+            ("[defaults]\nrow_limit = 0", "defaults.row_limit"),
+            ("[defaults]\ntimeout_secs = 0", "defaults.timeout_secs"),
+            (
+                "[connections.a]\nengine = \"sqlite\"\nrow_limit = 0",
+                "connections.a.row_limit",
+            ),
+            (
+                "[connections.a]\nengine = \"sqlite\"\ntimeout_secs = 0",
+                "connections.a.timeout_secs",
+            ),
+        ] {
+            match parse(text, &env_of(&[])).unwrap_err() {
+                ConfigError::ZeroValue { key: got } => assert_eq!(got, key),
+                other => panic!("expected ZeroValue for {key}, got {other:?}"),
+            }
+        }
+        // 1 is fine.
+        assert!(parse("[defaults]\nrow_limit = 1", &env_of(&[])).is_ok());
     }
 
     #[test]

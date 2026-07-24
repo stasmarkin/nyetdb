@@ -1,0 +1,116 @@
+# Golden corpus — statements that must be denied (SQLite dialect).
+# Every deny carries a reason from the closed list:
+# PARSE_FAILED | MULTI_STATEMENT | WRITE_OPERATION | TXN_CONTROL.
+
+# --- writes / DDL ---
+- query: INSERT INTO users (id, email) VALUES (1, 'a@b.c')
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: UPDATE users SET email = 'x@y.z' WHERE id = 1
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: DELETE FROM users WHERE id = 1
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: DELETE FROM users
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: DROP TABLE users
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: CREATE TABLE t (id INTEGER)
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: CREATE INDEX idx_users_email ON users(email)
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: ALTER TABLE users ADD COLUMN nick TEXT
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- writes smuggled into a Query statement body ---
+- query: WITH x AS (SELECT 1) DELETE FROM t
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: WITH x AS (SELECT 1) UPDATE t SET a = 1
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SELECT * INTO t2 FROM users
+  verdict: deny
+  reason: WRITE_OPERATION
+# set operations: the write can hide in either operand (or a parenthesized one)
+- query: SELECT * INTO t FROM users UNION SELECT 1
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SELECT 1 UNION SELECT * INTO t FROM users
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SELECT 1 UNION (SELECT * INTO t FROM users)
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- EXPLAIN wrapping a write (EXPLAIN ANALYZE executes it on some engines) ---
+- query: EXPLAIN DELETE FROM users
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: EXPLAIN ANALYZE UPDATE users SET email = 'x'
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- multiple statements: the classic piggyback ---
+- query: SELECT 1; SELECT 2
+  verdict: deny
+  reason: MULTI_STATEMENT
+- query: SELECT * FROM users; DELETE FROM users
+  verdict: deny
+  reason: MULTI_STATEMENT
+
+# --- session / database state ---
+# Every PRAGMA form hits a pre-parse keyword check (sqlparser cannot parse
+# the call form or keyword values) -> one teaching refusal for all of them.
+- query: PRAGMA case_sensitive_like = 1
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: PRAGMA journal_mode = DELETE
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: PRAGMA table_info(users)
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: PRAGMA user_version
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: pragma user_version
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: ATTACH DATABASE '/tmp/other.db' AS other
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- transaction control ---
+- query: BEGIN
+  verdict: deny
+  reason: TXN_CONTROL
+- query: BEGIN TRANSACTION
+  verdict: deny
+  reason: TXN_CONTROL
+- query: COMMIT
+  verdict: deny
+  reason: TXN_CONTROL
+- query: ROLLBACK
+  verdict: deny
+  reason: TXN_CONTROL
+- query: SET search_path = public
+  verdict: deny
+  reason: TXN_CONTROL
+
+# --- unparseable -> fail closed ---
+- query: this is not sql at all
+  verdict: deny
+  reason: PARSE_FAILED
+- query: SELECT * FROM
+  verdict: deny
+  reason: PARSE_FAILED

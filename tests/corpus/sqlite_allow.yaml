@@ -1,0 +1,69 @@
+# Golden corpus — legitimate reads that must pass (SQLite dialect).
+# Format: docs/DEV.md ("Validator corpus"). One case per `- query:` line.
+
+- query: SELECT 1
+  verdict: allow
+- query: SELECT 1;
+  verdict: allow
+- query: SELECT * FROM users WHERE id = 1
+  verdict: allow
+- query: SELECT id, email FROM users ORDER BY id DESC LIMIT 10
+  verdict: allow
+- query: SELECT u.id, o.total FROM users u JOIN orders o ON o.user_id = u.id
+  verdict: allow
+- query: SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.id IS NULL
+  verdict: allow
+- query: SELECT name FROM users WHERE id IN (SELECT user_id FROM admins)
+  verdict: allow
+- query: SELECT (SELECT count(*) FROM orders o WHERE o.user_id = u.id) AS n FROM users u
+  verdict: allow
+- query: WITH top AS (SELECT user_id, sum(total) s FROM orders GROUP BY 1) SELECT * FROM top WHERE s > 100
+  verdict: allow
+- query: WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 5) SELECT x FROM cnt
+  verdict: allow
+- query: SELECT count(*), avg(total) FROM orders GROUP BY user_id HAVING count(*) > 2
+  verdict: allow
+- query: SELECT 'a; b' AS tricky_literal
+  verdict: allow
+- query: SELECT name FROM sqlite_master WHERE type = 'table'
+  verdict: allow
+- query: EXPLAIN SELECT * FROM users
+  verdict: allow
+- query: EXPLAIN QUERY PLAN SELECT * FROM users WHERE id = 1
+  verdict: allow
+- query: SELECT id FROM a UNION SELECT id FROM b
+  verdict: allow
+- query: VALUES (1, 2)
+  verdict: allow
+
+# DESCRIBE and the SHOW family are in the top-level allowlist (DESIGN §3);
+# on SQLite most of them fail later, in the database (DB_ERROR), but the
+# validator must not block a read. One case per reachable AST variant (Д6).
+- query: DESCRIBE users
+  verdict: allow
+- query: DESC users
+  verdict: allow
+- query: SHOW TABLES
+  verdict: allow
+- query: SHOW COLUMNS FROM users
+  verdict: allow
+- query: SHOW CREATE TABLE users
+  verdict: allow
+- query: SHOW VARIABLES
+  verdict: allow
+- query: SHOW DATABASES
+  verdict: allow
+- query: SHOW SCHEMAS
+  verdict: allow
+- query: SHOW FUNCTIONS
+  verdict: allow
+- query: SHOW PROCESSLIST
+  verdict: allow
+- query: SHOW COLLATION
+  verdict: allow
+- query: SHOW CATALOGS
+  verdict: allow
+- query: SHOW VIEWS
+  verdict: allow
+- query: SHOW CHARSET
+  verdict: allow

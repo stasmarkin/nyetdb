@@ -340,18 +340,32 @@ fn query_outside_allowed_dirs_is_exit_4() {
 }
 
 #[test]
-fn query_resolved_is_not_implemented_exit_1() {
+fn query_unsupported_engine_is_not_implemented_exit_1() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = write_config(tmp.path(), &two_conn_config(tmp.path()));
-    let out = nyet(tmp.path())
-        .args(["query", "local", "select 1", "--config"])
-        .arg(&cfg)
-        .current_dir(tmp.path())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    let v = error_envelope(&out);
-    assert_eq!(v["error"]["code"], "NOT_IMPLEMENTED");
+    // A postgres connection that IS allowed from cwd: resolution succeeds,
+    // the engine is honestly not supported yet. Pins pipeline order too:
+    // the engine check fires before the validator, so even SQL the
+    // validator would refuse gets NOT_IMPLEMENTED (a NYET with a
+    // "fix your SQL" hint would be misleading here).
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.pg]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            tmp.path().display()
+        ),
+    );
+    for sql in ["select 1", "DELETE FROM users", "not sql at all"] {
+        let out = nyet(tmp.path())
+            .args(["query", "pg", sql, "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{sql}");
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "NOT_IMPLEMENTED", "{sql}");
+    }
 }
 
 #[test]
@@ -361,6 +375,503 @@ fn cli_usage_error_is_exit_2() {
     assert_eq!(out.status.code(), Some(2));
     let out = nyet(tmp.path()).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
+}
+
+// ---------------------------------------------------------------------------
+// nyet query (SQLite end-to-end)
+// ---------------------------------------------------------------------------
+
+/// Fixture database: three users.
+fn make_db(path: &Path) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        use sqlx::ConnectOptions;
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .connect()
+            .await
+            .unwrap();
+        for sql in [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)",
+            "INSERT INTO users VALUES (1, 'a@b.c'), (2, 'd@e.f'), (3, NULL)",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        sqlx::Connection::close(conn).await.unwrap();
+    });
+}
+
+/// Temp dir with a fixture db and a config whose `db` alias points at it.
+/// Extra config text (defaults, more connections) can be appended.
+fn sqlite_fixture(extra_config: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("fixture.db");
+    make_db(&db);
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "{extra_config}\n[connections.db]\nengine = \"sqlite\"\npath = \"{}\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            db.display(),
+            tmp.path().display()
+        ),
+    );
+    (tmp, cfg)
+}
+
+fn success_envelope(text: &str) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["ok"], true);
+    // duration_ms flaps; pin its presence and type, not its value.
+    assert!(v["meta"]["duration_ms"].is_u64(), "{v}");
+    v
+}
+
+#[test]
+fn query_select_json_success() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id, email FROM users ORDER BY id",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(
+        v["rows"],
+        serde_json::json!([
+            {"id": 1, "email": "a@b.c"},
+            {"id": 2, "email": "d@e.f"},
+            {"id": 3, "email": null}
+        ])
+    );
+    assert_eq!(v["meta"]["row_count"], 3);
+    assert_eq!(v["meta"]["truncated"], false);
+    assert_eq!(v["meta"]["connection"], "db");
+    assert!(
+        v.get("warnings").is_none(),
+        "empty warnings must be omitted"
+    );
+    // Row objects keep column order: id before email (not alphabetical).
+    assert!(
+        stdout(&out).contains(r#""rows":[{"id":1,"email":"a@b.c"}"#),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn query_table_format_puts_envelope_on_stderr() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id, email FROM users ORDER BY id",
+            "--format",
+            "table",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let table = stdout(&out);
+    assert!(table.starts_with("id  email\n"), "{table}");
+    assert!(table.contains("1   a@b.c"), "{table}");
+    let v = success_envelope(stderr(&out).trim().lines().last().unwrap());
+    assert_eq!(v["meta"]["row_count"], 3);
+    assert!(
+        v.get("rows").is_none(),
+        "table envelope must not carry rows"
+    );
+}
+
+#[test]
+fn query_write_is_refused_with_nyet_reason_and_hint() {
+    let (tmp, cfg) = sqlite_fixture("");
+    for (sql, reason) in [
+        ("DELETE FROM users", "WRITE_OPERATION"),
+        ("DROP TABLE users", "WRITE_OPERATION"),
+        ("SELECT 1; SELECT 2", "MULTI_STATEMENT"),
+        ("BEGIN", "TXN_CONTROL"),
+        ("not sql", "PARSE_FAILED"),
+    ] {
+        let out = nyet(tmp.path())
+            .args(["query", "db", sql, "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(5), "{sql}");
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "NYET", "{sql}");
+        assert_eq!(v["error"]["reason"], reason, "{sql}");
+    }
+    // And the data survived the attempts.
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT count(*) AS n FROM users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["rows"], serde_json::json!([{"n": 3}]));
+}
+
+#[test]
+fn query_truncation_sets_meta_and_warning() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id FROM users ORDER BY id",
+            "--limit",
+            "2",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["rows"], serde_json::json!([{"id": 1}, {"id": 2}]));
+    assert_eq!(v["meta"]["row_count"], 2);
+    assert_eq!(v["meta"]["truncated"], true);
+    assert_eq!(v["warnings"][0]["code"], "TRUNCATED");
+    assert!(v["warnings"][0]["message"].is_string());
+}
+
+#[test]
+fn query_row_limit_from_config_with_flag_override() {
+    let (tmp, cfg) = sqlite_fixture("[defaults]\nrow_limit = 1\n");
+    // Config default limits to 1 row...
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT id FROM users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["meta"]["row_count"], 1);
+    assert_eq!(v["meta"]["truncated"], true);
+    // ...and the flag wins over the config.
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id FROM users",
+            "--limit",
+            "10",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["meta"]["row_count"], 3);
+    assert_eq!(v["meta"]["truncated"], false);
+}
+
+#[test]
+fn query_timeout_is_exit_8() {
+    let (tmp, cfg) = sqlite_fixture("");
+    // Unbounded recursive CTE: a legitimate Query for the validator that
+    // never finishes — only the timeout can stop it.
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
+             SELECT count(*) FROM c",
+            "--timeout",
+            "1",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(8));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "TIMEOUT");
+}
+
+#[test]
+fn query_db_error_is_exit_7() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT * FROM no_such_table", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_db_error(&out);
+}
+
+fn assert_db_error(out: &Output) {
+    assert_eq!(out.status.code(), Some(7));
+    let v = error_envelope(out);
+    assert_eq!(v["error"]["code"], "DB_ERROR");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no_such_table"),
+        "{v}"
+    );
+}
+
+#[test]
+fn query_missing_db_file_is_exit_6() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.db]\nengine = \"sqlite\"\npath = \"{}/absent.db\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            tmp.path().display(),
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "CONNECTION_FAILED");
+}
+
+#[test]
+fn sqlite_connection_without_path_is_exit_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.db]\nengine = \"sqlite\"\nallowed_dirs = [\"{}\"]\n",
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+    assert!(v["error"]["hint"].as_str().unwrap().contains("path"));
+}
+
+#[test]
+fn defaults_format_applies_to_query_and_list_flag_wins() {
+    let (tmp, cfg) = sqlite_fixture("[defaults]\nformat = \"table\"\n");
+    // query without --format: table on stdout, envelope on stderr.
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id FROM users ORDER BY id",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(stdout(&out).starts_with("id\n"), "{}", stdout(&out));
+    success_envelope(stderr(&out).trim().lines().last().unwrap());
+    // list without --format: table too.
+    let out = nyet(tmp.path())
+        .args(["list", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(stdout(&out).starts_with("ALIAS"), "{}", stdout(&out));
+    // --format json beats the config default.
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id FROM users",
+            "--format",
+            "json",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    success_envelope(&stdout(&out));
+}
+
+#[test]
+fn unsupported_defaults_format_is_exit_3() {
+    let (tmp, cfg) = sqlite_fixture("[defaults]\nformat = \"csv\"\n");
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+}
+
+#[test]
+fn scoping_fires_before_the_validator() {
+    // A write query against a connection denied from cwd answers with the
+    // scoping error (exit 4), not a SQL lecture (exit 5) — pins the order.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(
+        tmp.path(),
+        "[connections.far]\nengine = \"sqlite\"\npath = \"/tmp/x.db\"\n\
+         allowed_dirs = [\"/no/such/place\"]\n",
+    );
+    let out = nyet(tmp.path())
+        .args(["query", "far", "DELETE FROM users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "DIR_NOT_ALLOWED");
+}
+
+#[test]
+fn defaults_format_table_routes_early_errors_to_stderr() {
+    // [defaults].format is settled right after the config parses, so even
+    // an unknown-alias error routes by it: stdout stays empty (data-only),
+    // the envelope goes to stderr.
+    let (tmp, cfg) = sqlite_fixture("[defaults]\nformat = \"table\"\n");
+    let out = nyet(tmp.path())
+        .args(["query", "nope", "SELECT 1", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(stdout(&out), "");
+    let all = stderr(&out);
+    let v: serde_json::Value = serde_json::from_str(all.trim().lines().last().unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+}
+
+#[test]
+fn zero_limits_in_config_are_exit_3() {
+    for line in ["row_limit = 0", "timeout_secs = 0"] {
+        let (tmp, cfg) = sqlite_fixture(&format!("[defaults]\n{line}\n"));
+        let out = nyet(tmp.path())
+            .args(["list", "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{line}");
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+        assert!(v["error"]["hint"].as_str().unwrap().contains("at least 1"));
+    }
+}
+
+#[test]
+fn zero_limit_flags_are_usage_errors_exit_2() {
+    let (tmp, cfg) = sqlite_fixture("");
+    for flag in ["--limit", "--timeout"] {
+        let out = nyet(tmp.path())
+            .args(["query", "db", "SELECT 1", flag, "0", "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{flag}");
+    }
+}
+
+#[test]
+fn duplicate_column_names_produce_a_warning() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1 AS a, 2 AS a, 3 AS b", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v = success_envelope(&stdout(&out));
+    let warning = &v["warnings"][0];
+    assert_eq!(warning["code"], "DUPLICATE_COLUMNS");
+    let msg = warning["message"].as_str().unwrap();
+    assert!(msg.contains('a') && msg.contains("AS"), "{msg}");
+}
+
+#[test]
+fn empty_result_table_format_still_prints_the_header() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id, email FROM users WHERE 0 = 1",
+            "--format",
+            "table",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(stdout(&out), "id  email\n");
+}
+
+#[test]
+fn nyet_refusal_with_table_format_goes_to_stderr() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "DELETE FROM users",
+            "--format",
+            "table",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    // Envelope placement is decided by the format, not the outcome.
+    assert_eq!(stdout(&out), "");
+    let line = stderr(&out);
+    let v: serde_json::Value = serde_json::from_str(line.trim().lines().last().unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "NYET");
+    assert_eq!(v["error"]["reason"], "WRITE_OPERATION");
 }
 
 #[cfg(unix)]

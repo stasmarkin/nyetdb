@@ -14,6 +14,11 @@ allow = [
     "Unicode-3.0",
 ]
 
+# Scoped, not global: only this crate may be Zlib.
+[[licenses.exceptions]]
+name = "foldhash" # via hashbrown, via sqlx
+allow = ["Zlib"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

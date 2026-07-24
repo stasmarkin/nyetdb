@@ -17,11 +17,13 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
 - config: parsing, validation (unknown keys are hard errors), `${VAR}`
   substitution, `password_env`, file permission warnings;
 - directory scoping (`allowed_dirs`) and `nyet list`;
+- `nyet query` for **SQLite**: SQL validation (read-only allowlist), the
+  database file opened read-only (`mode=ro`), row limit, timeout, json and
+  table output;
 - the stable JSON envelope and exit-code contract.
 
-`nyet query` is not implemented yet — it fully resolves the connection
-(so alias and directory-scoping errors are real) and then honestly returns
-`NOT_IMPLEMENTED`. Query execution arrives in the next release.
+Server engines (PostgreSQL, MySQL) arrive in later releases; `nyet query`
+against them resolves the connection and returns `NOT_IMPLEMENTED`.
 
 - [Roadmap](ROADMAP.md)
 - [Design](docs/DESIGN.md)
@@ -50,12 +52,11 @@ authored by the user only.
 Full annotated example:
 
 ```toml
-# Global defaults, overridable per connection
-# (parsed and validated now; takes effect when query execution lands).
+# Global defaults, overridable per connection (and by CLI flags).
 [defaults]
 row_limit = 1000       # max rows returned per query
 timeout_secs = 30      # per-query timeout
-format = "json"        # default output format
+format = "json"        # default output format: json | table
 
 [connections.prod]
 engine = "postgres"                    # postgres | mysql | sqlite | ...
@@ -68,7 +69,8 @@ allowed_dirs = ["~/Workspace/app"]
 row_limit = 500
 timeout_secs = 10
 
-# Validator policy tuning (takes effect when the SQL validator lands).
+# Validator policy tuning (parsed and validated now; takes effect when the
+# function denylist lands).
 [connections.prod.validator]
 allow_functions = ["pg_sleep"]         # remove from the built-in denylist
 deny_functions = ["my_scary_fn"]       # add your own bans
@@ -84,6 +86,12 @@ engine = "sqlite"
 path = "./dev.db"                      # sqlite uses path instead of url
 allowed_dirs = ["~/Workspace/app"]
 ```
+
+SQLite specifics: `path` points at the database file and is required; a
+relative `path` resolves against the directory `nyet` runs from (an absolute
+path is the predictable choice). The file is opened read-only (`mode=ro`), so
+even a write that somehow slipped past the SQL validator fails in the
+database itself.
 
 Rules:
 
@@ -106,7 +114,7 @@ Rules:
 ```sh
 nyet list                  # connections available from the current directory
 nyet list --format table   # human-friendly table (envelope goes to stderr)
-nyet query <alias> <sql>   # not implemented yet; resolves and says so
+nyet query <alias> <sql> [--format json|table] [--limit N] [--timeout SECS]
 ```
 
 `nyet list` prints aliases and engines only — never URLs or credentials:
@@ -114,6 +122,55 @@ nyet query <alias> <sql>   # not implemented yet; resolves and says so
 ```json
 {"v":1,"ok":true,"connections":[{"alias":"localdev","engine":"sqlite"}]}
 ```
+
+### nyet query
+
+```sh
+$ nyet query localdev "SELECT id, email FROM users ORDER BY id LIMIT 2"
+{"v":1,"ok":true,"rows":[{"id":1,"email":"a@b.c"},{"id":2,"email":"d@e.f"}],"meta":{"row_count":2,"truncated":false,"duration_ms":3,"connection":"localdev"}}
+```
+
+Row objects keep column order. `--limit` / `--timeout` beat the
+per-connection `row_limit` / `timeout_secs`, which beat `[defaults]`, which
+beat the built-ins (1000 rows / 30 s). All of them must be at least 1 — a
+zero limit/timeout is rejected (config: exit 3; flag: exit 2); to get the
+built-in default, omit the key. If the result has more rows than the limit,
+it is cut off and marked — both in `meta` and in `warnings`:
+
+```json
+{"v":1,"ok":true,"rows":[...],"meta":{"row_count":1000,"truncated":true,"duration_ms":18,"connection":"localdev"},"warnings":[{"code":"TRUNCATED","message":"result truncated to 1000 rows; add WHERE/LIMIT or raise --limit"}]}
+```
+
+`warnings` is omitted when empty. If the result has duplicate column names
+(`SELECT 1 AS a, 2 AS a`), json row objects keep both keys but most JSON
+parsers let the last value win — nyet flags this with a `DUPLICATE_COLUMNS`
+warning suggesting `AS` aliases. With `--format table` the rows go to
+stdout as an aligned table and the envelope (without `rows`) goes to stderr
+as one JSON line.
+
+### How to read a refusal
+
+Every query passes a SQL validator before touching the database. A refusal
+has `code = "NYET"`, exits with 5, and always says why and what to do:
+
+```json
+{"v":1,"ok":false,"error":{"code":"NYET","reason":"WRITE_OPERATION","message":"nyet: 'DELETE FROM' is not a read operation","hint":"nyet is read-only; only SELECT, EXPLAIN, SHOW and DESCRIBE statements are accepted — rewrite the task as a read query"}}
+```
+
+`error.reason` is a closed list:
+
+| reason | meaning |
+|---|---|
+| `PARSE_FAILED` | the query could not be parsed — anything not understood is denied (fail closed) |
+| `MULTI_STATEMENT` | more than one statement in a single query |
+| `WRITE_OPERATION` | not a read statement (DML/DDL/PRAGMA/ATTACH/..., including writes dressed as reads: `WITH ... DELETE`, `SELECT INTO`, `EXPLAIN <write>`) |
+| `TXN_CONTROL` | transaction or session control (BEGIN/COMMIT/ROLLBACK/SET) |
+
+PRAGMA is refused with a pointer instead of a dead end: schema questions
+have a SELECT answer (`SELECT name, sql FROM sqlite_master WHERE type = 'table'`).
+
+The full allow/deny specification is the public test corpus in
+[`tests/corpus/`](tests/corpus/).
 
 ## Output contract
 
@@ -128,20 +185,23 @@ otherwise human-readable diagnostics. Errors:
 ```
 
 Every error carries an actionable `hint`. Error codes today:
-`CONFIG_INVALID`, `DIR_NOT_ALLOWED`, `NOT_IMPLEMENTED`, `INTERNAL`.
+`CONFIG_INVALID`, `DIR_NOT_ALLOWED`, `NOT_IMPLEMENTED`, `INTERNAL`, `NYET`
+(with `reason`, see above), `CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
+Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`.
 
 Exit codes:
 
 | Code | Meaning |
 |---|---|
-| 0 | success |
-| 1 | internal error / not implemented yet |
+| 0 | success (including success with warnings) |
+| 1 | internal error / engine not implemented yet |
 | 2 | CLI usage error |
 | 3 | config error (not found, invalid, unknown alias) |
 | 4 | connection not allowed from the current directory |
-
-Codes 5–8 (validator refusal, connection, DB error, timeout) are reserved and
-arrive with query execution — see [docs/DESIGN.md](docs/DESIGN.md).
+| 5 | query refused by the validator (`error.code = "NYET"`) |
+| 6 | connection failed (file missing/unreadable, network, auth) |
+| 7 | the database returned an execution error |
+| 8 | timeout |
 
 ## License
 
