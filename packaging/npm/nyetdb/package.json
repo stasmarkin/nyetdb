@@ -1,0 +1,12 @@
+{
+  "name": "nyetdb",
+  "version": "0.0.1",
+  "description": "Read-only database access for AI agents. Your agent can look; for everything else — nyet. (name reservation, tool under development)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stasmarkin/nyetdb.git"
+  },
+  "homepage": "https://github.com/stasmarkin/nyetdb",
+  "license": "(MIT OR Apache-2.0)",
+  "keywords": ["database", "cli", "ai", "agents", "read-only", "postgres", "mysql"]
+}

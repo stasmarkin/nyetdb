@@ -6,9 +6,13 @@ CLI-утилита на Rust для доступа к базам данных, �
 > **Your AI agent can look. For everything else — nyet.**
 
 **Имя:** бренд/репозиторий/крейт — `nyetdb`, бинарник — `nyet` (паттерн
-ripgrep→`rg`: бренд уникален и гуглится, команда короткая). Крейт `nyet` и
-npm-пакет `nyet` застолблены как алиасы. Проверено (июль 2026): crates.io,
-npm, Homebrew, GitHub свободны для обоих имён.
+ripgrep→`rg`: бренд уникален и гуглится, команда короткая). Застолблено
+(июль 2026): GitHub (stasmarkin/nyetdb), crates.io (`nyetdb` + алиас `nyet`).
+**Бэклог:** зарегистрировать npm-пакеты `nyetdb` и `nyet` (имена свободны,
+плейсхолдеры лежат в `packaging/npm/`; публикация упёрлась в браузерный
+2FA-флоу npm — выполнить из каждой папки интерактивный `npm publish
+--registry=https://registry.npmjs.org/ --access public` или завести granular
+token с bypass 2FA). Домены — отложено (решение: пока не покупаем).
 
 **Позиционирование:** safety-first CLI. Дифференциация — не широта поддержки баз
 (там Google MCP Toolbox с ~47 источниками), а связка **plain CLI + layered
