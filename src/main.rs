@@ -5,6 +5,7 @@
 
 mod config;
 mod engine;
+mod guardrail;
 mod output;
 mod resolver;
 mod tunnel;
@@ -54,6 +55,23 @@ enum Command {
         alias: String,
         /// One table or view to detail (PostgreSQL: `schema.table` outside public)
         table: Option<String>,
+        /// Output format (default: [defaults].format from the config, then json)
+        #[arg(long, value_enum)]
+        format: Option<PlainFormat>,
+    },
+    /// Show the query plan, the cost estimate and the guardrail verdict —
+    /// without running the query
+    ///
+    /// Examples:
+    ///   nyet explain prod "SELECT * FROM orders WHERE org_id = 7"
+    ///   nyet explain prod "SELECT count(*) FROM events" --format table
+    // verbatim: see the Schema arm — the examples are the point (UX-3).
+    #[command(verbatim_doc_comment)]
+    Explain {
+        /// Connection alias from the config
+        alias: String,
+        /// The query to plan (read statements only, like `nyet query`)
+        query: String,
         /// Output format (default: [defaults].format from the config, then json)
         #[arg(long, value_enum)]
         format: Option<PlainFormat>,
@@ -158,6 +176,11 @@ struct Failure {
     code: ErrorCode,
     message: String,
     hint: String,
+    /// Only the guardrail refusal fills this: the plan that justified it
+    /// travels in the same envelope, so the agent can fix the query without a
+    /// second round trip (UX-2). Boxed: every Failure travels by value through
+    /// the whole cli, and only this one rare variant carries a plan.
+    estimate: Option<Box<output::Estimate>>,
 }
 
 impl Failure {
@@ -166,6 +189,7 @@ impl Failure {
             code,
             message: message.into(),
             hint: hint.into(),
+            estimate: None,
         }
     }
 }
@@ -183,11 +207,23 @@ impl Db {
         &self,
         sql: &str,
         fetch_limit: u64,
-    ) -> Result<engine::ResultSet, engine::EngineError> {
+        guardrail: &guardrail::Guardrail,
+    ) -> Result<engine::QueryOutcome, engine::EngineError> {
         match self {
-            Db::Sqlite(e) => e.execute(sql, fetch_limit).await,
-            Db::Postgres(e) => e.execute(sql, fetch_limit).await,
-            Db::Mysql(e) => e.execute(sql, fetch_limit).await,
+            Db::Sqlite(e) => e.execute(sql, fetch_limit, guardrail).await,
+            Db::Postgres(e) => e.execute(sql, fetch_limit, guardrail).await,
+            Db::Mysql(e) => e.execute(sql, fetch_limit, guardrail).await,
+        }
+    }
+
+    async fn estimate(
+        &self,
+        sql: &str,
+    ) -> Result<Option<guardrail::CostEstimate>, engine::EngineError> {
+        match self {
+            Db::Sqlite(e) => e.estimate(sql).await,
+            Db::Postgres(e) => e.estimate(sql).await,
+            Db::Mysql(e) => e.estimate(sql).await,
         }
     }
 
@@ -266,15 +302,22 @@ fn main() -> ExitCode {
     // the flag is known; run() updates this once [defaults].format applies.
     let mut format = match &cli.command {
         Command::List { format } => format.map(PlainFormat::as_format),
-        Command::Schema { format, .. } => format.map(PlainFormat::as_format),
+        Command::Schema { format, .. } | Command::Explain { format, .. } => {
+            format.map(PlainFormat::as_format)
+        }
         Command::Query { format, .. } => *format,
     }
     .unwrap_or(Format::Json);
     match run(cli, &mut format) {
         Ok(()) => ExitCode::SUCCESS,
         Err(f) => {
-            let envelope =
-                output::error_json(f.code.as_str(), f.code.reason(), &f.message, &f.hint);
+            let envelope = output::error_json(
+                f.code.as_str(),
+                f.code.reason(),
+                &f.message,
+                &f.hint,
+                f.estimate.as_deref(),
+            );
             // Best-effort: we are already failing, and there is no data to
             // lose (the envelope goes out; its write failing changes nothing).
             let _ = emit(format, "", &envelope);
@@ -296,7 +339,9 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
     let format = resolve_format(
         match &cli.command {
             Command::List { format } => format.map(PlainFormat::as_format),
-            Command::Schema { format, .. } => format.map(PlainFormat::as_format),
+            Command::Schema { format, .. } | Command::Explain { format, .. } => {
+                format.map(PlainFormat::as_format)
+            }
             Command::Query { format, .. } => *format,
         },
         config::peek_defaults_format(&text).as_deref(),
@@ -304,9 +349,10 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
     // list/schema have no row stream, so a jsonl/csv [defaults].format (set
     // for query workflows) degrades to json for them — documented in README.
     let format = match (&cli.command, format) {
-        (Command::List { .. } | Command::Schema { .. }, Format::Jsonl | Format::Csv) => {
-            Format::Json
-        }
+        (
+            Command::List { .. } | Command::Schema { .. } | Command::Explain { .. },
+            Format::Jsonl | Format::Csv,
+        ) => Format::Json,
         (_, f) => f,
     };
     *route_format = format;
@@ -355,78 +401,67 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             limit,
             timeout,
         } => {
-            // Order matters and is pinned by tests: alias -> directory
-            // scoping -> engine support -> connection config -> validator ->
-            // execution. Scoping fires before the validator (a denied
-            // directory answers with exit 4, not a SQL lecture); engine
-            // support fires before the validator (an unsupported engine
-            // answers NOT_IMPLEMENTED, not NYET with a misleading SQL hint).
-            let conn = lookup_alias(&cfg, &path, &alias)?;
-            check_scope(&alias, conn, &cwd, allowed(conn))?;
-            // Flag > per-connection > [defaults] > built-in. Timeout is
-            // resolved here (before the engine) because Postgres feeds it into
-            // the server-side statement_timeout at connect time.
-            let limit = limit
-                .or(conn.row_limit)
-                .or(cfg.defaults.row_limit)
-                .unwrap_or(1000);
-            let timeout_secs = timeout
-                .or(conn.timeout_secs)
-                .or(cfg.defaults.timeout_secs)
-                .unwrap_or(30);
-            let (mut db, policy) = build_engine(&alias, conn, timeout_secs)?;
-            let insecure_transport = insecure_transport(conn);
-
+            let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, timeout)?;
+            // Flag > per-connection > [defaults] > built-in, capped by the
+            // config owner's max_row_limit (see config::capped).
+            let limit = cfg.row_limit(conn, limit);
             // Layer 1: the validator. Any deny -> code NYET + reason, exit 5.
-            let (query, mut warnings) = match validator::validate(&query, &policy) {
-                validator::Verdict::Deny {
-                    reason,
-                    message,
-                    hint,
-                } => {
-                    return Err(Failure::new(
-                        ErrorCode::Nyet(reason.as_str()),
+            let (query, is_query, mut warnings) = validate(&query, &session.policy)?;
+            // Layer 1.5: the guardrail. Only a plain query can be wrapped in an
+            // EXPLAIN; SHOW/DESCRIBE are metadata no planner estimates, so they
+            // run unguarded (documented). An EXPLAIN ANALYZE never gets here —
+            // the validator refuses it (reason EXPLAIN_ANALYZE).
+            let guardrail = match is_query {
+                true => config::guardrail(&alias, conn).map_err(|e| config_failure(e, &path))?,
+                false => guardrail::Guardrail::OFF,
+            };
+            // The tunnel is opened AFTER the validator (a refused query exits 5
+            // without paying for ssh) and torn down when the guard drops, so
+            // forwards never accumulate. Fetch limit+1 to detect truncation
+            // without reading everything.
+            let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
+            let (outcome, duration_ms) = run_db(session.db.execute(
+                &query,
+                limit.saturating_add(1),
+                &guardrail,
+            ))?;
+
+            let (mut rs, estimate) = match outcome {
+                // The guardrail refused: nothing ran, and the envelope carries
+                // the plan that justified it (NYET/EXPENSIVE_QUERY, exit 5).
+                engine::QueryOutcome::Refused { estimate, value } => {
+                    let (message, hint) = guardrail.refusal(&alias, value);
+                    return Err(Failure {
+                        code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
                         message,
                         hint,
-                    ))
+                        estimate: Some(Box::new(guardrail.describe(estimate))),
+                    });
                 }
-                // Execute the NORMALIZED text — it is what the validator
-                // classified; running the original would reopen the gap
-                // Unicode stripping closes.
-                validator::Verdict::Allow { sql, warnings } => (
-                    sql,
-                    warnings
-                        .into_iter()
-                        .map(|w| output::Warning {
-                            code: w.code,
-                            message: w.message,
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                // Planning itself outran the guardrail's budget. Fail closed:
+                // planning time is agent-controllable, so "no plan in time" must
+                // not be a way to switch the guard off. Same reason code — the
+                // verdict is the same, only the evidence differs.
+                engine::QueryOutcome::PlanTooSlow { budget_ms } => {
+                    let (message, hint) = guardrail::planning_too_slow(&alias, budget_ms);
+                    return Err(Failure {
+                        code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
+                        message,
+                        hint,
+                        estimate: None,
+                    });
+                }
+                engine::QueryOutcome::Ran { result, estimate } => (result, estimate),
             };
-
-            // Layer 2.5: an SSH tunnel to a bastion, opened AFTER the validator
-            // (a refused query exits 5 without paying for ssh) and BEFORE the
-            // engine connects. The guard is held for the whole query and torn
-            // down on drop, so forwards never accumulate.
-            let _tunnel = open_tunnel(conn, timeout_secs, &mut db)?;
-
-            let rt = runtime()?;
-            let started = Instant::now();
-            // The engine owns BOTH deadlines internally: a hung/slow CONNECT is
-            // bounded by its own generous deadline (-> Connect, exit 6) and only
-            // the QUERY phase is bounded by the effective per-query timeout (->
-            // Timeout, exit 8). Keeping them inside execute (not one outer tokio
-            // timeout over connect+query) makes the exit code deterministic even
-            // when --timeout is smaller than a legitimate connect. Fetch limit+1
-            // to detect truncation without reading everything.
-            let result = rt.block_on(db.execute(&query, limit.saturating_add(1)));
-            // After a query timeout the sqlite worker may still be grinding; a
-            // background shutdown lets the process exit instead of joining it.
-            rt.shutdown_background();
-            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-            let mut rs = result.map_err(engine_failure)?;
+            // The guardrail was on but reached no verdict — the database would
+            // not plan the statement (no estimate at all), or the plan carried
+            // no number it could judge. Fail open by design (see docs/DEV.md),
+            // but never silently: the timeout and the row limit are what is left.
+            if guardrail.plans()
+                && estimate.is_none_or(|e| guardrail.check(&e) == guardrail::Check::NoEstimate)
+            {
+                warnings.push(guardrail_skipped_warning());
+            }
 
             let truncated = rs.rows.len() as u64 > limit;
             if truncated {
@@ -455,7 +490,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     ),
                 });
             }
-            if insecure_transport {
+            if session.insecure_transport {
                 warnings.push(insecure_transport_warning());
             }
             let meta = output::QueryMeta {
@@ -490,25 +525,12 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             table,
             format: _,
         } => {
-            // Same pipeline order as query, minus the validator (there is no
-            // agent SQL here): alias -> directory scoping -> engine support /
-            // connection config -> execution.
-            let conn = lookup_alias(&cfg, &path, &alias)?;
-            check_scope(&alias, conn, &cwd, allowed(conn))?;
-            let timeout_secs = conn
-                .timeout_secs
-                .or(cfg.defaults.timeout_secs)
-                .unwrap_or(30);
-            let (mut db, _policy) = build_engine(&alias, conn, timeout_secs)?;
-            let insecure_transport = insecure_transport(conn);
-            let _tunnel = open_tunnel(conn, timeout_secs, &mut db)?;
-
-            let rt = runtime()?;
-            let started = Instant::now();
-            let result = rt.block_on(db.schema(table.as_deref()));
-            rt.shutdown_background();
-            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let schema = result.map_err(engine_failure)?;
+            // The same setup as query, minus the validator and the guardrail
+            // (there is no agent SQL here, and a catalog read has nothing to
+            // estimate).
+            let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
+            let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
+            let (schema, duration_ms) = run_db(session.db.schema(table.as_deref()))?;
 
             // An explicit [table] that matched nothing: the catalog answered,
             // the object simply is not there. DB_ERROR (exit 7) with the way
@@ -535,7 +557,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     ),
                 });
             }
-            if insecure_transport {
+            if session.insecure_transport {
                 warnings.push(insecure_transport_warning());
             }
             let meta = output::SchemaMeta {
@@ -557,7 +579,226 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             emit(format, &data, &envelope).map_err(output_write_failure)?;
             Ok(())
         }
+        Command::Explain {
+            alias,
+            query,
+            format: _,
+        } => {
+            // The `query` pipeline up to and including the validator, then the
+            // PLAN instead of the execution. Nothing runs: the EXPLAIN is never
+            // ANALYZE, so `nyet explain` cannot be a way to execute anything.
+            let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
+            // The very same layer 1 as `nyet query` — planning a write is
+            // refused (exit 5) before anything is sent to the database.
+            let (query, is_query, mut warnings) = validate(&query, &session.policy)?;
+            // The verdict is informational here, but it is measured against this
+            // connection's own guardrail, so `explain` answers exactly what
+            // `query` would decide.
+            let guardrail =
+                config::guardrail(&alias, conn).map_err(|e| config_failure(e, &path))?;
+
+            // A metadata statement (SHOW/DESCRIBE, or an EXPLAIN the agent wrote
+            // itself) has no plan to ask for: wrapping it in another EXPLAIN
+            // would only earn a confusing syntax error from the server. Answer
+            // that here — honestly, and without touching the database.
+            let (plan, duration_ms) = match is_query {
+                true => {
+                    let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
+                    run_db(session.db.estimate(&query))?
+                }
+                false => {
+                    warnings.push(no_plan_warning());
+                    (None, 0)
+                }
+            };
+            // No plan at all: either this was not a query, or planning outran
+            // the guardrail's budget — `explain` runs the SAME budget as
+            // `query`, so it cannot answer "ok" for a statement `query` would
+            // refuse. Either way the verdict is `no_estimate` over an empty plan.
+            let empty = plan.is_none();
+            let plan = plan.unwrap_or_else(|| {
+                if is_query {
+                    warnings.push(planning_too_slow_warning());
+                }
+                guardrail::CostEstimate {
+                    plan: serde_json::Value::Array(Vec::new()),
+                    cost: None,
+                    rows: None,
+                    lower_bound: false,
+                }
+            });
+            // The same honest note the query path gives when a plan carries no
+            // number nyet can judge (a recursive CTE, an unreadable shape).
+            if is_query
+                && !empty
+                && guardrail.plans()
+                && guardrail.check(&plan) == guardrail::Check::NoEstimate
+            {
+                warnings.push(guardrail_skipped_warning());
+            }
+            let estimate = guardrail.describe(plan);
+
+            if session.insecure_transport {
+                warnings.push(insecure_transport_warning());
+            }
+            let meta = output::ExplainMeta {
+                duration_ms,
+                connection: alias,
+            };
+            let (data, envelope) = match format {
+                Format::Table => (
+                    output::explain_text(&estimate),
+                    output::explain_meta_json(&meta, &warnings),
+                ),
+                // Only Json remains: jsonl/csv were degraded to json above.
+                _ => (
+                    String::new(),
+                    output::explain_json(&estimate, &meta, &warnings),
+                ),
+            };
+            emit(format, &data, &envelope).map_err(output_write_failure)?;
+            Ok(())
+        }
     }
+}
+
+/// Layer 1 for both `query` and `explain`: any deny -> NYET + reason (exit 5),
+/// so an EXPLAIN over a write is refused exactly like the write itself
+/// (consistently fail closed). Returns the NORMALIZED text — what the validator
+/// actually classified; running anything else would reopen the gap Unicode
+/// stripping closes — plus whether it is a plain query and its warnings.
+fn validate(
+    query: &str,
+    policy: &validator::Policy,
+) -> Result<(String, bool, Vec<output::Warning>), Failure> {
+    match validator::validate(query, policy) {
+        validator::Verdict::Deny {
+            reason,
+            message,
+            hint,
+        } => Err(Failure::new(
+            ErrorCode::Nyet(reason.as_str()),
+            message,
+            hint,
+        )),
+        validator::Verdict::Allow {
+            sql,
+            warnings,
+            is_query,
+        } => Ok((
+            sql,
+            is_query,
+            warnings
+                .into_iter()
+                .map(|w| output::Warning {
+                    code: w.code,
+                    message: w.message,
+                })
+                .collect(),
+        )),
+    }
+}
+
+/// The guardrail asked for a plan and got nothing it could judge. Д10 — what
+/// happened, why, what to do instead. Shared by `query` (which then ran the
+/// query unguarded) and `explain` (whose verdict is `no_estimate` for the very
+/// same reason), so the agent is never left guessing why there is no number.
+fn guardrail_skipped_warning() -> output::Warning {
+    output::Warning {
+        code: "GUARDRAIL_SKIPPED",
+        message: "the guardrail has no estimate it can trust for this query: the planner \
+                  does not bound a recursive CTE (its cost/rows are a LOWER bound, so only \
+                  a plan already over the limit can be refused), and some plan shapes are \
+                  unreadable — so this query was not checked against the connection's \
+                  limit; bound it yourself with WHERE/LIMIT or a smaller --timeout"
+            .to_string(),
+    }
+}
+
+/// `nyet explain` could not get a plan inside the guardrail's budget. The same
+/// code as the other "no verdict" cases (the contract list is closed), a
+/// different story — and it says what `nyet query` would do with this statement.
+fn planning_too_slow_warning() -> output::Warning {
+    output::Warning {
+        code: "GUARDRAIL_SKIPPED",
+        message: "planning this statement outran the guardrail's budget, so there is no plan \
+                  to show and no verdict to give — nyet query would refuse it for exactly \
+                  that reason (EXPENSIVE_QUERY); simplify the statement (fewer joins, fewer \
+                  computed expressions)"
+            .to_string(),
+    }
+}
+
+/// `nyet explain` was handed something that is not a query.
+fn no_plan_warning() -> output::Warning {
+    output::Warning {
+        code: "NO_PLAN",
+        message: "SHOW/DESCRIBE and an EXPLAIN you wrote yourself are metadata statements, \
+                  not queries: there is no plan to estimate, so nothing was asked of the \
+                  database — run the statement with nyet query <alias> <statement> to get \
+                  its result"
+            .to_string(),
+    }
+}
+
+/// What the three database commands set up identically, in the order tests pin:
+/// alias -> directory scoping -> engine support / connection config. Scoping
+/// answers before the validator (a denied directory gets exit 4, not a SQL
+/// lecture), and so does engine support (an unsupported engine gets
+/// NOT_IMPLEMENTED, not a NYET with a misleading SQL hint).
+struct Session {
+    db: Db,
+    /// The engine's validator policy; `schema` ignores it (no agent SQL).
+    policy: validator::Policy,
+    /// Flag > per-connection > [defaults] > built-in. Resolved before the engine
+    /// because Postgres feeds it into the server-side statement_timeout at
+    /// connect time.
+    timeout_secs: u64,
+    insecure_transport: bool,
+}
+
+fn open_session<'a>(
+    cfg: &'a config::Config,
+    path: &Path,
+    alias: &str,
+    cwd: &Path,
+    allowed: &dyn Fn(&config::Connection) -> bool,
+    timeout_flag: Option<u64>,
+) -> Result<(&'a config::Connection, Session), Failure> {
+    let conn = lookup_alias(cfg, path, alias)?;
+    check_scope(alias, conn, cwd, allowed(conn))?;
+    let timeout_secs = cfg.timeout_secs(conn, timeout_flag);
+    let (db, policy) = build_engine(alias, conn, timeout_secs)?;
+    Ok((
+        conn,
+        Session {
+            db,
+            policy,
+            timeout_secs,
+            insecure_transport: insecure_transport(conn),
+        },
+    ))
+}
+
+/// Run one database operation on the lazily built runtime and report the wall
+/// time it took (`meta.duration_ms` — the whole database phase, the guardrail's
+/// EXPLAIN included).
+///
+/// The engine owns BOTH of its deadlines internally: a hung/slow CONNECT is
+/// bounded by its own generous one (-> exit 6) and only the query phase by the
+/// effective per-query timeout (-> exit 8), which keeps the exit code
+/// deterministic even when `--timeout` is smaller than a legitimate connect.
+fn run_db<T>(
+    operation: impl std::future::Future<Output = Result<T, engine::EngineError>>,
+) -> Result<(T, u64), Failure> {
+    let rt = runtime()?;
+    let started = Instant::now();
+    let result = rt.block_on(operation);
+    // After a query timeout the sqlite worker may still be grinding; a
+    // background shutdown lets the process exit instead of joining it.
+    rt.shutdown_background();
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok((result.map_err(engine_failure)?, duration_ms))
 }
 
 /// alias -> connection, with the known-alias hint (CONFIG_INVALID, exit 3).
@@ -897,15 +1138,19 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
             ),
             format!("re-export {name} with a valid UTF-8 value, or remove the reference"),
         ),
-        config::ConfigError::EnvVarInAllowedDir { alias, dir } => (
+        config::ConfigError::EnvVarInPolicy { alias, key, value } => (
             format!(
-                "config file {}: allowed_dirs entry \"{dir}\" for connection '{alias}' \
-                 uses ${{VAR}} substitution",
+                "config file {}: {key} value \"{value}\" for connection '{alias}' uses \
+                 ${{VAR}} substitution",
                 path.display()
             ),
-            "allowed_dirs entries must be literal paths; ${VAR} substitution is not \
-             allowed here because the environment is controlled by the calling agent"
-                .to_string(),
+            format!(
+                "{key} must be a literal value; ${{VAR}} substitution is not allowed in \
+                 policy settings (allowed_dirs, validator.allow_functions / deny_functions, \
+                 guardrail.mode) because the environment is controlled by the calling agent \
+                 — it could otherwise widen its own scope, un-deny a function or switch the \
+                 guardrail off"
+            ),
         ),
         config::ConfigError::InvalidAllowedDir { alias, dir } => (
             format!(
@@ -942,6 +1187,17 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
             "SSH tunnels forward a TCP port; SQLite is a local file, so ssh does not \
              apply — remove the [ssh] section, or use a server engine (postgres)"
                 .to_string(),
+        ),
+        config::ConfigError::GuardrailInvalid { alias, message } => (
+            format!(
+                "config file {}: connection '{alias}' has an invalid [guardrail] section: {message}",
+                path.display()
+            ),
+            format!(
+                "set [connections.{alias}.guardrail] mode to \"cost\", \"rows\" or \"off\" \
+                 (which modes an engine supports depends on what its planner publishes — \
+                 see the README), with max_cost / max_rows as positive numbers"
+            ),
         ),
         config::ConfigError::SshInvalid { alias, message } => (
             format!("config file {}: connection '{alias}' has an invalid [ssh] value: {message}", path.display()),

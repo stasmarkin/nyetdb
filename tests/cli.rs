@@ -614,6 +614,68 @@ fn query_timeout_is_exit_8() {
     assert_eq!(v["error"]["code"], "TIMEOUT");
 }
 
+/// The config owner's ceilings on what the agent may spend: `--limit` and
+/// `--timeout` beat the config, but `max_row_limit` / `max_timeout_secs` beat
+/// the flags. Clamping is silent — the effective limit shows up as the usual
+/// TRUNCATED / TIMEOUT answer.
+#[test]
+fn config_ceilings_clamp_the_flags() {
+    let (tmp, cfg) = sqlite_fixture("[defaults]\nmax_row_limit = 2\nmax_timeout_secs = 1\n");
+    // --limit 999999 against max_row_limit = 2: two rows and TRUNCATED.
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id FROM users ORDER BY id",
+            "--limit",
+            "999999",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["meta"]["row_count"], 2, "{v}");
+    assert_eq!(v["meta"]["truncated"], true);
+    assert_eq!(v["warnings"][0]["code"], "TRUNCATED");
+    // --timeout 999999 against max_timeout_secs = 1: the query is cut at the
+    // ceiling (an unbounded recursive CTE would otherwise never return).
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c)              SELECT count(*) FROM c",
+            "--timeout",
+            "999999",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(8), "{}", stdout(&out));
+    assert_eq!(error_envelope(&out)["error"]["code"], "TIMEOUT");
+    // Without ceilings the flags win, exactly as before.
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id FROM users ORDER BY id",
+            "--limit",
+            "999999",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(success_envelope(&stdout(&out))["meta"]["row_count"], 3);
+}
+
 #[test]
 fn query_db_error_is_exit_7() {
     let (tmp, cfg) = sqlite_fixture("");
@@ -1559,6 +1621,184 @@ fn schema_mirrors_the_list_format_conventions() {
         let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
         assert!(v["schema"]["tables"].is_array(), "{v}");
     }
+}
+
+#[test]
+fn explain_on_sqlite_is_honest_about_having_no_estimate() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "explain",
+            "db",
+            "SELECT id, email FROM users ORDER BY email",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = success_envelope(&stdout(&out));
+    // SQLite publishes a plan but NO cost/row estimate, so nyet reports the
+    // plan and says there is nothing to judge — no invented pseudo-metric
+    // (UX-7), no threshold, no cost/rows keys at all.
+    assert_eq!(v["estimate"]["mode"], "off");
+    assert_eq!(v["estimate"]["verdict"], "no_estimate");
+    for absent in ["cost", "rows", "threshold"] {
+        assert!(v["estimate"].get(absent).is_none(), "{absent}: {v}");
+    }
+    let plan = v["estimate"]["plan"].as_array().unwrap();
+    assert!(
+        plan.iter().any(|line| line
+            .as_str()
+            .is_some_and(|l| l.contains("SCAN") && l.contains("users"))),
+        "{v}"
+    );
+    assert_eq!(v["meta"]["connection"], "db");
+
+    // table format: the plan for human eyes on stdout, envelope on stderr.
+    let out = nyet(tmp.path())
+        .args([
+            "explain",
+            "db",
+            "SELECT id FROM users",
+            "--format",
+            "table",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("verdict: no_estimate (mode off)\n"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(stdout(&out).contains("users"), "{}", stdout(&out));
+    let env: serde_json::Value =
+        serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+    assert_eq!(env["ok"], true);
+    assert!(env.get("estimate").is_none(), "{env}");
+
+    // The validator runs first and fails closed the same way as for `query`:
+    // planning a write is refused before anything reaches the database.
+    let out = nyet(tmp.path())
+        .args(["explain", "db", "DELETE FROM users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "NYET");
+    assert_eq!(v["error"]["reason"], "WRITE_OPERATION");
+    // ...and so is an EXPLAIN ANALYZE over a write (ANALYZE would run it).
+    let out = nyet(tmp.path())
+        .args([
+            "explain",
+            "db",
+            "EXPLAIN ANALYZE DELETE FROM users",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+    assert_eq!(error_envelope(&out)["error"]["reason"], "WRITE_OPERATION");
+
+    // A plain query still runs exactly as before — sqlite has no guardrail, so
+    // nothing changed for it (and no GUARDRAIL_SKIPPED noise either).
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id FROM users ORDER BY id",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["meta"]["row_count"], 3);
+    assert!(v.get("warnings").is_none(), "{v}");
+}
+
+/// A guardrail mode the engine cannot honor must fail LOUD at config parse
+/// (exit 3) — never degrade silently to "no guardrail", which would leave the
+/// human believing in protection that is not there (UX-1/UX-7).
+#[test]
+fn a_guardrail_mode_sqlite_cannot_honor_is_a_config_error() {
+    // Config parsing owns this rule and the per-engine matrix is unit-tested
+    // (src/guardrail.rs, src/config.rs); one run through the binary is enough to
+    // pin the exit code and the envelope.
+    let (tmp, cfg) = sqlite_fixture("[connections.db.guardrail]\nmode = \"rows\"\n");
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", stdout(&out));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("guardrail"),
+        "{v}"
+    );
+    // An explicit "off" is accepted (the sqlite default anyway).
+    let (tmp, cfg) = sqlite_fixture("[connections.db.guardrail]\nmode = \"off\"\n");
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1 AS n", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+}
+
+#[test]
+fn explain_pipeline_order_matches_query() {
+    // alias -> scoping -> engine support -> validator, exactly like query.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(tmp.path(), &two_conn_config(tmp.path()));
+    for (alias, code, expected) in [
+        ("nope", 3, "CONFIG_INVALID"),
+        ("prod", 4, "DIR_NOT_ALLOWED"),
+    ] {
+        let out = nyet(tmp.path())
+            .args(["explain", alias, "SELECT 1", "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(code), "{alias}: {}", stdout(&out));
+        assert_eq!(error_envelope(&out)["error"]["code"], expected);
+    }
+    // An unsupported engine answers before the validator would.
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.r]\nengine = \"redis\"\nurl = \"redis://h:6379\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["explain", "r", "DELETE FROM t", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert_eq!(error_envelope(&out)["error"]["code"], "NOT_IMPLEMENTED");
 }
 
 #[test]

@@ -36,6 +36,15 @@
 - query: EXPLAIN DELETE FROM users
   verdict: deny
   reason: WRITE_OPERATION
+# EXPLAIN ANALYZE runs the statement on MySQL 8, and so does MariaDB's bare
+# ANALYZE form — both refused (the allow twin `EXPLAIN SELECT ...` is in
+# mysql_allow.yaml).
+- query: EXPLAIN ANALYZE SELECT * FROM users
+  verdict: deny
+  reason: EXPLAIN_ANALYZE
+- query: ANALYZE SELECT * FROM users
+  verdict: deny
+  reason: PARSE_FAILED
 
 # --- session / transaction control ---
 - query: SET @x = 1

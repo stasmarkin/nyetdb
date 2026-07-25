@@ -18,6 +18,10 @@ pub struct Config {
 pub struct Defaults {
     pub row_limit: Option<u64>,
     pub timeout_secs: Option<u64>,
+    /// Ceilings the `--limit` / `--timeout` FLAGS cannot exceed. Absent = no
+    /// ceiling (the historical behavior); see `Config::row_limit`.
+    pub max_row_limit: Option<u64>,
+    pub max_timeout_secs: Option<u64>,
     // Routing reads this via peek_defaults_format() BEFORE the semantic parse
     // (so a config error still routes by it); the field stays only so
     // deny_unknown_fields accepts the key here.
@@ -40,8 +44,12 @@ pub struct Connection {
     pub allowed_dirs: Vec<String>,
     pub row_limit: Option<u64>,
     pub timeout_secs: Option<u64>,
+    /// Per-connection ceilings, overriding the `[defaults]` ones.
+    pub max_row_limit: Option<u64>,
+    pub max_timeout_secs: Option<u64>,
     pub validator: Option<Validator>,
     pub ssh: Option<Ssh>,
+    pub guardrail: Option<Guardrail>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +57,19 @@ pub struct Connection {
 pub struct Validator {
     pub allow_functions: Option<Vec<String>>,
     pub deny_functions: Option<Vec<String>>,
+}
+
+/// `[connections.X.guardrail]`: refuse a query whose PLAN estimates more than
+/// the threshold. Values are validated at parse time by `guardrail::resolve`
+/// (unknown mode, a mode the engine cannot honor, a threshold that would refuse
+/// everything) — fail loud, exit 3.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Guardrail {
+    /// `cost` | `rows` | `off`; the default depends on the engine.
+    pub mode: Option<String>,
+    pub max_cost: Option<f64>,
+    pub max_rows: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,9 +91,15 @@ pub enum ConfigError {
     /// An allowed_dirs entry that is neither absolute nor a safe `~/` path
     /// (relative, or `~//...` whose remainder is rooted) — both fail-open.
     InvalidAllowedDir { alias: String, dir: String },
-    /// `${VAR}` in an allowed_dirs entry: the environment is controlled by
-    /// the calling agent, so substitution there would let it widen the scope.
-    EnvVarInAllowedDir { alias: String, dir: String },
+    /// `${VAR}` in a POLICY value (allowed_dirs, validator allow/deny lists,
+    /// guardrail mode): the environment is controlled by the calling agent, so
+    /// substitution there would let the agent widen its own scope, un-deny a
+    /// function or switch the guardrail off. Literal values only.
+    EnvVarInPolicy {
+        alias: String,
+        key: &'static str,
+        value: String,
+    },
     /// `row_limit = 0` / `timeout_secs = 0`: zero would mean "no rows" /
     /// "every query times out" — never what anyone wants. Fail loud.
     ZeroValue { key: String },
@@ -82,6 +109,10 @@ pub enum ConfigError {
     /// An ssh tunnel was configured for a sqlite connection. SQLite is a local
     /// file; a port forward is meaningless (and would silently do nothing).
     SshWithSqlite { alias: String },
+    /// A `[connections.X.guardrail]` value the engine cannot honor (unknown
+    /// mode, a mode this engine has no estimates for, a threshold that would
+    /// refuse everything). Fail loud rather than silently running unguarded.
+    GuardrailInvalid { alias: String, message: String },
     /// An ssh `host`/`remote`/`control_persist` value is malformed or unsafe
     /// (e.g. an option-injection host after `${VAR}` substitution). Caught at
     /// parse (fail-fast) rather than as a runtime tunnel error.
@@ -95,8 +126,8 @@ pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Result<String, std::env::VarError>;
 pub fn parse(text: &str, env: EnvLookup) -> Result<Config, ConfigError> {
     let value: toml::Value =
         toml::from_str(text).map_err(|e| ConfigError::Invalid(toml_message(&e, text)))?;
-    // On the RAW value, before substitution: allowed_dirs must be literal.
-    reject_env_vars_in_allowed_dirs(&value)?;
+    // On the RAW value, before substitution: policy values must be literal.
+    reject_env_vars_in_policy(&value)?;
     let value = substitute(value, env)?;
     let config: Config = value
         .try_into()
@@ -117,15 +148,67 @@ pub fn parse(text: &str, env: EnvLookup) -> Result<Config, ConfigError> {
     }
     reject_zero(config.defaults.row_limit, "defaults.row_limit")?;
     reject_zero(config.defaults.timeout_secs, "defaults.timeout_secs")?;
+    reject_zero(config.defaults.max_row_limit, "defaults.max_row_limit")?;
+    reject_zero(
+        config.defaults.max_timeout_secs,
+        "defaults.max_timeout_secs",
+    )?;
     for (alias, conn) in &config.connections {
         reject_zero(conn.row_limit, &format!("connections.{alias}.row_limit"))?;
         reject_zero(
             conn.timeout_secs,
             &format!("connections.{alias}.timeout_secs"),
         )?;
+        reject_zero(
+            conn.max_row_limit,
+            &format!("connections.{alias}.max_row_limit"),
+        )?;
+        reject_zero(
+            conn.max_timeout_secs,
+            &format!("connections.{alias}.max_timeout_secs"),
+        )?;
         validate_ssh(alias, conn)?;
+        guardrail(alias, conn)?;
     }
     Ok(config)
+}
+
+impl Config {
+    /// Effective row limit for one query: flag > per-connection > `[defaults]`
+    /// > built-in 1000, then capped by `max_row_limit`.
+    pub fn row_limit(&self, conn: &Connection, flag: Option<u64>) -> u64 {
+        capped(
+            flag.or(conn.row_limit).or(self.defaults.row_limit),
+            1000,
+            conn.max_row_limit.or(self.defaults.max_row_limit),
+        )
+    }
+
+    /// Effective per-query timeout: same precedence, capped by
+    /// `max_timeout_secs`.
+    pub fn timeout_secs(&self, conn: &Connection, flag: Option<u64>) -> u64 {
+        capped(
+            flag.or(conn.timeout_secs).or(self.defaults.timeout_secs),
+            30,
+            conn.max_timeout_secs.or(self.defaults.max_timeout_secs),
+        )
+    }
+}
+
+/// The ceiling wins over everything, the flag included: it is the config
+/// owner's word on how much of their database an agent may spend, and an agent
+/// that can raise its own ceiling does not have one (the same reasoning as the
+/// guardrail's missing `--force`). A ceiling below the configured value clamps
+/// that too — a contradiction inside the config resolves the strict way.
+/// Clamping is SILENT: the effective limit is already visible through the
+/// ordinary `TRUNCATED` / `TIMEOUT` answers, and a warning on every call would
+/// be noise (UX-4). No ceiling = the historical behavior, byte for byte.
+fn capped(value: Option<u64>, builtin: u64, ceiling: Option<u64>) -> u64 {
+    let value = value.unwrap_or(builtin);
+    match ceiling {
+        Some(ceiling) => value.min(ceiling),
+        None => value,
+    }
 }
 
 /// The raw `[defaults].format` string, read from a structural TOML parse
@@ -184,6 +267,27 @@ fn validate_ssh(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The connection's effective guardrail — the ONE place it is resolved.
+/// `parse` calls it so a mode this engine cannot honor is a loud config error
+/// (exit 3) before anything connects, and the cli calls it again to get the
+/// value; a connection with no `[guardrail]` section resolves to the per-engine
+/// default (see `guardrail::resolve`).
+pub fn guardrail(
+    alias: &str,
+    conn: &Connection,
+) -> Result<crate::guardrail::Guardrail, ConfigError> {
+    let (mode, max_cost, max_rows) = match &conn.guardrail {
+        Some(g) => (g.mode.as_deref(), g.max_cost, g.max_rows),
+        None => (None, None, None),
+    };
+    crate::guardrail::Guardrail::resolve(&conn.engine, mode, max_cost, max_rows).map_err(
+        |message| ConfigError::GuardrailInvalid {
+            alias: alias.to_string(),
+            message,
+        },
+    )
+}
+
 /// Zero limits are footguns: row_limit = 0 returns nothing (looking like an
 /// empty table), timeout_secs = 0 times every query out.
 fn reject_zero(value: Option<u64>, key: &str) -> Result<(), ConfigError> {
@@ -195,24 +299,62 @@ fn reject_zero(value: Option<u64>, key: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// `allowed_dirs` must be static literals: `${VAR}` there would let the
-/// calling agent (who controls the environment) widen the scope at will,
-/// e.g. "/srv/${P}" with P="" resolves to the parent "/srv/".
-fn reject_env_vars_in_allowed_dirs(value: &toml::Value) -> Result<(), ConfigError> {
+/// POLICY values must be static literals: `${VAR}` in them would let the
+/// calling agent — who controls the environment (threat model) — rewrite the
+/// policy it is subject to. All three are the same class of decision:
+///
+/// - `allowed_dirs` — "/srv/${P}" with P="" resolves to the parent "/srv/";
+/// - `validator.allow_functions` / `deny_functions` — un-deny `pg_sleep`;
+/// - `guardrail.mode` — switch the guardrail off.
+///
+/// Checked on the RAW tree, before substitution, so an unset variable is
+/// rejected too (nothing here is worth a "maybe").
+fn reject_env_vars_in_policy(value: &toml::Value) -> Result<(), ConfigError> {
     let Some(connections) = value.get("connections").and_then(toml::Value::as_table) else {
         return Ok(());
     };
     for (alias, conn) in connections {
-        let Some(dirs) = conn.get("allowed_dirs").and_then(toml::Value::as_array) else {
-            continue;
-        };
-        for dir in dirs.iter().filter_map(toml::Value::as_str) {
-            if dir.contains("${") {
-                return Err(ConfigError::EnvVarInAllowedDir {
+        let literal = |key: &'static str, text: &str| -> Result<(), ConfigError> {
+            if text.contains("${") {
+                return Err(ConfigError::EnvVarInPolicy {
                     alias: alias.clone(),
-                    dir: dir.to_string(),
+                    key,
+                    value: text.to_string(),
                 });
             }
+            Ok(())
+        };
+        if let Some(dirs) = conn.get("allowed_dirs").and_then(toml::Value::as_array) {
+            for dir in dirs.iter().filter_map(toml::Value::as_str) {
+                literal("allowed_dirs", dir)?;
+            }
+        }
+        for key in ["allow_functions", "deny_functions"] {
+            let functions = conn
+                .get("validator")
+                .and_then(|v| v.get(key))
+                .and_then(toml::Value::as_array);
+            for name in functions
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+            {
+                literal(
+                    if key == "allow_functions" {
+                        "validator.allow_functions"
+                    } else {
+                        "validator.deny_functions"
+                    },
+                    name,
+                )?;
+            }
+        }
+        if let Some(mode) = conn
+            .get("guardrail")
+            .and_then(|g| g.get("mode"))
+            .and_then(toml::Value::as_str)
+        {
+            literal("guardrail.mode", mode)?;
         }
     }
     Ok(())
@@ -497,20 +639,56 @@ mod tests {
     }
 
     #[test]
-    fn env_vars_in_allowed_dirs_are_rejected_before_substitution() {
-        // The calling agent controls the environment: "/srv/${P}" with P=""
-        // would resolve to the parent "/srv/". Literal paths only.
-        for (dir, env) in [
-            ("~/${X}", env_of(&[("X", "/etc")])),
-            ("/srv/${P}", env_of(&[("P", "")])),
-            ("/srv/${UNSET}", env_of(&[])), // rejected even if VAR is unset
+    fn env_vars_in_policy_values_are_rejected_before_substitution() {
+        // The calling agent controls the environment, so substitution in a
+        // POLICY value would let it rewrite the policy it is subject to:
+        // "/srv/${P}" with P="" widens the scope to the parent, ${F} un-denies
+        // a function, ${M} switches the guardrail off. Literals only — and the
+        // rejection happens before substitution, so an unset variable fails too.
+        for (key, body, env) in [
+            (
+                "allowed_dirs",
+                "allowed_dirs = [\"~/${X}\"]".to_string(),
+                env_of(&[("X", "/etc")]),
+            ),
+            (
+                "allowed_dirs",
+                "allowed_dirs = [\"/srv/${P}\"]".to_string(),
+                env_of(&[("P", "")]),
+            ),
+            (
+                "allowed_dirs",
+                "allowed_dirs = [\"/srv/${UNSET}\"]".to_string(),
+                env_of(&[]),
+            ),
+            (
+                "validator.allow_functions",
+                "[connections.a.validator]\nallow_functions = [\"${F}\"]".to_string(),
+                env_of(&[("F", "pg_sleep")]),
+            ),
+            (
+                "validator.deny_functions",
+                "[connections.a.validator]\ndeny_functions = [\"${F}\"]".to_string(),
+                env_of(&[("F", "x")]),
+            ),
+            (
+                "guardrail.mode",
+                "[connections.a.guardrail]\nmode = \"${M}\"".to_string(),
+                env_of(&[("M", "off")]),
+            ),
         ] {
-            let text = format!("[connections.a]\nengine = \"sqlite\"\nallowed_dirs = [\"{dir}\"]");
-            let err = parse(&text, &env).unwrap_err();
-            assert!(
-                matches!(err, ConfigError::EnvVarInAllowedDir { dir: ref got, .. } if got == dir),
-                "for {dir:?} got {err:?}"
+            let text = format!(
+                "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n{body}"
             );
+            match parse(&text, &env).unwrap_err() {
+                ConfigError::EnvVarInPolicy {
+                    alias, key: got, ..
+                } => {
+                    assert_eq!(alias, "a");
+                    assert_eq!(got, key);
+                }
+                other => panic!("expected EnvVarInPolicy({key}), got {other:?}"),
+            }
         }
     }
 
@@ -692,6 +870,117 @@ mod tests {
                 "port 0 must be rejected: {ssh}"
             );
         }
+    }
+
+    /// The ceilings the config owner can set on the agent's `--limit` /
+    /// `--timeout`: the flag beats the config, but the ceiling beats the flag.
+    #[test]
+    fn ceilings_clamp_the_flag_the_config_and_the_built_in() {
+        let cfg = |text: &str| parse(text, &env_of(&[])).unwrap();
+        let plain = cfg("[connections.a]\nengine = \"sqlite\"\n");
+        fn conn(c: &Config) -> &Connection {
+            c.connections.get("a").unwrap()
+        }
+        // No ceiling anywhere: the historical resolution, unchanged.
+        assert_eq!(plain.row_limit(conn(&plain), None), 1000);
+        assert_eq!(plain.row_limit(conn(&plain), Some(5_000_000)), 5_000_000);
+        assert_eq!(
+            plain.timeout_secs(conn(&plain), Some(999_999_999)),
+            999_999_999
+        );
+
+        // A ceiling in [defaults] applies to every connection...
+        let d = cfg("[defaults]\nmax_row_limit = 100\nmax_timeout_secs = 5\n\
+                    [connections.a]\nengine = \"sqlite\"\n");
+        assert_eq!(d.row_limit(conn(&d), Some(5_000_000)), 100);
+        assert_eq!(
+            d.row_limit(conn(&d), Some(10)),
+            10,
+            "below the ceiling: the flag"
+        );
+        assert_eq!(
+            d.row_limit(conn(&d), None),
+            100,
+            "the built-in 1000 is clamped too"
+        );
+        assert_eq!(d.timeout_secs(conn(&d), Some(999_999_999)), 5);
+        assert_eq!(d.timeout_secs(conn(&d), None), 5);
+
+        // ...and a per-connection ceiling overrides it — in either direction,
+        // because it is the more specific statement of the same rule.
+        let c = cfg("[defaults]\nmax_row_limit = 100\nmax_timeout_secs = 5\n\
+                     [connections.a]\nengine = \"sqlite\"\nmax_row_limit = 10\n\
+                     max_timeout_secs = 60\n");
+        assert_eq!(c.row_limit(conn(&c), Some(5_000_000)), 10);
+        assert_eq!(c.timeout_secs(conn(&c), Some(999)), 60);
+
+        // A configured value ABOVE the ceiling is clamped as well: a
+        // contradiction inside the config resolves the strict way.
+        let x = cfg("[connections.a]\nengine = \"sqlite\"\nrow_limit = 900\n\
+                     timeout_secs = 900\nmax_row_limit = 50\nmax_timeout_secs = 9\n");
+        assert_eq!(x.row_limit(conn(&x), None), 50);
+        assert_eq!(x.timeout_secs(conn(&x), None), 9);
+
+        // Zero ceilings are the same footgun as zero limits: fail loud.
+        for key in ["max_row_limit", "max_timeout_secs"] {
+            for text in [
+                format!("[defaults]\n{key} = 0"),
+                format!("[connections.a]\nengine = \"sqlite\"\n{key} = 0"),
+            ] {
+                assert!(
+                    matches!(
+                        parse(&text, &env_of(&[])).unwrap_err(),
+                        ConfigError::ZeroValue { .. }
+                    ),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guardrail_section_is_validated_against_the_engine() {
+        // Parses and reaches the connection.
+        let text = "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                    [connections.a.guardrail]\nmode = \"cost\"\nmax_cost = 250000.0";
+        let cfg = parse(text, &env_of(&[])).unwrap();
+        let g = cfg.connections["a"].guardrail.as_ref().unwrap();
+        assert_eq!(g.mode.as_deref(), Some("cost"));
+        assert_eq!(g.max_cost, Some(250_000.0));
+        // A mode the engine cannot honor, an unknown mode and a threshold that
+        // would refuse everything are all hard errors (exit 3) — never a silent
+        // downgrade to "off".
+        for (engine, body) in [
+            ("sqlite", "mode = \"cost\""),
+            ("sqlite", "mode = \"rows\""),
+            ("mysql", "mode = \"cost\""),
+            ("postgres", "mode = \"nope\""),
+            ("postgres", "max_cost = 0.0"),
+            ("mysql", "max_rows = 0"),
+        ] {
+            let text = format!(
+                "[connections.a]\nengine = \"{engine}\"\npath = \"x.db\"\n\
+                 url = \"mysql://u@h/db\"\n[connections.a.guardrail]\n{body}"
+            );
+            match parse(&text, &env_of(&[])).unwrap_err() {
+                ConfigError::GuardrailInvalid { alias, message } => {
+                    assert_eq!(alias, "a");
+                    assert!(!message.is_empty(), "{engine}/{body}");
+                }
+                other => panic!("expected GuardrailInvalid for {engine}/{body}, got {other:?}"),
+            }
+        }
+        // An explicit off is accepted everywhere, including sqlite.
+        let text = "[connections.a]\nengine = \"sqlite\"\npath = \"x.db\"\n\
+                    [connections.a.guardrail]\nmode = \"off\"";
+        assert!(parse(text, &env_of(&[])).is_ok());
+        // Unknown keys inside the section still fail loudly (the convention).
+        let text = "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                    [connections.a.guardrail]\nmax_costs = 1.0";
+        assert!(matches!(
+            parse(text, &env_of(&[])).unwrap_err(),
+            ConfigError::Invalid(_)
+        ));
     }
 
     #[test]

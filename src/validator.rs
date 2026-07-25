@@ -7,7 +7,9 @@
 //! statement -> recursive AST walk (top-level allowlist, nested writes,
 //! locking clauses, function denylist).
 
-use sqlparser::ast::{Expr, ObjectName, Query, Select, Statement, TableFactor, Visit, Visitor};
+use sqlparser::ast::{
+    Expr, ObjectName, Query, Select, Statement, TableFactor, UtilityOption, Visit, Visitor,
+};
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use std::borrow::Cow;
@@ -26,6 +28,7 @@ pub enum DenyReason {
     LockingClause,
     DeniedFunction,
     ExecutableComment,
+    ExplainAnalyze,
 }
 
 impl DenyReason {
@@ -38,6 +41,7 @@ impl DenyReason {
             DenyReason::LockingClause => "LOCKING_CLAUSE",
             DenyReason::DeniedFunction => "DENIED_FUNCTION",
             DenyReason::ExecutableComment => "EXECUTABLE_COMMENT",
+            DenyReason::ExplainAnalyze => "EXPLAIN_ANALYZE",
         }
     }
 }
@@ -53,7 +57,15 @@ pub enum Verdict {
     /// `sql` is the normalized text that MUST be executed instead of the
     /// original: the validator classified this exact string, and running
     /// anything else would reopen the gap normalization closes.
-    Allow { sql: String, warnings: Vec<Warning> },
+    Allow {
+        sql: String,
+        warnings: Vec<Warning>,
+        /// True when the accepted statement is a plain query (SELECT / WITH /
+        /// set operation) — the only kind that can be wrapped in an EXPLAIN.
+        /// The rest of the allowlist (EXPLAIN, SHOW, DESCRIBE) is metadata that
+        /// no planner estimates, so the cli skips the guardrail for it.
+        is_query: bool,
+    },
     Deny {
         reason: DenyReason,
         message: String,
@@ -456,6 +468,7 @@ pub fn validate(sql: &str, policy: &Policy) -> Verdict {
     Verdict::Allow {
         sql: sql.into_owned(),
         warnings,
+        is_query: matches!(stmt, Statement::Query(_)),
     }
 }
 
@@ -477,6 +490,30 @@ impl Visitor for Checker<'_> {
     /// all parse into ShowVariable under this dialect).
     fn pre_visit_statement(&mut self, stmt: &Statement) -> ControlFlow<Self::Break> {
         match stmt {
+            // EXPLAIN ANALYZE *runs* the statement — it is an execution wearing
+            // a plan's clothes, and it slips past everything a plan-based
+            // guardrail can do (no plan is returned to judge, and the row limit
+            // does not apply to plan output either). Only a plain query needs
+            // this arm: a write inside the EXPLAIN falls through and the
+            // recursion below denies it with the sharper WRITE_OPERATION.
+            Statement::Explain {
+                analyze,
+                options,
+                statement,
+                ..
+            } if explain_executes(*analyze, options.as_deref())
+                && matches!(**statement, Statement::Query(_)) =>
+            {
+                break_deny(deny(
+                    DenyReason::ExplainAnalyze,
+                    "EXPLAIN ANALYZE executes the statement it is asked to explain, so it is \
+                     an execution, not a plan"
+                        .to_string(),
+                    "run `nyet explain <alias> <query>` instead — it returns the plan and a \
+                     cost estimate without executing anything; a plain EXPLAIN (no ANALYZE) \
+                     is accepted as a query too",
+                ))
+            }
             Statement::Query(_)
             | Statement::Explain { .. }
             | Statement::ExplainTable { .. }
@@ -611,6 +648,29 @@ impl Checker<'_> {
         }
         ControlFlow::Continue(())
     }
+}
+
+/// Does this EXPLAIN carry ANALYZE? Every spelling of it:
+///
+/// - the keyword form (`EXPLAIN ANALYZE ...`) sets the `analyze` flag, while the
+///   PostgreSQL parenthesized form (`EXPLAIN (ANALYZE, FORMAT JSON) ...`) lands
+///   in `options` with the flag left FALSE — reading only the flag left the whole
+///   paren form as a bypass;
+/// - **PostgreSQL also accepts the British `ANALYSE`**, and `EXPLAIN (ANALYSE)
+///   SELECT ...` executed the query in full (verified live) while a name match on
+///   "analyze" alone waved it through.
+///
+/// Any such option counts, `(analyze false)` included: fail closed.
+fn explain_executes(analyze: bool, options: Option<&[UtilityOption]>) -> bool {
+    analyze
+        || options.is_some_and(|options| {
+            options.iter().any(|o| {
+                matches!(
+                    o.name.value.to_ascii_lowercase().as_str(),
+                    "analyze" | "analyse"
+                )
+            })
+        })
 }
 
 fn break_deny(v: Verdict) -> ControlFlow<Box<Verdict>> {
@@ -843,7 +903,7 @@ mod tests {
     #[test]
     fn allow_carries_normalized_sql_and_warning() {
         match validate_default("SEL\u{200D}ECT 1") {
-            Verdict::Allow { sql, warnings } => {
+            Verdict::Allow { sql, warnings, .. } => {
                 assert_eq!(sql, "SELECT 1");
                 assert_eq!(warnings.len(), 1);
                 assert_eq!(warnings[0].code, "UNICODE_STRIPPED");
@@ -853,7 +913,7 @@ mod tests {
         }
         // No stripping -> no warnings, sql passes through unchanged.
         match validate_default("SELECT 1") {
-            Verdict::Allow { sql, warnings } => {
+            Verdict::Allow { sql, warnings, .. } => {
                 assert_eq!(sql, "SELECT 1");
                 assert!(warnings.is_empty());
             }

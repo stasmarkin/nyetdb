@@ -60,6 +60,12 @@
 - query: EXPLAIN ANALYZE UPDATE users SET email = 'x'
   verdict: deny
   reason: WRITE_OPERATION
+# EXPLAIN ANALYZE *executes* the statement, so it is refused on its own —
+# even over a plain read, where nothing else would stop it (the allow twin
+# `EXPLAIN SELECT ...` is above).
+- query: EXPLAIN ANALYZE SELECT * FROM users
+  verdict: deny
+  reason: EXPLAIN_ANALYZE
 
 # --- multiple statements: the classic piggyback ---
 - query: SELECT 1; SELECT 2

@@ -129,7 +129,7 @@ ssh и разбор ошибок.
 Каждый пункт — такой же self-contained шаг со своим value/тестами/доками:
 
 7. ~~`nyet schema` — introspection, токен-оптимизированный формат (UX-3, UX-4).~~ **сделано**
-8. `nyet explain` + auto-guardrail по стоимости плана.
+8. ~~`nyet explain` + auto-guardrail по стоимости плана.~~ **сделано**
 9. `nyet doctor` — честная диагностика сетапа (UX-7).
 10. `nyet agent-setup` — генерация инструкции для AGENTS.md/скилла (UX-3).
 11. Аудит-лог (UX-8).

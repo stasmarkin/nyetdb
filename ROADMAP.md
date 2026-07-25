@@ -91,8 +91,8 @@ introspection, auto-guardrail через EXPLAIN). Ниша подтвержде
 
 - [x] `nyet schema <alias> [table]` — компактный introspection (таблицы,
       колонки, индексы, FK), токен-оптимизированный формат
-- [ ] `nyet explain` — EXPLAIN с человекочитаемым вердиктом
-- [ ] Auto-guardrail: EXPLAIN перед тяжёлым запросом; стоимость выше порога →
+- [x] `nyet explain` — EXPLAIN с человекочитаемым вердиктом
+- [x] Auto-guardrail: EXPLAIN перед тяжёлым запросом; стоимость выше порога →
       не выполнять, вернуть план и совет
 - [ ] `nyet doctor` — коннективность, реально ли read-only роль (write в
       откатываемой транзакции), не superuser ли, права конфига

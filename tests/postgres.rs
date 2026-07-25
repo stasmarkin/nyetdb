@@ -49,19 +49,25 @@ async fn start_and_seed() -> (ContainerAsync<Postgres>, u16) {
     (container, port)
 }
 
-fn write_pg_config(dir: &Path, port: u16) -> std::path::PathBuf {
-    let path = dir.join("config.toml");
+/// Config for the container, optionally with extra sections (a `[guardrail]`).
+/// Each variant gets its own file name so several can coexist in one temp dir.
+fn write_pg_config_with(dir: &Path, port: u16, extra: &str) -> std::path::PathBuf {
+    let path = dir.join(format!("config{}.toml", extra.len()));
     std::fs::write(
         &path,
         format!(
             "[connections.pg]\nengine = \"postgres\"\n\
              url = \"postgres://postgres@127.0.0.1:{port}/postgres\"\n\
-             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n{extra}",
             dir.display()
         ),
     )
     .unwrap();
     path
+}
+
+fn write_pg_config(dir: &Path, port: u16) -> std::path::PathBuf {
+    write_pg_config_with(dir, port, "")
 }
 
 /// Run the binary with a clean environment plus HOME and the password env var.
@@ -171,10 +177,19 @@ fn postgres_query_end_to_end() {
         assert_no_password_leak(&out);
 
         // 5) timeout: a heavy scan cancelled by the server statement_timeout ->
-        // exit 8. pg_sleep is denylisted, so use a huge generate_series scan.
+        // exit 8. pg_sleep is denylisted, so use a huge generate_series scan —
+        // which the auto-guardrail now refuses on sight (its plan costs 1.25e9,
+        // way over the default limit), so this case turns the guardrail OFF to
+        // keep testing the timeout path itself. That interaction is the point:
+        // with the guardrail on, such a query never reaches the server at all.
+        let unguarded = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.guardrail]\nmode = \"off\"\n",
+        );
         let out = run(
             tmp.path(),
-            &cfg,
+            &unguarded,
             &[
                 "query",
                 "pg",
@@ -387,6 +402,300 @@ fn postgres_schema_end_to_end() {
         let out = run(tmp.path(), &cfg, &["schema", "pg"]);
         let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
         assert_eq!(v["meta"]["table_count"], 7);
+
+        container.rm().await.unwrap();
+    });
+}
+
+/// The auto-guardrail and `nyet explain` against a real planner: the default
+/// (generous) threshold lets ordinary reads through and stops an obvious
+/// monster, a configured threshold decides deterministically, and `off` really
+/// is off. Nothing here relies on timing.
+#[test]
+fn postgres_guardrail_and_explain_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_pg_config(tmp.path(), port);
+
+        // 1) No [guardrail] section = the default (cost, 1e6): an ordinary read
+        // is untouched, envelope byte-for-byte as before (no estimate field, no
+        // warning) — the guardrail is invisible until it fires.
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["query", "pg", "SELECT id, email FROM users ORDER BY id"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["meta"]["row_count"], 3);
+        // The guardrail read a real estimate, so it stays silent: no
+        // GUARDRAIL_SKIPPED, and a success envelope carries no `estimate`.
+        assert!(!stdout(&out).contains("GUARDRAIL_SKIPPED"), "{v}");
+        assert!(v.get("estimate").is_none(), "{v}");
+
+        // 2) A real monster (10^12 rows out of a cross join) is refused by the
+        // DEFAULT threshold — the whole point of shipping it on by default.
+        let monster = "SELECT count(*) FROM generate_series(1, 1000000) a \
+                       CROSS JOIN generate_series(1, 1000000) b";
+        let out = run(tmp.path(), &cfg, &["query", "pg", monster]);
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["code"], "NYET");
+        assert_eq!(v["error"]["reason"], "EXPENSIVE_QUERY");
+        // The refusal teaches: the plan travels with it, and the way out names
+        // the config key its owner can raise (there is no --force, on purpose).
+        assert_eq!(v["estimate"]["mode"], "cost");
+        assert_eq!(v["estimate"]["verdict"], "expensive");
+        assert_eq!(v["estimate"]["threshold"], 1_000_000.0);
+        assert!(v["estimate"]["cost"].as_f64().unwrap() > 1_000_000.0, "{v}");
+        assert!(v["estimate"]["plan"][0]["Plan"].is_object(), "{v}");
+        let hint = v["error"]["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("[connections.pg.guardrail] max_cost"),
+            "{hint}"
+        );
+        assert_no_password_leak(&out);
+
+        // 3) A configured threshold decides — no reliance on planner magnitudes.
+        let tiny = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.guardrail]\nmode = \"cost\"\nmax_cost = 1.0\n",
+        );
+        let out = run(tmp.path(), &tiny, &["query", "pg", "SELECT * FROM users"]);
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["reason"], "EXPENSIVE_QUERY");
+        assert_eq!(v["estimate"]["threshold"], 1.0);
+        // ...and rows mode judges rows instead: 3 planned rows > a limit of 1.
+        let rows_mode = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.guardrail]\nmode = \"rows\"\nmax_rows = 1\n",
+        );
+        let out = run(
+            tmp.path(),
+            &rows_mode,
+            &["query", "pg", "SELECT * FROM users"],
+        );
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["estimate"]["mode"], "rows");
+        assert_eq!(v["estimate"]["threshold"], 1);
+        assert!(v["estimate"]["rows"].as_u64().unwrap() >= 3, "{v}");
+
+        // 4) mode = "off" really is off: the same query that the 1.0 threshold
+        // above refused now runs.
+        let cfg_off = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.guardrail]\nmode = \"off\"\n",
+        );
+        let out = run(tmp.path(), &cfg_off, &["query", "pg", "SELECT * FROM users"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+        // 5) A metadata statement carries no plan, so the guardrail leaves it
+        // alone — even under the 1.0 threshold that refuses everything else.
+        let out = run(tmp.path(), &tiny, &["query", "pg", "SHOW search_path"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let out = run(tmp.path(), &tiny, &["query", "pg", "EXPLAIN SELECT 1"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+        // 6) nyet explain: the plan plus an informational verdict, and nothing
+        // executed either way (exit 0 even for the monster).
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["explain", "pg", "SELECT id FROM users WHERE id = 1"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["estimate"]["mode"], "cost");
+        assert_eq!(v["estimate"]["verdict"], "ok");
+        assert!(v["estimate"]["cost"].as_f64().unwrap() < 1_000_000.0, "{v}");
+        assert!(v["estimate"]["rows"].is_u64(), "{v}");
+        assert!(
+            v["estimate"]["plan"][0]["Plan"]["Node Type"].is_string(),
+            "{v}"
+        );
+        assert_eq!(v["meta"]["connection"], "pg");
+        assert_no_password_leak(&out);
+
+        let out = run(tmp.path(), &cfg, &["explain", "pg", monster]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["estimate"]["verdict"], "expensive");
+        // The table format renders the plan for human eyes on stdout.
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["explain", "pg", "SELECT * FROM users", "--format", "table"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert!(
+            stdout(&out).starts_with("verdict: ok (mode cost)"),
+            "{}",
+            stdout(&out)
+        );
+        assert!(stdout(&out).contains("Seq Scan"), "{}", stdout(&out));
+
+        // 7) A RECURSIVE CTE: PostgreSQL does not estimate the iteration, so the
+        // plan of an unbounded recursion costs ~3.35 — the guardrail must
+        // refuse to JUDGE such a plan instead of blessing it. The query still
+        // runs (bounded here so the test is fast) and says so.
+        //
+        // ...but that must NOT be an off switch: the same trivial CTE glued
+        // onto the monster leaves the monster's own cost in the plan, so the
+        // refusal stands (this exact trick disabled the guardrail before).
+        let disguised = "WITH RECURSIVE z(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM z WHERE n < 2)              SELECT count(*) FROM generate_series(1, 1000000) a              CROSS JOIN generate_series(1, 1000000) b WHERE a = (SELECT max(n) FROM z)";
+        let out = run(tmp.path(), &cfg, &["query", "pg", disguised]);
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["reason"], "EXPENSIVE_QUERY", "{v}");
+        let recursive = "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c                          WHERE n < 10) SELECT count(*) FROM c";
+        let out = run(tmp.path(), &cfg, &["query", "pg", recursive]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["rows"][0]["count"], 10);
+        let warnings = v["warnings"].as_array().unwrap();
+        let skipped = warnings
+            .iter()
+            .find(|w| w["code"] == "GUARDRAIL_SKIPPED")
+            .unwrap_or_else(|| panic!("no GUARDRAIL_SKIPPED: {v}"));
+        // Д10: the warning says what to do about it.
+        assert!(
+            skipped["message"].as_str().unwrap().contains("WHERE/LIMIT"),
+            "{skipped}"
+        );
+        // ...and `nyet explain` reports no_estimate — NOT a confident "ok".
+        let out = run(tmp.path(), &cfg, &["explain", "pg", recursive]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["estimate"]["verdict"], "no_estimate", "{v}");
+        // The number is still shown — it is a LOWER bound, not a verdict, and
+        // the missing `threshold` says nothing was compared.
+        assert!(v["estimate"]["cost"].is_number(), "{v}");
+        assert!(v["estimate"].get("threshold").is_none(), "{v}");
+        assert!(
+            v["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == "GUARDRAIL_SKIPPED"),
+            "{v}"
+        );
+
+        // 8) A query the server cannot plan is an ordinary DB_ERROR (exit 7)
+        // with the REAL reason: the guardrail's EXPLAIN fails first and aborts
+        // the transaction, so without the SAVEPOINT around it the query below
+        // would report "current transaction is aborted" instead of the missing
+        // relation — the fail-open path would be broken on Postgres entirely.
+        let out = run(tmp.path(), &cfg, &["query", "pg", "SELECT * FROM nope_x"]);
+        assert_eq!(out.status.code(), Some(7), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains("nope_x"), "{message}");
+        assert!(!message.contains("transaction is aborted"), "{message}");
+        let out = run(tmp.path(), &cfg, &["explain", "pg", "SELECT * FROM nope_x"]);
+        assert_eq!(out.status.code(), Some(7), "{}", stdout(&out));
+
+        // 8b) PLANNING TIME IS AGENT-CONTROLLABLE: PostgreSQL folds IMMUTABLE
+        // expressions while planning, so a chain of md5(repeat(...)) makes the
+        // EXPLAIN itself take seconds (measured: 583ms for three 60MB terms).
+        // If "no plan in time" fell open, that would be the cheapest guardrail
+        // off switch there is — so exceeding the guardrail's budget REFUSES,
+        // with the same EXPENSIVE_QUERY reason and no plan to show.
+        // Sized for determinism, not for speed: 48 terms of ~130ms of planning
+        // each (~6s) against a 5s budget (`--timeout 10` -> the 5s cap) and a
+        // 10s query deadline. Both margins are wide, and the deciding timer is
+        // a timer, not the work — with the budget and the client deadline set to
+        // the same instant this case used to flake one run in three, and the
+        // losing branch fell OPEN. NB: PostgreSQL does NOT interrupt plan-time
+        // const-folding on `statement_timeout`, so here the client deadline is
+        // the one that fires; the connection is dropped rather than tidied
+        // (tidying would queue behind the very planning we gave up on).
+        let padding: Vec<String> = (0..48)
+            .map(|i| format!("md5(repeat('{i}', 40000000))"))
+            .collect();
+        let slow_to_plan = format!("SELECT {}", padding.join(" || "));
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["query", "pg", &slow_to_plan, "--timeout", "10"],
+        );
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["code"], "NYET");
+        assert_eq!(v["error"]["reason"], "EXPENSIVE_QUERY", "{v}");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("budget"),
+            "{v}"
+        );
+        assert!(v.get("estimate").is_none(), "no plan was obtained: {v}");
+        // 8c) The same thing on a SHORT timeout, where the margins are thin:
+        // with `--timeout 2` the guardrail's deadline is 1.8s and the query's is
+        // 2s, so the refusal has to come out of a busy connection without any
+        // polite cleanup — that cleanup used to queue behind the abandoned
+        // planning and let the outer timer answer TIMEOUT instead.
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["query", "pg", &slow_to_plan, "--timeout", "2"],
+        );
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["reason"], "EXPENSIVE_QUERY", "{v}");
+        // `nyet explain` runs the SAME budget (it has no --timeout flag, so the
+        // connection's timeout_secs decides), so it agrees with the query
+        // instead of grinding for the full timeout and reporting a cheerful
+        // "ok": no plan, an honest no_estimate, and a warning that says what
+        // `nyet query` would do.
+        let short = write_pg_config_with(tmp.path(), port, "timeout_secs = 2\n");
+        let out = run(tmp.path(), &short, &["explain", "pg", &slow_to_plan]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["estimate"]["verdict"], "no_estimate", "{v}");
+        assert_eq!(v["estimate"]["plan"], serde_json::json!([]), "{v}");
+        let warned = v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["code"] == "GUARDRAIL_SKIPPED")
+            .unwrap_or_else(|| panic!("no GUARDRAIL_SKIPPED: {v}"));
+        assert!(
+            warned["message"].as_str().unwrap().contains("budget"),
+            "{warned}"
+        );
+
+        // ...and with the guardrail off the same statement is just a query
+        // again (bounded by the timeout, as before) — the refusal above is the
+        // guardrail's doing, not a new blanket ban.
+        let out = run(
+            tmp.path(),
+            &cfg_off,
+            &["query", "pg", &slow_to_plan, "--timeout", "10"],
+        );
+        assert!(
+            matches!(out.status.code(), Some(0 | 8)),
+            "{:?}: {}",
+            out.status.code(),
+            stdout(&out)
+        );
+
+        // 9) The BRITISH spelling of ANALYZE executes the query just the same,
+        // and it used to sail past the validator (verified: it ran a 2e7-row
+        // aggregate). Refused, like every other EXPLAIN ANALYZE.
+        for statement in [
+            "EXPLAIN (ANALYSE) SELECT count(*) FROM users",
+            "EXPLAIN (BUFFERS, ANALYSE) SELECT count(*) FROM users",
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM users",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "pg", statement]);
+            assert_eq!(out.status.code(), Some(5), "{statement}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["reason"], "EXPLAIN_ANALYZE", "{statement}");
+        }
 
         container.rm().await.unwrap();
     });

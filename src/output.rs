@@ -31,6 +31,10 @@ struct ErrorEnvelope<'a> {
     v: u8,
     ok: bool,
     error: ErrorBody<'a>,
+    /// Only on an `EXPENSIVE_QUERY` refusal: the plan the guardrail judged, so
+    /// the agent can fix the query without a second round trip (UX-2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimate: Option<&'a Estimate>,
 }
 
 #[derive(Serialize)]
@@ -302,6 +306,98 @@ fn key_parts_visible(parts: &[KeyPart], columns: &[SchemaColumn]) -> bool {
     })
 }
 
+/// The `estimate` object of the envelope — the SAME shape in a `nyet explain`
+/// success and in an `EXPENSIVE_QUERY` refusal, so an agent parses one thing.
+/// Built by `guardrail::Guardrail::describe`.
+#[derive(Serialize)]
+pub struct Estimate {
+    /// The connection's guardrail mode: `cost` | `rows` | `off`.
+    pub mode: &'static str,
+    /// `ok` (under the threshold) | `expensive` (above it, refused) |
+    /// `no_estimate` (nothing was compared: mode `off`, an engine without
+    /// estimates, or a plan that carried no usable number).
+    pub verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// The limit the verdict was made against; absent when nothing was compared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<Value>,
+    pub plan: Value,
+}
+
+#[derive(Serialize)]
+pub struct ExplainMeta {
+    pub duration_ms: u64,
+    pub connection: String,
+}
+
+#[derive(Serialize)]
+struct ExplainEnvelope<'a> {
+    v: u8,
+    ok: bool,
+    /// Absent in the data-less (stderr) envelope of the table format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimate: Option<&'a Estimate>,
+    meta: &'a ExplainMeta,
+    #[serde(skip_serializing_if = "<[Warning]>::is_empty")]
+    warnings: &'a [Warning],
+}
+
+pub fn explain_json(estimate: &Estimate, meta: &ExplainMeta, warnings: &[Warning]) -> String {
+    to_json(&ExplainEnvelope {
+        v: ENVELOPE_V,
+        ok: true,
+        estimate: Some(estimate),
+        meta,
+        warnings,
+    })
+}
+
+pub fn explain_meta_json(meta: &ExplainMeta, warnings: &[Warning]) -> String {
+    to_json(&ExplainEnvelope {
+        v: ENVELOPE_V,
+        ok: true,
+        estimate: None,
+        meta,
+        warnings,
+    })
+}
+
+/// Human rendering of a plan (the `table` format): the verdict line, then the
+/// plan itself — one line per entry for the array-of-strings plans (SQLite),
+/// indented JSON otherwise (the engines' own plan structures).
+pub fn explain_text(estimate: &Estimate) -> String {
+    let mut out = format!("verdict: {} (mode {})", estimate.verdict, estimate.mode);
+    if let Some(cost) = estimate.cost {
+        out.push_str(&format!("  cost {cost}"));
+    }
+    if let Some(rows) = estimate.rows {
+        out.push_str(&format!("  rows {rows}"));
+    }
+    if let Some(threshold) = &estimate.threshold {
+        out.push_str(&format!("  limit {threshold}"));
+    }
+    out.push('\n');
+    out.push_str(&plan_text(&estimate.plan));
+    out
+}
+
+fn plan_text(plan: &Value) -> String {
+    match plan.as_array() {
+        // SQLite: already one plain line per plan step.
+        Some(lines) if lines.iter().all(Value::is_string) => lines
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|l| format!("{l}\n"))
+            .collect(),
+        // Serialization of our own already-parsed Value cannot fail; a
+        // pretty-print that somehow did would still not be worth a panic.
+        _ => serde_json::to_string_pretty(plan).unwrap_or_else(|_| plan.to_string()) + "\n",
+    }
+}
+
 #[derive(Serialize)]
 struct SchemaEnvelope<'a> {
     v: u8,
@@ -445,7 +541,13 @@ pub fn bare_success() -> String {
     })
 }
 
-pub fn error_json(code: &str, reason: Option<&str>, message: &str, hint: &str) -> String {
+pub fn error_json(
+    code: &str,
+    reason: Option<&str>,
+    message: &str,
+    hint: &str,
+    estimate: Option<&Estimate>,
+) -> String {
     to_json(&ErrorEnvelope {
         v: ENVELOPE_V,
         ok: false,
@@ -455,6 +557,7 @@ pub fn error_json(code: &str, reason: Option<&str>, message: &str, hint: &str) -
             message,
             hint,
         },
+        estimate,
     })
 }
 
@@ -633,7 +736,7 @@ mod tests {
     #[test]
     fn error_envelope_is_compact_and_stable() {
         assert_eq!(
-            error_json("CONFIG_INVALID", None, "boom", "fix it"),
+            error_json("CONFIG_INVALID", None, "boom", "fix it", None),
             r#"{"v":1,"ok":false,"error":{"code":"CONFIG_INVALID","message":"boom","hint":"fix it"}}"#
         );
     }
@@ -641,8 +744,107 @@ mod tests {
     #[test]
     fn nyet_refusal_envelope_carries_reason() {
         assert_eq!(
-            error_json("NYET", Some("WRITE_OPERATION"), "no", "rewrite"),
+            error_json("NYET", Some("WRITE_OPERATION"), "no", "rewrite", None),
             r#"{"v":1,"ok":false,"error":{"code":"NYET","reason":"WRITE_OPERATION","message":"no","hint":"rewrite"}}"#
+        );
+    }
+
+    fn plan() -> Value {
+        serde_json::json!([{"Plan": {"Node Type": "Seq Scan", "Total Cost": 2500000.0}}])
+    }
+
+    fn expensive() -> Estimate {
+        Estimate {
+            mode: "cost",
+            verdict: "expensive",
+            cost: Some(2_500_000.0),
+            rows: Some(9_000_000),
+            threshold: Some(Value::from(1_000_000.0)),
+            plan: plan(),
+        }
+    }
+
+    /// The guardrail refusal: a normal NYET envelope PLUS the plan that
+    /// justified it, so the agent can fix the query without asking again.
+    #[test]
+    fn expensive_query_refusal_envelope_carries_the_plan() {
+        assert_eq!(
+            error_json(
+                "NYET",
+                Some("EXPENSIVE_QUERY"),
+                "too big",
+                "narrow it",
+                Some(&expensive())
+            ),
+            r#"{"v":1,"ok":false,"error":{"code":"NYET","reason":"EXPENSIVE_QUERY","message":"too big","hint":"narrow it"},"estimate":{"mode":"cost","verdict":"expensive","cost":2500000.0,"rows":9000000,"threshold":1000000.0,"plan":[{"Plan":{"Node Type":"Seq Scan","Total Cost":2500000.0}}]}}"#
+        );
+    }
+
+    fn explain_meta() -> ExplainMeta {
+        ExplainMeta {
+            duration_ms: 7,
+            connection: "prod".into(),
+        }
+    }
+
+    #[test]
+    fn explain_envelope_is_compact_and_stable() {
+        // A cheap query: the same shape, verdict ok.
+        let ok = Estimate {
+            mode: "cost",
+            verdict: "ok",
+            cost: Some(12.5),
+            rows: Some(3),
+            threshold: Some(Value::from(1_000_000.0)),
+            plan: plan(),
+        };
+        assert_eq!(
+            explain_json(&ok, &explain_meta(), &[]),
+            r#"{"v":1,"ok":true,"estimate":{"mode":"cost","verdict":"ok","cost":12.5,"rows":3,"threshold":1000000.0,"plan":[{"Plan":{"Node Type":"Seq Scan","Total Cost":2500000.0}}]},"meta":{"duration_ms":7,"connection":"prod"}}"#
+        );
+        // The expensive verdict is informational here (nothing was executed
+        // either way — explain never runs the query).
+        assert_eq!(
+            explain_json(&expensive(), &explain_meta(), &[]),
+            r#"{"v":1,"ok":true,"estimate":{"mode":"cost","verdict":"expensive","cost":2500000.0,"rows":9000000,"threshold":1000000.0,"plan":[{"Plan":{"Node Type":"Seq Scan","Total Cost":2500000.0}}]},"meta":{"duration_ms":7,"connection":"prod"}}"#
+        );
+    }
+
+    /// SQLite (and any off-mode connection): the plan is real, the numbers are
+    /// absent, and nyet says so instead of inventing a metric (UX-7).
+    #[test]
+    fn explain_envelope_without_numbers_omits_them() {
+        let none = Estimate {
+            mode: "off",
+            verdict: "no_estimate",
+            cost: None,
+            rows: None,
+            threshold: None,
+            plan: serde_json::json!(["SCAN users", "USE TEMP B-TREE FOR ORDER BY"]),
+        };
+        assert_eq!(
+            explain_json(&none, &explain_meta(), &[]),
+            r#"{"v":1,"ok":true,"estimate":{"mode":"off","verdict":"no_estimate","plan":["SCAN users","USE TEMP B-TREE FOR ORDER BY"]},"meta":{"duration_ms":7,"connection":"prod"}}"#
+        );
+        // table format: data on stdout, this envelope (payload dropped) on stderr.
+        let warnings = [Warning {
+            code: "GUARDRAIL_SKIPPED",
+            message: "no usable estimate".into(),
+        }];
+        assert_eq!(
+            explain_meta_json(&explain_meta(), &warnings),
+            r#"{"v":1,"ok":true,"meta":{"duration_ms":7,"connection":"prod"},"warnings":[{"code":"GUARDRAIL_SKIPPED","message":"no usable estimate"}]}"#
+        );
+        // ...and the human rendering: verdict line, then one plan line each.
+        assert_eq!(
+            explain_text(&none),
+            "verdict: no_estimate (mode off)\nSCAN users\nUSE TEMP B-TREE FOR ORDER BY\n"
+        );
+        assert_eq!(
+            explain_text(&expensive()),
+            "verdict: expensive (mode cost)  cost 2500000  rows 9000000  limit 1000000.0\n\
+             [\n  {\n    \"Plan\": {\n      \"Node Type\": \"Seq Scan\",\n      \
+             \"Total Cost\": 2500000.0\n    }\n  }\n]\n"
         );
     }
 

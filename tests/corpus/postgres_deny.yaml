@@ -42,6 +42,40 @@
 - query: EXPLAIN ANALYZE UPDATE users SET email = 'x'
   verdict: deny
   reason: WRITE_OPERATION
+# A write inside the parenthesized option form is caught by the recursive walk
+# too (a different parse shape: the options land beside the statement).
+- query: EXPLAIN (ANALYZE, FORMAT JSON) DELETE FROM users
+  verdict: deny
+  reason: WRITE_OPERATION
+# EXPLAIN ANALYZE *executes* the statement — refused over a plain read as well,
+# in both spellings (the keyword one, and the PostgreSQL option form, which
+# sqlparser keeps in a different field).
+- query: EXPLAIN ANALYZE SELECT * FROM users
+  verdict: deny
+  reason: EXPLAIN_ANALYZE
+- query: EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM users
+  verdict: deny
+  reason: EXPLAIN_ANALYZE
+- query: EXPLAIN (ANALYZE) SELECT 1
+  verdict: deny
+  reason: EXPLAIN_ANALYZE
+# PostgreSQL also accepts the BRITISH spelling, and it executes just the same —
+# a name match on "analyze" alone let this one run the query in full.
+- query: EXPLAIN (ANALYSE) SELECT 1
+  verdict: deny
+  reason: EXPLAIN_ANALYZE
+- query: EXPLAIN (analyse true) SELECT 1
+  verdict: deny
+  reason: EXPLAIN_ANALYZE
+- query: EXPLAIN (BUFFERS, ANALYSE) SELECT 1
+  verdict: deny
+  reason: EXPLAIN_ANALYZE
+# The bare keyword form of it: sqlparser does not know ANALYSE, so it fails
+# closed at the parser instead — pinned so a future parser upgrade that starts
+# accepting it cannot silently turn it into an allow.
+- query: EXPLAIN ANALYSE SELECT 1
+  verdict: deny
+  reason: PARSE_FAILED
 
 # --- COPY moves data in/out of the server; never a plain read ---
 - query: COPY users TO STDOUT

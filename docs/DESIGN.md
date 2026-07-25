@@ -18,7 +18,7 @@
 nyet query <alias> <query> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
 nyet list [--format json|table]
 nyet schema <alias> [table] [--format json|table]
-nyet explain <alias> <query>       # v0.3
+nyet explain <alias> <query> [--format json|table]
 nyet doctor [alias]                # v0.3
 nyet agent-setup                   # v0.3
 ```
@@ -48,7 +48,10 @@ nyet agent-setup                   # v0.3
 }
 ```
 
-Отказ валидатора — фирменный код `NYET`, конкретика в `reason`:
+Отказ валидатора **или guardrail'а** — фирменный код `NYET`, конкретика в
+`reason` (валидаторные reason'ы + `EXPENSIVE_QUERY`, владелец которого —
+guardrail; отказ guardrail'а дополнительно несёт top-level поле `estimate` с
+планом и оценкой):
 
 ```json
 {
@@ -80,7 +83,7 @@ nyet agent-setup                   # v0.3
 | 2 | ошибка использования CLI (clap default) |
 | 3 | ошибка конфига (не найден, невалиден, битые права) |
 | 4 | подключение недоступно из текущей папки (directory scoping) |
-| 5 | запрос отклонён валидатором (`error.code = "NYET"`) |
+| 5 | запрос отклонён валидатором или guardrail'ом (`error.code = "NYET"`) |
 | 6 | ошибка соединения/auth (сеть, ssh-туннель, креденшалы) |
 | 7 | база вернула ошибку выполнения |
 | 8 | timeout |
@@ -108,6 +111,8 @@ nyet agent-setup                   # v0.3
 row_limit = 1000
 timeout_secs = 30
 format = "json"
+max_row_limit = 10000                  # опциональные потолки: выше них
+max_timeout_secs = 60                  # --limit/--timeout агента не поднимут
 
 [connections.prod]
 engine = "postgres"                    # postgres | mysql | sqlite (v0.2) | ...
@@ -116,11 +121,18 @@ password_env = "PROD_DB_PASSWORD"      # имя env-переменной; в к�
 allowed_dirs = ["~/Workspace/app"]     # пусто/отсутствует = запрещено везде
 row_limit = 500
 timeout_secs = 10
+max_row_limit = 5000                   # потолки per-connection перекрывают
+max_timeout_secs = 30                  # [defaults]
 
 [connections.prod.validator]
 allow_functions = ["pg_sleep"]         # убрать из встроенного denylist (осознанный риск)
 deny_functions  = ["my_scary_fn"]      # добавить свои запреты
 # для Redis/Mongo (v0.4) — та же пара: allow_commands / deny_commands
+
+[connections.prod.guardrail]
+mode = "cost"                          # cost | rows | off; дефолт зависит от движка
+max_cost = 1000000.0                   # порог для mode = "cost" (только PostgreSQL)
+max_rows = 10000000                    # порог для mode = "rows"
 
 [connections.prod.ssh]
 host = "deploy@bastion.corp:22"
@@ -152,6 +164,20 @@ allowed_dirs = ["~/Workspace/app"]
 - **`validator.allow_functions` / `deny_functions`**: правят встроенный
   denylist per-connection. Policy настраивается; внутренняя механика
   (как получается классификация) — нет.
+- **Потолки `max_row_limit` / `max_timeout_secs`**: effective = min(обычный
+  резолв flag→conn→defaults→встроенный, потолок). Потолок клампит и флаг, и
+  конфигурное значение выше него (противоречие в конфиге — в строгую сторону),
+  кламп молчаливый. Ключей нет → поведение прежнее. Потолок `0` — ошибка (exit 3).
+- **Policy-значения — только литералы**: подстановка `${VAR}` запрещена в
+  `allowed_dirs`, `validator.allow_functions`/`deny_functions` и
+  `guardrail.mode`. Окружением управляет вызывающий агент (threat model), а
+  через эти ключи он иначе расширил бы себе scope, снял бы запрет функции или
+  выключил guardrail.
+- **`guardrail`**: режим, не поддерживаемый движком (`cost` для MySQL/SQLite,
+  любой кроме `off` для SQLite), неизвестный `mode`, порог `<= 0` и порог,
+  который активный режим не читает (`max_rows` при `mode = "cost"`), — жёсткая
+  ошибка (exit 3), а не тихий откат к «без guardrail». Глобальных дефолтов в
+  `[defaults]` для guardrail нет (YAGNI): порог — свойство конкретной базы.
 - Неизвестные ключи в конфиге — жёсткая ошибка (fail loud, ловит опечатки).
 
 ---
@@ -233,7 +259,10 @@ zero-width unicode, denylist-функции), а также представит
   «удружил и почистил таблицу», writes, индуцированные prompt injection из
   данных/тикетов/PR.
 - **Тяжёлые запросы**: full scan на десятки миллионов строк, отсутствие LIMIT —
-  митигируются timeout, row limit, (v0.3) auto-guardrail через EXPLAIN.
+  митигируются timeout, row limit и auto-guardrail через EXPLAIN (оценка плана
+  выше порога → запрос не выполняется, `NYET`/`EXPENSIVE_QUERY`, exit 5).
+  Guardrail — best effort против монстров, а не гарантия: движок без оценок
+  (SQLite) и нераспарсенный план его не включают (см. docs/DEV.md).
 - **Попадание креденшалов в контекст LLM**: агент оперирует алиасами; пароли —
   только в env/конфиге, nyet никогда не выводит их в stdout/stderr/логи.
 

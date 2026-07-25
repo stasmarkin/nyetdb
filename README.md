@@ -29,6 +29,9 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
   json / jsonl / csv / table output;
 - **SSH tunnels** for PostgreSQL and MySQL/MariaDB: reach a database behind a
   bastion by shelling out to the system `ssh` (see the SSH tunnels section below);
+- `nyet explain` and the **auto-guardrail**: the query plan, a cost estimate and
+  a verdict — and, before `nyet query` runs anything, a refusal for plans whose
+  estimate is over the connection's threshold (see below);
 - the stable JSON envelope and exit-code contract.
 
 Redis, MongoDB and ClickHouse arrive in later releases; `nyet query` against a
@@ -88,6 +91,9 @@ Full annotated example:
 row_limit = 1000       # max rows returned per query
 timeout_secs = 30      # per-query timeout
 format = "json"        # default output format: json | jsonl | table | csv
+# Optional ceilings: the agent's --limit / --timeout cannot go above these.
+max_row_limit = 10000
+max_timeout_secs = 60
 
 [connections.prod]
 engine = "postgres"                    # postgres | mysql | sqlite | ...
@@ -99,12 +105,21 @@ password_env = "PROD_DB_PASSWORD"      # NAME of an env var; no password in the 
 allowed_dirs = ["~/Workspace/app"]
 row_limit = 500
 timeout_secs = 10
+max_row_limit = 5000                   # optional ceilings for this connection,
+max_timeout_secs = 30                  # overriding the [defaults] ones
 
 # Validator policy tuning — see the Security section below.
 # CAUTION: every allow_functions entry is a conscious risk you take.
 [connections.prod.validator]
 allow_functions = ["pg_sleep"]         # remove from the built-in denylist
 deny_functions = ["my_scary_fn"]       # add your own bans
+
+# Auto-guardrail: refuse a query whose PLAN is over the limit (see below).
+# On by default with a generous limit; which modes exist depends on the engine.
+[connections.prod.guardrail]
+mode = "cost"                          # cost | rows | off
+max_cost = 1000000.0                   # cost mode (PostgreSQL only)
+max_rows = 10000000                    # rows mode
 
 # SSH tunnel to reach the database through a bastion (see the section below).
 [connections.prod.ssh]
@@ -288,7 +303,11 @@ picked automatically.
 Rules:
 
 - `${VAR}` is substituted in any string value; a missing variable is a hard
-  error (exit 3), never an empty string. Exception: `allowed_dirs` — see below.
+  error (exit 3), never an empty string. Exception — **policy values must be
+  literal**: `allowed_dirs`, `validator.allow_functions` / `deny_functions` and
+  `guardrail.mode` reject `${VAR}` outright, because the environment is
+  controlled by the calling agent and substitution there would let it widen its
+  own scope, un-deny a function or switch the guardrail off.
 - Unknown keys are hard errors — typos fail loudly.
 - If the config file is readable by group/others, `nyet` prints a warning to
   stderr (run `chmod 600` on it). Not a refusal, so CI/containers keep working.
@@ -307,6 +326,7 @@ Rules:
 nyet list                  # connections available from the current directory
 nyet list --format table   # human-friendly table (envelope goes to stderr)
 nyet schema <alias> [table] [--format json|table]
+nyet explain <alias> <sql> [--format json|table]
 nyet query <alias> <sql> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
 ```
 
@@ -327,7 +347,18 @@ Row objects keep column order. `--limit` / `--timeout` beat the
 per-connection `row_limit` / `timeout_secs`, which beat `[defaults]`, which
 beat the built-ins (1000 rows / 30 s). All of them must be at least 1 — a
 zero limit/timeout is rejected (config: exit 3; flag: exit 2); to get the
-built-in default, omit the key. If the result has more rows than the limit,
+built-in default, omit the key.
+
+**Ceilings the agent cannot raise.** The flags let an agent go *above* your
+configured `row_limit` / `timeout_secs`, which is usually what you want — until
+it is not (`--timeout 999999`). Set `max_row_limit` / `max_timeout_secs` (in
+`[defaults]`, or per connection, where it overrides `[defaults]`) and the
+effective value is capped there: the ceiling beats the flag, and it also caps a
+`row_limit`/`timeout_secs` you configured above it — a contradiction in the
+config resolves the strict way. Clamping is **silent**: you see the effective
+value in the ordinary answer (a `TRUNCATED` warning, or `TIMEOUT` at the
+ceiling), and a warning on every call would just cost tokens. Omit the keys and
+nothing changes — there is no ceiling by default. If the result has more rows than the limit,
 it is cut off and marked — both in `meta` and in `warnings`:
 
 ```json
@@ -375,8 +406,8 @@ envelope (without `rows`) on stderr as one JSON line:
   character; use `json`/`jsonl` for byte-exact data.
 
 `nyet list` supports `json` and `table` only (it has no row stream); if
-`[defaults].format` is `jsonl`/`csv`, `list` falls back to `json`. `nyet
-schema` follows the same rule.
+`[defaults].format` is `jsonl`/`csv`, `list` falls back to `json`. `nyet schema`
+and `nyet explain` follow the same rule.
 
 ### nyet schema
 
@@ -530,6 +561,178 @@ users table
   fk (org_id) -> orgs (id)
 ```
 
+### nyet explain
+
+```sh
+nyet explain <alias> <sql> [--format json|table]
+```
+
+The query plan, whatever estimate the engine publishes, and the guardrail
+verdict — **without running the query**. The SQL goes through the same
+validator as `nyet query` (planning a write is refused the same way), and the
+EXPLAIN nyet builds is never `ANALYZE` — `ANALYZE` executes the statement.
+
+```sh
+$ nyet explain prod "SELECT id FROM users WHERE email = 'a@b.c'"
+{"v":1,"ok":true,"estimate":{"mode":"cost","verdict":"ok","cost":8.29,"rows":1,"threshold":1000000.0,"plan":[{"Plan":{"Node Type":"Index Scan",...}}]},"meta":{"duration_ms":11,"connection":"prod"}}
+```
+
+- `mode` — the connection's guardrail mode (`cost` / `rows` / `off`).
+- `verdict` — `ok` (under the threshold), `expensive` (above it: `nyet query`
+  would refuse this query), or `no_estimate` (nothing to compare — the engine
+  publishes no estimate, the mode is `off`, or this particular plan carried no
+  usable number).
+- `cost` / `rows` / `threshold` appear only when they exist; `plan` is the plan
+  as the engine reports it (PostgreSQL's `FORMAT JSON` tree, MySQL/MariaDB's
+  classic EXPLAIN rows, SQLite's `EXPLAIN QUERY PLAN` lines).
+- `--format table` prints the verdict line plus a readable plan on stdout, with
+  the envelope on stderr — the usual convention.
+
+`nyet explain` does not run the query, so an `expensive` verdict is
+information, not a refusal: it exits 0. It plans under the same budget as
+`nyet query` — derived from the same `timeout_secs`, at every timeout — so the
+two agree: if planning outruns that budget you get `verdict: no_estimate` with an
+empty plan and a warning saying `nyet query` would refuse this statement. Two
+honest caveats:
+
+- It expects a *query*. `SHOW`, `DESCRIBE` and a statement you already wrapped
+  in `EXPLAIN` have no plan to ask for: nyet says so without touching the
+  database (`verdict: "no_estimate"`, an empty `plan`, and a `NO_PLAN` warning
+  telling you to run it with `nyet query`), rather than sending the server a
+  nonsensical double EXPLAIN.
+- "Does not run the query" means the *statement* is not executed. Planning is
+  not free, and not perfectly side-effect-free on every engine: PostgreSQL
+  evaluates constant `IMMUTABLE` expressions while planning, so
+  `SELECT md5(repeat('x', 100000000))` does that work at plan time — measured,
+  and the reason the guardrail refuses a query whose planning outruns its budget
+  rather than waving it through. It happens inside the same read-only
+  transaction and `timeout_secs` as a query would. `EXPLAIN ANALYZE`
+  — the thing that really executes — is refused outright by the validator
+  (`EXPLAIN_ANALYZE`), by `nyet explain` and by `nyet query` alike.
+
+### The auto-guardrail
+
+Before `nyet query` runs anything, nyet asks the database to **plan** the query
+and compares the estimate with the connection's threshold. Over the threshold,
+the query is not executed:
+
+```json
+{"v":1,"ok":false,"error":{"code":"NYET","reason":"EXPENSIVE_QUERY","message":"nyet: the query plan's estimated cost is 25000165000, above the guardrail limit of 1000000 for connection 'prod' — the query was NOT executed","hint":"narrow the query (add a WHERE filter or a LIMIT, join on an indexed column) — the plan is in `estimate` of this envelope; if the query really is legitimate, ask the person who owns the config to raise [connections.prod.guardrail] max_cost"},"estimate":{"mode":"cost","verdict":"expensive","cost":25000165000.0,"rows":1,"threshold":1000000.0,"plan":[...]}}
+```
+
+Exit code **5**, like every other `NYET` refusal, with `reason` =
+`EXPENSIVE_QUERY` and the plan attached so the query can be fixed without
+another round trip.
+
+**It is on by default, with a deliberately generous limit** — it exists to stop
+a full scan of tens of millions of rows, not to second-guess your analytics.
+Per engine:
+
+| engine | modes | default | default limit |
+|---|---|---|---|
+| PostgreSQL | `cost`, `rows`, `off` | `cost` | `max_cost = 1000000.0` (`max_rows = 10000000`) |
+| MySQL/MariaDB | `rows`, `off` | `rows` | `max_rows = 10000000` |
+| SQLite | `off` only | `off` | — |
+
+```toml
+[connections.prod.guardrail]
+mode = "cost"           # cost | rows | off
+max_cost = 5000000.0    # raise it if your legitimate queries are bigger
+max_rows = 20000000
+```
+
+- **`cost`** is the PostgreSQL planner's own cost number (`Total Cost` of the
+  top plan node). It has no unit — it is the planner's internal currency — so
+  the threshold is calibrated empirically: 1 000 000 is far above an ordinary
+  indexed read or an aggregate over a few million rows, and far below a
+  cross join or a scan of tens of millions.
+- **`rows`** is the estimated row count. On PostgreSQL it is the **largest**
+  `Plan Rows` in the plan, not the top node's: the top node of
+  `SELECT count(*) FROM huge` is an Aggregate returning one row over a scan of
+  millions, and judging by that would let every such query through. On
+  MySQL/MariaDB it is the classic EXPLAIN `rows` column — multiplied across the
+  tables of one select (that product is exactly what makes a cross join
+  enormous), summed across independent selects (UNION arms, cached subqueries)
+  and multiplied by the correlated ones (`DEPENDENT`/`UNCACHEABLE`, which the
+  server re-runs per outer row — unless such a subquery is estimated at a single
+  row, which is added instead, or it would vanish from the product). Both are
+  estimates of *work*, not a promise: the PostgreSQL maximum does not add up
+  sibling branches (it can under-count a wide plan) and the MySQL product
+  over-counts sibling correlations (it can refuse one) — see docs/DEV.md.
+- **MySQL/MariaDB have no `cost` mode.** MySQL 8 and MariaDB do not report a
+  comparable plan cost through a form that works on both, and nyet does not
+  invent one: `mode = "cost"` on those engines is a config error (exit 3), not a
+  silent fallback.
+- **SQLite has no guardrail.** `EXPLAIN QUERY PLAN` publishes no cost and no row
+  estimate at all, so the only accepted mode is `off` (the default) and
+  `nyet explain` answers `verdict: "no_estimate"` with the plan text. Saying so
+  is the honest answer; a made-up number would not be.
+- A `mode` an engine cannot honor is always a **config error (exit 3)** — never
+  a silent downgrade to "unguarded". So is a threshold the active mode never
+  reads (`max_rows` under `mode = "cost"`, or either one under `off`): a limit
+  that quietly does nothing is worse than no limit.
+- **Metadata statements are not estimated.** `SHOW`, `DESCRIBE` and an explicit
+  `EXPLAIN ...` you send yourself carry no plan to judge, so they run unguarded.
+  (`EXPLAIN ANALYZE` is a different story: it *executes* the statement, so the
+  validator refuses it outright — see `EXPLAIN_ANALYZE` below.)
+- **A recursive CTE downgrades the verdict, it does not erase it.** PostgreSQL
+  does not estimate the iteration of a `WITH RECURSIVE`, so an unbounded
+  recursion plans at a cost near zero. Such a plan is treated as a **lower
+  bound**: if it is *already* over the limit the query is refused as usual (so
+  gluing a two-row recursive CTE onto a monster does not hide it), and if it is
+  under, the verdict is `no_estimate` rather than "ok" (and the `cost`/`rows` it
+  shows are a lower bound, not a prediction) — `nyet explain` says so,
+  and `nyet query` runs it with a `GUARDRAIL_SKIPPED` warning (refusing every
+  recursive CTE would be a false refusal for the ordinary hierarchy walks people
+  write). Bound those queries yourself — a depth predicate, a `LIMIT`, or a
+  smaller `--timeout`.
+- **The backstops behind the guardrail are yours to bound too.** When the
+  guardrail cannot judge a plan, what is left is `timeout_secs` and the row
+  limit — and an agent can raise both with `--timeout` / `--limit` unless you
+  set `max_timeout_secs` / `max_row_limit` (see the section above). If you rely
+  on the timeout as the real backstop, set the ceiling.
+- If a plan comes back without a usable number, the query **runs anyway** and
+  the answer carries a `GUARDRAIL_SKIPPED` warning. The guardrail is a
+  best-effort catcher of monsters, not a gate: refusing everything nyet cannot
+  parse would break legitimate work, and the timeout plus the row limit are
+  still there.
+- The EXPLAIN runs on the same connection and in the same read-only transaction
+  as the query it guards — no extra connection, no extra login — and it has a
+  budget of its own (5 s, or a fraction of `timeout_secs` when that is smaller),
+  enforced by the server as well as by nyet. The two ways it can come back
+  empty are treated **differently**, and the rule is whether an agent can cause
+  them on purpose:
+  - **the database refuses to plan the statement** (a role that may `SELECT` a
+    view but not `EXPLAIN` it — MySQL needs `SHOW VIEW` for that — or a form the
+    server dislikes): the estimate is dropped and **the query still runs**, with
+    a `GUARDRAIL_SKIPPED` warning. A guard that turns a working query into an
+    error would be the worse bug. **If your role reads views, grant it
+    `SHOW VIEW` on them** — otherwise any query mentioning such a view switches
+    the guardrail off for that connection (the warning still records it);
+  - **planning outruns the budget** (which is always strictly inside your
+    `timeout_secs`, so the refusal beats the timeout to the answer): the query is
+    **refused** (`EXPENSIVE_QUERY`, exit 5, no plan to show). Planning time is something a
+    query can inflate on purpose — PostgreSQL evaluates constant `IMMUTABLE`
+    expressions while planning, and a MySQL EXPLAIN over `information_schema`
+    can take tens of seconds — so "no plan in time" must not become a way to
+    switch the guardrail off. A statement whose *plan* takes seconds was never
+    going to be cheap to run.
+  The EXPLAIN shares the query's `timeout_secs` and counts inside
+  `meta.duration_ms` (that number is the whole database phase).
+
+**A plan exposes more than a result does.** It names the base tables, indexes
+and predicates behind a view, and shows the qualifiers a row-level-security
+policy adds — so an account restricted *by a view* still learns the shape of
+what is underneath it (`nyet explain` and the plan attached to a refusal both
+show this). Restrict an agent's account with real grants (see the read-only role
+recipes above), not by pointing it at a view.
+
+**There is no `--force` flag, on purpose.** The threshold belongs to the person
+who owns the config: a flag that lets the agent lift its own guardrail is
+security theatre (a refusal it can wave away is not a limit). The hint on a
+refusal says exactly that — narrow the query, or ask the human to raise
+`max_cost` / `max_rows` for that connection.
+
 ## Security
 
 `nyet` enforces read-only in layers, assuming a cooperative but fallible
@@ -550,7 +753,7 @@ SQL dialect — SQLite, PostgreSQL or MySQL) → exactly one statement → recur
 AST walk. The walk denies write/DDL statements anywhere in the tree (CTE bodies
 including data-modifying CTEs like `WITH x AS (DELETE ... RETURNING)`, derived
 tables, subqueries), locking clauses (`FOR UPDATE`/`FOR SHARE`), `COPY`, `SET`,
-and denylisted functions.
+`EXPLAIN ANALYZE` (which executes what it explains) and denylisted functions.
 
 **MySQL/MariaDB executable comments.** MySQL runs the body of `/*! ... */`,
 `/*M! ... */` (MariaDB) and optimizer-hint `/*+ ... */` comments, but a SQL
@@ -580,6 +783,8 @@ to do:
 | `TXN_CONTROL` | transaction or session control (BEGIN/COMMIT/ROLLBACK/SET) |
 | `LOCKING_CLAUSE` | `SELECT ... FOR UPDATE` / `FOR SHARE` — takes row locks, not a plain read |
 | `DENIED_FUNCTION` | a function on the denylist for this connection (the message names it) |
+| `EXPLAIN_ANALYZE` | `EXPLAIN ANALYZE ...` (or PostgreSQL's `EXPLAIN (ANALYZE, ...)`) — it *runs* the statement it claims to explain, so it is an execution wearing a plan's clothes; use `nyet explain` for a plan, a plain `EXPLAIN` is fine as a query |
+| `EXPENSIVE_QUERY` | the query plan's estimate is above this connection's guardrail limit, so the query was not executed — the envelope carries the plan. Also used when *planning itself* outran the guardrail's budget (then there is no plan to carry): see the auto-guardrail section |
 | `EXECUTABLE_COMMENT` | a MySQL/MariaDB executable comment or optimizer hint (`/*! … */`, `/*M! … */`, `/*+ … */`) — the server runs its body but a SQL parser drops it, so nyet cannot see what it does; remove the comment |
 
 PRAGMA is refused with a pointer instead of a dead end: schema questions
@@ -642,6 +847,11 @@ runs with the database user's privileges even in a read-only session.
 ### Warning codes
 
 `warnings[].code` is a closed list: `TRUNCATED` (row limit cut the result),
+`GUARDRAIL_SKIPPED` (the plan carried no estimate the guardrail could use — a
+recursive CTE, an unreadable plan shape, or an EXPLAIN the server refused — so
+the query was not checked against the limit; it ran anyway, bounded by the
+timeout and row limit), `NO_PLAN` (`nyet explain` was given a metadata statement,
+which has no plan),
 `DUPLICATE_COLUMNS` (json rows would collapse same-named keys),
 `UNICODE_STRIPPED` (invisible characters removed from the query),
 `INSECURE_TRANSPORT` (a direct server connection whose url `sslmode`/`ssl-mode`
@@ -671,7 +881,7 @@ Every error carries an actionable `hint`. Error codes today:
 `CONFIG_INVALID`, `DIR_NOT_ALLOWED`, `NOT_IMPLEMENTED`, `INTERNAL`, `NYET`
 (with `reason`, see above), `CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
 Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
-`INSECURE_TRANSPORT`, `SCHEMA_TRUNCATED`.
+`INSECURE_TRANSPORT`, `SCHEMA_TRUNCATED`, `GUARDRAIL_SKIPPED`, `NO_PLAN`.
 
 Exit codes:
 
@@ -682,7 +892,7 @@ Exit codes:
 | 2 | CLI usage error |
 | 3 | config error (not found, invalid, unknown alias) |
 | 4 | connection not allowed from the current directory |
-| 5 | query refused by the validator (`error.code = "NYET"`) |
+| 5 | query refused by the validator or the guardrail (`error.code = "NYET"`) |
 | 6 | connection failed (file missing/unreadable, network, auth, ssh tunnel) |
 | 7 | the database returned an execution error |
 | 8 | timeout |

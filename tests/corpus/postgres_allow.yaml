@@ -42,6 +42,10 @@
 # EXPLAIN (read), SHOW and set operations
 - query: EXPLAIN SELECT * FROM users
   verdict: allow
+# A different parse shape (utility options), and the exact form nyet's own
+# guardrail builds — the read twin of the EXPLAIN ANALYZE deny cases.
+- query: EXPLAIN (FORMAT JSON) SELECT id FROM users WHERE id = 1
+  verdict: allow
 # SHOW is a read (twin of the SET search_path deny case)
 - query: SHOW search_path
   verdict: allow

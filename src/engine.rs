@@ -5,6 +5,7 @@
 //! `build_table`, which owns the pk/unique presentation rules) — the contract
 //! shape they fill in, so the three engines cannot drift.
 
+use crate::guardrail::{CostEstimate, Guardrail};
 use crate::output::{
     build_table, KeyPart, Schema, SchemaColumn, SchemaFk, SchemaIndex, SchemaTable,
 };
@@ -77,10 +78,175 @@ fn client_timeout(query_timeout_ms: u64) -> EngineError {
     }
 }
 
+/// The outcome of a guarded `execute`.
+#[derive(Debug)]
+pub enum QueryOutcome {
+    /// The query ran. `estimate` is `None` when the guardrail was off or the
+    /// database refused to plan the statement (fail open, see `Plan::Failed`);
+    /// the cli reads the verdict off it — the engines never decide policy, they
+    /// only obey `Guardrail::refuses`.
+    Ran {
+        result: ResultSet,
+        estimate: Option<CostEstimate>,
+    },
+    /// The plan estimate was over the threshold: NOTHING was executed. `value`
+    /// is the offending number the guardrail measured.
+    Refused { estimate: CostEstimate, value: f64 },
+    /// Planning itself outran the guardrail's budget: NOTHING was executed
+    /// (fail closed — see `Plan::TooSlow`).
+    PlanTooSlow { budget_ms: u64 },
+}
+
+/// What the guardrail's EXPLAIN produced. The two failure modes are deliberately
+/// NOT the same:
+///
+/// - `Failed` — the database refused to plan the statement (a role that may
+///   `SELECT` a view but lacks `SHOW VIEW`, a form the server dislikes). The
+///   agent cannot make this happen on an ARBITRARY query, and the query itself
+///   would often succeed, so failing it would be a regression caused purely by
+///   the guard: **fail open** (run, warn `GUARDRAIL_SKIPPED`). The error is kept
+///   because `nyet explain`, which has no query to fall back on, reports it.
+/// - `TooSlow` — planning outran the budget. Planning time IS agent-controlled
+///   (PostgreSQL const-folds `IMMUTABLE` expressions at plan time; a MySQL
+///   EXPLAIN over `information_schema` takes tens of seconds), so this one must
+///   **fail closed**, or "make planning slow" becomes the way to switch the
+///   guardrail off.
+/// - `Broken` — the guardrail's own PLUMBING failed (savepoint, the statement
+///   timeout it lends the EXPLAIN, the rollback, the restore). That is not "we
+///   could not plan it": the session is in an unknown state — possibly an
+///   aborted transaction, possibly still carrying the short EXPLAIN timeout — so
+///   the error is surfaced and the query is NOT run on it.
+///
+/// `TooSlow` is TERMINAL: once planning has outrun the budget, no plumbing error
+/// may change that verdict, because no plumbing is attempted at all — the
+/// connection may still be busy with the planning we gave up on, and any
+/// politeness (`ROLLBACK`, `COM_QUIT`, a graceful close) would queue behind it
+/// until the query's own deadline fired and turned the refusal into a bare
+/// TIMEOUT. Both "no plan" verdicts therefore hand the connection back to be
+/// DROPPED (see `discard`), which costs one connection and saves the answer.
+enum Plan {
+    Got(CostEstimate),
+    Failed(EngineError),
+    TooSlow,
+    Broken(EngineError),
+}
+
+impl Plan {
+    /// What `nyet explain` makes of it: the plan is the answer there, so a
+    /// database error surfaces (exit 7) and only the budget produces "no plan"
+    /// (`Ok(None)` -> `verdict: no_estimate` plus a warning).
+    fn into_answer(self) -> Result<Option<CostEstimate>, EngineError> {
+        match self {
+            Plan::Got(estimate) => Ok(Some(estimate)),
+            Plan::Failed(e) | Plan::Broken(e) => Err(e),
+            Plan::TooSlow => Ok(None),
+        }
+    }
+
+    /// Is the connection unfit for a polite goodbye? `TooSlow` may leave the
+    /// backend still planning, and `Broken` leaves the session in an unknown
+    /// state; in both cases the socket is dropped instead of chatted with.
+    fn discard(&self) -> bool {
+        matches!(self, Plan::TooSlow | Plan::Broken(_))
+    }
+
+    /// Classify one guarded EXPLAIN. A server-side statement timeout during the
+    /// EXPLAIN arrives as `EngineError::Timeout` (Postgres 57014, MySQL 3024 /
+    /// MariaDB 1969) — that IS the budget firing, so it is TooSlow, not Failed.
+    fn of(result: Result<Result<CostEstimate, EngineError>, tokio::time::error::Elapsed>) -> Plan {
+        match result {
+            Ok(Ok(estimate)) => Plan::Got(estimate),
+            Ok(Err(EngineError::Timeout { .. })) | Err(_) => Plan::TooSlow,
+            Ok(Err(e)) => Plan::Failed(e),
+        }
+    }
+}
+
+/// How long the guardrail's own EXPLAIN may take. The guardrail must not eat the
+/// budget of the query it guards (a MySQL EXPLAIN over information_schema has
+/// been seen taking 17.9s, turning a would-be refusal into a TIMEOUT), and past
+/// this point the planning cost is itself evidence that the statement is
+/// expensive — so exceeding it REFUSES the query (`Plan::TooSlow`).
+const EXPLAIN_BUDGET_MS: u64 = 5_000;
+
+/// The guardrail's OWN client deadline, always strictly inside the query's:
+/// `min(cap + grace, timeout - reserve)`. If planning alone ate the query's
+/// budget the query could not have finished either, and the guardrail's
+/// "planning is itself that expensive" beats a bare TIMEOUT — but only if it
+/// gets to answer first, which is what the reserve buys. At the smallest legal
+/// timeout (1 s) this is 800 ms; from 10 s up it is the flat cap + grace.
+///
+/// **Applicability: `query_timeout_ms >= 1000`** — the minimum both the CLI and
+/// the config enforce (`--timeout` / `timeout_secs` are >= 1 second). Below
+/// ~200 ms the reserve eats everything and deadline/budget collapse to 1 ms, so
+/// the "strictly nested" property would stop holding; nothing can reach that
+/// today, and a future sub-second input must revisit these three constants.
+fn explain_deadline_ms(query_timeout_ms: u64) -> u64 {
+    EXPLAIN_BUDGET_MS
+        .saturating_add(EXPLAIN_GRACE_MS)
+        .min(query_timeout_ms.saturating_sub(EXPLAIN_RESERVE_MS))
+        .max(1)
+}
+
+/// The SERVER-side cap that goes with that deadline, a grace period earlier, so
+/// the normal way out is the server cancelling its own EXPLAIN rather than nyet
+/// abandoning it.
+fn explain_budget_ms(query_timeout_ms: u64) -> u64 {
+    explain_deadline_ms(query_timeout_ms)
+        .saturating_sub(EXPLAIN_GRACE_MS)
+        .max(1)
+}
+
+/// How much later than the SERVER's cap the client deadline fires. The two used
+/// to be set to the same value, and the race was decided by luck: when the
+/// client won, the abandoned future left a dirty connection and the verdict was
+/// silently downgraded to fail-open (the e2e flaked one run in three). The grace
+/// makes the clean server-side cancellation the normal outcome and keeps the
+/// tokio timer as what it is meant to be — a backstop for a server that ignores
+/// its own cap.
+const EXPLAIN_GRACE_MS: u64 = 500;
+
+/// What the guardrail leaves of the query's deadline for itself to answer in.
+/// Its own deadline must fire STRICTLY before the query's, or the outer timer
+/// wins the race and the answer is a bare TIMEOUT instead of the refusal.
+const EXPLAIN_RESERVE_MS: u64 = 200;
+
+/// Run the guardrail's EXPLAIN under its budget. The SERVER is capped at
+/// `budget_ms` by the caller, so the usual outcome is a clean server-side error
+/// rather than an abandoned future — an abandoned one keeps burning the backend
+/// and its late error surfaces on the NEXT statement (observed on MySQL).
+async fn budgeted_plan(
+    deadline_ms: u64,
+    plan: impl std::future::Future<Output = Result<CostEstimate, EngineError>>,
+) -> Plan {
+    Plan::of(tokio::time::timeout(Duration::from_millis(deadline_ms), plan).await)
+}
+
 /// The one planned abstraction of the project (Д5). Fetches at most
 /// `fetch_limit` rows; the caller passes limit+1 to detect truncation.
 pub trait Engine {
-    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError>;
+    /// Run the query, unless the guardrail's plan estimate says it is a monster
+    /// (then nothing is executed). The EXPLAIN runs in the SAME read-only
+    /// session — no second connect — inside the query deadline and its own
+    /// (shorter) budget.
+    async fn execute(
+        &self,
+        sql: &str,
+        fetch_limit: u64,
+        guardrail: &Guardrail,
+    ) -> Result<QueryOutcome, EngineError>;
+
+    /// The query plan and whatever estimate this engine publishes, without
+    /// executing anything (`nyet explain`). **Never ANALYZE** — that would run
+    /// the statement.
+    ///
+    /// `Ok(None)` means planning outran the guardrail's budget — the same budget
+    /// and the same server-side cap the guarded query path uses, so `explain`
+    /// answers what `query` would decide instead of grinding for the full
+    /// timeout and reporting a cheerful "ok" for a statement `query` refuses.
+    /// A database error still surfaces (exit 7): here the plan IS the answer,
+    /// there is no query to fall back on.
+    async fn estimate(&self, sql: &str) -> Result<Option<CostEstimate>, EngineError>;
 
     /// Introspect the schema through the same read-only session as a query.
     /// `table` is the agent's `[table]` argument: `Some` selects one object
@@ -230,7 +396,17 @@ impl Sqlite {
 }
 
 impl Engine for Sqlite {
-    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError> {
+    /// The guardrail is not applicable here and the parameter is ignored on
+    /// purpose: SQLite's `EXPLAIN QUERY PLAN` publishes no cost or row estimate
+    /// at all, so `guardrail::resolve` accepts nothing but `off` for this engine
+    /// (a config error otherwise, exit 3). Running the EXPLAIN anyway would burn
+    /// a round trip to learn nothing.
+    async fn execute(
+        &self,
+        sql: &str,
+        fetch_limit: u64,
+        _guardrail: &Guardrail,
+    ) -> Result<QueryOutcome, EngineError> {
         let mut conn = self.open().await?;
         // Bound the QUERY phase (not the local file open above) on the effective
         // per-query budget: sqlite has no server-side timeout, so this in-process
@@ -275,11 +451,29 @@ impl Engine for Sqlite {
                 }
             }
             let _ = conn.close().await;
-            Ok::<ResultSet, EngineError>(ResultSet { columns, rows })
+            Ok::<QueryOutcome, EngineError>(QueryOutcome::Ran {
+                result: ResultSet { columns, rows },
+                estimate: None,
+            })
         })
         .await
         {
             Ok(r) => r,
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
+        }
+    }
+
+    /// No budget games here: SQLite has no server-side cap to lend and its
+    /// planner publishes no numbers anyway, so the only bound is the ordinary
+    /// query timeout.
+    async fn estimate(&self, sql: &str) -> Result<Option<CostEstimate>, EngineError> {
+        let mut conn = self.open().await?;
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, sqlite_plan(&mut conn, sql)).await {
+            Ok(r) => {
+                let _ = conn.close().await;
+                r.map(Some)
+            }
             Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
     }
@@ -297,6 +491,39 @@ impl Engine for Sqlite {
             Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
     }
+}
+
+/// SQLite plan: `EXPLAIN QUERY PLAN` — the human-readable plan and nothing
+/// else (SQLite publishes no cost/row estimates, hence no guardrail here).
+///
+/// **Constant prefix + the SQL the validator already accepted, and never
+/// ANALYZE:** `EXPLAIN QUERY PLAN` only plans, while SQLite's `EXPLAIN ANALYZE`
+/// (and every other engine's) would RUN the statement — the one thing a
+/// guardrail must never do.
+async fn sqlite_plan(
+    conn: &mut sqlx::SqliteConnection,
+    sql: &str,
+) -> Result<CostEstimate, EngineError> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_error)?;
+    let (columns, values) = plan_table(&rows, decode_row)?;
+    Ok(crate::guardrail::sqlite_estimate(&columns, &values))
+}
+
+/// A tabular plan (SQLite / MySQL) -> (column names, decoded values), for the
+/// pure parsers in `guardrail`. Column names come from the first row; an empty
+/// plan yields empty everything (which reads as "no estimate").
+fn plan_table<R: Row>(
+    rows: &[R],
+    decode: fn(&R) -> Result<Vec<Value>, EngineError>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>), EngineError> {
+    let columns = rows.first().map_or_else(Vec::new, |r| {
+        r.columns().iter().map(|c| c.name().to_string()).collect()
+    });
+    let values = rows.iter().map(decode).collect::<Result<_, _>>()?;
+    Ok((columns, values))
 }
 
 /// SQLite introspection: `sqlite_master` for the object list, then the
@@ -603,7 +830,12 @@ impl Postgres {
 }
 
 impl Engine for Postgres {
-    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError> {
+    async fn execute(
+        &self,
+        sql: &str,
+        fetch_limit: u64,
+        guardrail: &Guardrail,
+    ) -> Result<QueryOutcome, EngineError> {
         let mut conn = self.connect().await?;
 
         // Bound the QUERY phase on the effective per-query budget (connect above
@@ -616,6 +848,50 @@ impl Engine for Postgres {
             if let Err(e) = Postgres::begin_read_only(&mut conn).await {
                 let _ = conn.close().await;
                 return Err(e);
+            }
+
+            // The guardrail's EXPLAIN runs HERE: same read-only session (no
+            // second connect), before a single row of the real query is read.
+            let budget_ms = explain_budget_ms(self.query_timeout_ms);
+            let estimate = match guardrail.plans() {
+                false => None,
+                true => {
+                    let plan = pg_guarded_plan(
+                        &mut conn,
+                        sql,
+                        self.query_timeout_ms,
+                        self.statement_timeout_ms,
+                    )
+                    .await;
+                    // THE decision about this connection, here as everywhere
+                    // (`Plan::discard`): anything the guardrail could not leave
+                    // clean is DROPPED, never closed politely — a graceful
+                    // ROLLBACK/close queues behind the planning we abandoned (or
+                    // behind whatever broke) until the query deadline turns the
+                    // refusal into a bare TIMEOUT.
+                    if plan.discard() {
+                        drop(conn);
+                        return match plan {
+                            Plan::Broken(e) => Err(e),
+                            // TooSlow is the only other discarding verdict.
+                            _ => Ok(QueryOutcome::PlanTooSlow { budget_ms }),
+                        };
+                    }
+                    match plan {
+                        Plan::Got(estimate) => Some(estimate),
+                        // Failed: the database would not plan it — fail OPEN
+                        // (the query runs and reports its own error, if any).
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(value) = estimate.as_ref().and_then(|e| guardrail.refuses(e)) {
+                pg_close_read_only(conn).await;
+                return Ok(QueryOutcome::Refused {
+                    // Some by construction: refuses() answered about this one.
+                    estimate: estimate.expect("the refused estimate"),
+                    value,
+                });
             }
 
             let mut columns: Vec<String> = Vec::new();
@@ -657,7 +933,41 @@ impl Engine for Postgres {
             }
             pg_close_read_only(conn).await;
             fetched?;
-            Ok::<ResultSet, EngineError>(ResultSet { columns, rows })
+            Ok::<QueryOutcome, EngineError>(QueryOutcome::Ran {
+                result: ResultSet { columns, rows },
+                estimate,
+            })
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
+        }
+    }
+
+    async fn estimate(&self, sql: &str) -> Result<Option<CostEstimate>, EngineError> {
+        let mut conn = self.connect().await?;
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, async move {
+            if let Err(e) = Postgres::begin_read_only(&mut conn).await {
+                let _ = conn.close().await;
+                return Err(e);
+            }
+            // The guarded path, exactly as `query` runs it — so a statement
+            // whose planning `query` refuses is not blessed with an "ok" here.
+            let plan = pg_guarded_plan(
+                &mut conn,
+                sql,
+                self.query_timeout_ms,
+                self.statement_timeout_ms,
+            )
+            .await;
+            if plan.discard() {
+                drop(conn);
+            } else {
+                pg_close_read_only(conn).await;
+            }
+            plan.into_answer()
         })
         .await
         {
@@ -696,6 +1006,102 @@ impl Postgres {
         conn.execute("BEGIN READ ONLY").await.map_err(pg_error)?;
         Ok(())
     }
+}
+
+/// PostgreSQL plan: `EXPLAIN (FORMAT JSON)` — the JSON tree carries the
+/// planner's `Total Cost` and `Plan Rows` on the top node, which is what the
+/// guardrail compares (parsing is pure, in `guardrail`).
+///
+/// **Constant prefix + the SQL the validator already accepted, and NEVER
+/// ANALYZE:** `EXPLAIN` alone only plans the statement, `EXPLAIN ANALYZE` would
+/// execute it — the one thing a guardrail must not do.
+async fn pg_plan(conn: &mut sqlx::PgConnection, sql: &str) -> Result<CostEstimate, EngineError> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN (FORMAT JSON) {sql}")))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(pg_error)?;
+    // The column is `json` on every supported server; a text-returning one (or
+    // any shape we did not expect) must not fail the run — an unreadable plan
+    // is simply "no estimate" (the cli warns GUARDRAIL_SKIPPED and runs on).
+    let plan = row.try_get::<Value, _>(0).unwrap_or_else(|_| {
+        row.try_get::<String, _>(0)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(Value::Null)
+    });
+    Ok(crate::guardrail::postgres_estimate(plan))
+}
+
+/// The guardrail's EXPLAIN on PostgreSQL, wrapped in the two things that keep
+/// the SESSION healthy and the budget honest (both review findings, verified
+/// live):
+///
+/// - **`SAVEPOINT` + `ROLLBACK TO SAVEPOINT` around it.** A failing EXPLAIN
+///   aborts the transaction, and every later statement then dies with "current
+///   transaction is aborted" — so the fail-open path did not actually work on
+///   Postgres: `SELECT * FROM nope_x` reported that instead of "relation does
+///   not exist". Rolling back to the savepoint restores the transaction AND
+///   (savepoints being transactional) the `statement_timeout` set below, so one
+///   mechanism undoes everything.
+/// - **`SET LOCAL statement_timeout = <budget>`.** The SERVER stops planning at
+///   the budget instead of us abandoning a future that keeps burning the backend.
+///   The error comes back as 57014 -> `EngineError::Timeout` -> `Plan::TooSlow`.
+///
+/// Three extra round trips on a guarded query; the price of a guardrail that
+/// cannot be disabled by making planning slow.
+async fn pg_guarded_plan(
+    conn: &mut sqlx::PgConnection,
+    sql: &str,
+    query_timeout_ms: u64,
+    restore_ms: u64,
+) -> Plan {
+    use sqlx::Executor;
+    let budget_ms = explain_budget_ms(query_timeout_ms);
+    if let Err(e) = conn.execute("SAVEPOINT nyet_guardrail").await {
+        return Plan::Broken(pg_error(e));
+    }
+    if let Err(e) = conn
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL statement_timeout = {budget_ms}"
+        )))
+        .await
+    {
+        // No tidying: `Broken` means the caller drops the connection, so the
+        // savepoint dies with it — and awaiting a rollback here could hang long
+        // enough for the outer timer to answer TIMEOUT instead of this error.
+        return Plan::Broken(pg_error(e));
+    }
+    // The client deadline sits a grace period BEHIND the server cap (and inside
+    // the query's own deadline), so the normal way out is the server's 57014.
+    let plan = budgeted_plan(explain_deadline_ms(query_timeout_ms), pg_plan(conn, sql)).await;
+    if matches!(plan, Plan::TooSlow) {
+        // TERMINAL — and nothing is attempted on the connection afterwards, so
+        // no plumbing error can rewrite the verdict. When OUR deadline is what
+        // fired, the backend is still planning and the connection is busy: the
+        // rollback below would queue behind the very work we gave up on and burn
+        // the query's remaining time, which is how this case answered TIMEOUT
+        // instead of a refusal. The caller drops the socket.
+        return Plan::TooSlow;
+    }
+    // Clears an aborted transaction and restores statement_timeout.
+    if let Err(e) = conn.execute("ROLLBACK TO SAVEPOINT nyet_guardrail").await {
+        // Never a silent run: an unrecoverable session is surfaced, not fallen
+        // open on. (TooSlow cannot reach here — it returned above.)
+        return Plan::Broken(pg_error(e));
+    }
+    // Belt and suspenders: if the rollback somehow left the budget in place, the
+    // query would be cut short at the EXPLAIN's budget. Failing to restore is a
+    // broken session too — running the query under an unknown timeout would
+    // report a TIMEOUT that is nobody's actual setting.
+    if let Err(e) = conn
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL statement_timeout = {restore_ms}"
+        )))
+        .await
+    {
+        return Plan::Broken(pg_error(e));
+    }
+    plan
 }
 
 /// Read-only: nothing to persist, so rollback (cheaper than commit) and close
@@ -1246,13 +1652,31 @@ impl Mysql {
     /// always ends up capped regardless of the config label.
     async fn begin_read_only(&self, conn: &mut sqlx::MySqlConnection) -> Result<(), EngineError> {
         use sqlx::Executor;
-        let secs = (self.statement_timeout_ms / 1000).max(1);
+        Self::set_statement_timeout(conn, self.statement_timeout_ms).await?;
+        conn.execute("START TRANSACTION READ ONLY")
+            .await
+            .map_err(mysql_error)?;
+        Ok(())
+    }
+
+    /// The server-side statement cap, in both flavors' spellings. MySQL takes
+    /// milliseconds (`max_execution_time`), MariaDB seconds
+    /// (`max_statement_time`), and each rejects the other's name with
+    /// ER_UNKNOWN_SYSTEM_VARIABLE (1193) — set both, swallow the 1193, and the
+    /// real server always ends up capped. Also used to lend the guardrail's
+    /// EXPLAIN a shorter cap of its own.
+    async fn set_statement_timeout(
+        conn: &mut sqlx::MySqlConnection,
+        timeout_ms: u64,
+    ) -> Result<(), EngineError> {
+        use sqlx::Executor;
+        // MariaDB counts SECONDS, so round UP: rounding down turned a 1600ms
+        // guardrail budget into a 1s server cap and refused queries whose
+        // planning was inside the budget.
+        let secs = timeout_ms.div_ceil(1000).max(1);
         for stmt in [
-            // MySQL milliseconds; MariaDB seconds. (>= 1; 0 = "no limit".)
-            format!(
-                "SET SESSION max_execution_time = {}",
-                self.statement_timeout_ms.max(1)
-            ),
+            // (>= 1; 0 = "no limit".)
+            format!("SET SESSION max_execution_time = {}", timeout_ms.max(1)),
             format!("SET SESSION max_statement_time = {secs}"),
         ] {
             if let Err(e) = conn.execute(sqlx::AssertSqlSafe(stmt)).await {
@@ -1262,10 +1686,39 @@ impl Mysql {
                 }
             }
         }
-        conn.execute("START TRANSACTION READ ONLY")
-            .await
-            .map_err(mysql_error)?;
         Ok(())
+    }
+
+    /// The guardrail's EXPLAIN with the SERVER capped at the budget too. Without
+    /// that cap the abandoned EXPLAIN keeps running and its late error surfaces
+    /// as the failure of the NEXT statement (observed: a 3024 from a dropped
+    /// EXPLAIN reported against the query that followed). MariaDB's
+    /// `max_statement_time` has second granularity, so the server cap is the
+    /// budget rounded UP to a second and the tokio deadline stays the finer of
+    /// the two.
+    async fn guarded_plan(
+        &self,
+        conn: &mut sqlx::MySqlConnection,
+        sql: &str,
+        query_timeout_ms: u64,
+    ) -> Plan {
+        if let Err(e) = Self::set_statement_timeout(conn, explain_budget_ms(query_timeout_ms)).await
+        {
+            return Plan::Broken(e);
+        }
+        let plan =
+            budgeted_plan(explain_deadline_ms(query_timeout_ms), mysql_plan(conn, sql)).await;
+        if matches!(plan, Plan::TooSlow) {
+            // TERMINAL, and the connection may still be busy with the planning
+            // we abandoned: no restore, no politeness (see the Postgres twin).
+            return Plan::TooSlow;
+        }
+        // Restoring the query's own cap is part of the plumbing: if it fails the
+        // query would run under the EXPLAIN's short budget, so fail closed.
+        match Self::set_statement_timeout(conn, self.statement_timeout_ms).await {
+            Ok(()) => plan,
+            Err(e) => Plan::Broken(e),
+        }
     }
 }
 
@@ -1278,7 +1731,12 @@ async fn mysql_close_read_only(mut conn: sqlx::MySqlConnection) {
 }
 
 impl Engine for Mysql {
-    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError> {
+    async fn execute(
+        &self,
+        sql: &str,
+        fetch_limit: u64,
+        guardrail: &Guardrail,
+    ) -> Result<QueryOutcome, EngineError> {
         let mut conn = self.connect().await?;
 
         // Bound the QUERY phase (everything below, after a successful connect)
@@ -1292,6 +1750,37 @@ impl Engine for Mysql {
             if let Err(e) = self.begin_read_only(&mut conn).await {
                 let _ = conn.close().await;
                 return Err(e);
+            }
+
+            // Guardrail: same read-only session, before the real query runs
+            // (see the Postgres twin).
+            let budget_ms = explain_budget_ms(self.query_timeout_ms);
+            let estimate = match guardrail.plans() {
+                false => None,
+                true => {
+                    let plan = self
+                        .guarded_plan(&mut conn, sql, self.query_timeout_ms)
+                        .await;
+                    // The same single decision as the Postgres twin.
+                    if plan.discard() {
+                        drop(conn);
+                        return match plan {
+                            Plan::Broken(e) => Err(e),
+                            _ => Ok(QueryOutcome::PlanTooSlow { budget_ms }),
+                        };
+                    }
+                    match plan {
+                        Plan::Got(estimate) => Some(estimate),
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(value) = estimate.as_ref().and_then(|e| guardrail.refuses(e)) {
+                mysql_close_read_only(conn).await;
+                return Ok(QueryOutcome::Refused {
+                    estimate: estimate.expect("the refused estimate"),
+                    value,
+                });
             }
 
             // ponytail: the fetch loop / empty-columns-via-prepare / rollback+close
@@ -1337,7 +1826,36 @@ impl Engine for Mysql {
             }
             mysql_close_read_only(conn).await;
             fetched?;
-            Ok::<ResultSet, EngineError>(ResultSet { columns, rows })
+            Ok::<QueryOutcome, EngineError>(QueryOutcome::Ran {
+                result: ResultSet { columns, rows },
+                estimate,
+            })
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
+        }
+    }
+
+    async fn estimate(&self, sql: &str) -> Result<Option<CostEstimate>, EngineError> {
+        let mut conn = self.connect().await?;
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, async move {
+            if let Err(e) = self.begin_read_only(&mut conn).await {
+                let _ = conn.close().await;
+                return Err(e);
+            }
+            // The guarded path, exactly as `query` runs it (see the pg twin).
+            let plan = self
+                .guarded_plan(&mut conn, sql, self.query_timeout_ms)
+                .await;
+            if plan.discard() {
+                drop(conn);
+            } else {
+                mysql_close_read_only(conn).await;
+            }
+            plan.into_answer()
         })
         .await
         {
@@ -1364,6 +1882,25 @@ impl Engine for Mysql {
             Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
     }
+}
+
+/// MySQL/MariaDB plan: the CLASSIC tabular `EXPLAIN`, on purpose — it is the
+/// one form both flavors agree on (`EXPLAIN FORMAT=JSON` exists on both but with
+/// different shapes and different — or absent — cost fields, so nyet publishes
+/// no cost mode for these engines rather than a number that means two things).
+///
+/// **Constant prefix + the validated SQL, and never ANALYZE**: MySQL 8's
+/// `EXPLAIN ANALYZE` and MariaDB's `ANALYZE` both RUN the statement.
+async fn mysql_plan(
+    conn: &mut sqlx::MySqlConnection,
+    sql: &str,
+) -> Result<CostEstimate, EngineError> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN {sql}")))
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(mysql_error)?;
+    let (columns, values) = plan_table(&rows, decode_mysql_row)?;
+    Ok(crate::guardrail::mysql_estimate(&columns, &values))
 }
 
 /// MySQL/MariaDB introspection: four information_schema queries scoped to the
@@ -1728,6 +2265,26 @@ fn error_text(e: &sqlx::Error) -> String {
 mod tests {
     use super::*;
 
+    /// Test shorthand for "run it, no guardrail": these tests are about layer 2,
+    /// decoding and timeouts. The guardrail's own behavior is covered by the
+    /// pure tests in `src/guardrail.rs` and end to end in `tests/postgres.rs` /
+    /// `tests/mysql.rs`.
+    trait ExecuteRows: Engine {
+        async fn execute_rows(
+            &self,
+            sql: &str,
+            fetch_limit: u64,
+        ) -> Result<ResultSet, EngineError> {
+            match self.execute(sql, fetch_limit, &Guardrail::OFF).await? {
+                QueryOutcome::Ran { result, .. } => Ok(result),
+                QueryOutcome::Refused { .. } | QueryOutcome::PlanTooSlow { .. } => {
+                    unreachable!("a guardrail that is off never plans, so it never refuses")
+                }
+            }
+        }
+    }
+    impl<E: Engine> ExecuteRows for E {}
+
     fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -1758,6 +2315,100 @@ mod tests {
         });
     }
 
+    /// The two failure modes of a guarded EXPLAIN are NOT the same, and the
+    /// difference is the whole fail-open/fail-closed rule (docs/DEV.md): a
+    /// database that will not plan the statement is fail OPEN (the agent cannot
+    /// summon that on demand, and the query would often work), while planning
+    /// that outruns its budget is fail CLOSED (planning time IS
+    /// agent-controllable). Deterministic and Docker-free: the plan future is
+    /// stubbed.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_failing_explain_falls_open_but_a_slow_one_refuses() {
+        let estimate = || CostEstimate {
+            plan: Value::Null,
+            cost: Some(1.0),
+            rows: None,
+            lower_bound: false,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // A usable plan travels through untouched.
+            assert!(matches!(
+                budgeted_plan(30_000, async { Ok(estimate()) }).await,
+                Plan::Got(_)
+            ));
+            // A database error (ER 1345 and friends) -> fail open.
+            let refused: Result<CostEstimate, EngineError> = Err(EngineError::Db {
+                message: "EXPLAIN/SHOW can not be issued; lacking privileges".to_string(),
+                hint: String::new(),
+            });
+            assert!(matches!(
+                budgeted_plan(30_000, async { refused }).await,
+                Plan::Failed(_)
+            ));
+            // The server hitting the EXPLAIN's own statement timeout IS the
+            // budget firing, not an ordinary failure -> fail closed.
+            let cancelled: Result<CostEstimate, EngineError> = Err(EngineError::Timeout {
+                message: "cancelled".to_string(),
+                hint: String::new(),
+            });
+            assert!(matches!(
+                budgeted_plan(30_000, async { cancelled }).await,
+                Plan::TooSlow
+            ));
+            // ...and so is the client-side deadline (the backstop): a 60s plan
+            // under a 200ms budget refuses, it does not quietly run the query.
+            let slow = async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(estimate())
+            };
+            let started = std::time::Instant::now();
+            assert!(matches!(budgeted_plan(200, slow).await, Plan::TooSlow));
+            assert!(started.elapsed() < Duration::from_secs(5), "budget ignored");
+
+            // `nyet explain` reads the SAME classification, so it can never
+            // answer "ok" for a statement the query path refuses: only the
+            // budget produces "no plan" (-> verdict no_estimate), while a
+            // database error surfaces as an error (exit 7 — there is no query
+            // to fall back on) and so does broken plumbing.
+            assert!(matches!(Plan::TooSlow.into_answer(), Ok(None)));
+            assert!(matches!(Plan::Got(estimate()).into_answer(), Ok(Some(_))));
+            let db_error = || EngineError::Db {
+                message: "boom".to_string(),
+                hint: String::new(),
+            };
+            assert!(Plan::Failed(db_error()).into_answer().is_err());
+            assert!(Plan::Broken(db_error()).into_answer().is_err());
+        });
+        // The guardrail's deadline must be STRICTLY inside the query's —
+        // otherwise the outer timer wins the race and the refusal comes back as
+        // a bare TIMEOUT — with the server cap a grace period earlier still.
+        // Checked over a representative sample of CLI timeouts (1s..3600s),
+        // not exhaustively.
+        for timeout_secs in [1u64, 2, 3, 5, 10, 30, 3600] {
+            let query_ms = timeout_secs * 1000;
+            let deadline = explain_deadline_ms(query_ms);
+            let budget = explain_budget_ms(query_ms);
+            assert!(
+                deadline < query_ms,
+                "{timeout_secs}s: {deadline} !< {query_ms}"
+            );
+            assert!(budget < deadline, "{timeout_secs}s: {budget} !< {deadline}");
+            assert!(budget >= 1);
+        }
+        // The flat cap applies once there is room for it.
+        assert_eq!(explain_budget_ms(30_000), EXPLAIN_BUDGET_MS);
+        // OUTSIDE the documented range (sub-second, unreachable through the CLI
+        // and the config) the only claim is that nothing wraps or reaches zero —
+        // NOT that the deadlines still nest.
+        assert!(explain_budget_ms(1) >= 1);
+        assert!(explain_deadline_ms(u64::MAX) >= 1 && explain_budget_ms(u64::MAX) >= 1);
+    }
+
     /// Layer 2: a write that bypasses the validator entirely (direct Engine
     /// call) still fails, because the file is opened read-only.
     #[test]
@@ -1769,7 +2420,7 @@ mod tests {
             path: db,
             query_timeout_ms: 30_000,
         };
-        let err = block_on(engine.execute("INSERT INTO t (id) VALUES (99)", 10)).err();
+        let err = block_on(engine.execute_rows("INSERT INTO t (id) VALUES (99)", 10)).err();
         match err {
             Some(EngineError::Db { message, .. }) => {
                 assert!(message.contains("readonly"), "{message}")
@@ -1777,7 +2428,7 @@ mod tests {
             _ => panic!("write must fail against a read-only connection"),
         }
         // And the database is intact.
-        let rs = block_on(engine.execute("SELECT count(*) AS n FROM t", 10))
+        let rs = block_on(engine.execute_rows("SELECT count(*) AS n FROM t", 10))
             .ok()
             .unwrap();
         assert_eq!(rs.rows, vec![vec![Value::from(2)]]);
@@ -1816,7 +2467,7 @@ mod tests {
             path: db,
             query_timeout_ms: 30_000,
         };
-        let rs = block_on(engine.execute("SELECT * FROM t ORDER BY id", 10))
+        let rs = block_on(engine.execute_rows("SELECT * FROM t ORDER BY id", 10))
             .ok()
             .unwrap();
         assert_eq!(rs.columns, ["id", "name", "score", "data"]);
@@ -1844,7 +2495,7 @@ mod tests {
             path: db,
             query_timeout_ms: 30_000,
         };
-        let rs = block_on(engine.execute("SELECT id FROM t", 1))
+        let rs = block_on(engine.execute_rows("SELECT id FROM t", 1))
             .ok()
             .unwrap();
         assert_eq!(rs.rows.len(), 1);
@@ -1861,7 +2512,7 @@ mod tests {
         };
         // CAST(x'80ff' AS TEXT): a TEXT value that is not valid UTF-8 —
         // must come back with replacement chars, not fail the query.
-        let rs = block_on(engine.execute("SELECT CAST(x'80ff' AS TEXT) AS t", 10))
+        let rs = block_on(engine.execute_rows("SELECT CAST(x'80ff' AS TEXT) AS t", 10))
             .ok()
             .unwrap();
         assert_eq!(rs.rows[0][0], Value::from("\u{FFFD}\u{FFFD}"));
@@ -1876,7 +2527,7 @@ mod tests {
             path: db,
             query_timeout_ms: 30_000,
         };
-        let rs = block_on(engine.execute("SELECT id, name FROM t WHERE 0 = 1", 10))
+        let rs = block_on(engine.execute_rows("SELECT id, name FROM t WHERE 0 = 1", 10))
             .ok()
             .unwrap();
         assert!(rs.rows.is_empty());
@@ -1889,7 +2540,7 @@ mod tests {
             path: PathBuf::from("/no/such/file.db"),
             query_timeout_ms: 30_000,
         };
-        match block_on(engine.execute("SELECT 1", 10)) {
+        match block_on(engine.execute_rows("SELECT 1", 10)) {
             Err(EngineError::Connect { message, hint }) => {
                 assert!(message.contains("/no/such/file.db"), "{message}");
                 assert!(!hint.is_empty());
@@ -1921,7 +2572,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(engine.execute(sql, 10));
+        let result = rt.block_on(engine.execute_rows(sql, 10));
         rt.shutdown_background();
         match result {
             Err(EngineError::Timeout { .. }) => {}
@@ -2016,7 +2667,7 @@ mod tests {
             host_override: None,
             connect_timeout_ms: Some(500), // short so the hang test finishes fast
         };
-        match pg_block_on(engine.execute("SELECT 1", 10)) {
+        match pg_block_on(engine.execute_rows("SELECT 1", 10)) {
             Err(EngineError::Connect { hint, .. }) => {
                 assert!(
                     hint.contains("host") || hint.contains("reachable"),
@@ -2074,7 +2725,10 @@ mod tests {
 
             // Layer 2: a write bypassing the validator fails at the database
             // (the read-only transaction refuses it, SQLSTATE 25006).
-            match engine.execute("INSERT INTO t (id) VALUES (99)", 10).await {
+            match engine
+                .execute_rows("INSERT INTO t (id) VALUES (99)", 10)
+                .await
+            {
                 Err(EngineError::Db { message, .. }) => {
                     assert!(message.to_lowercase().contains("read-only"), "{message}")
                 }
@@ -2082,14 +2736,14 @@ mod tests {
             }
             // ...and the table is intact.
             let rs = engine
-                .execute("SELECT count(*) AS n FROM t", 10)
+                .execute_rows("SELECT count(*) AS n FROM t", 10)
                 .await
                 .unwrap();
             assert_eq!(rs.rows, vec![vec![Value::from(2)]]);
 
             // Type decoding across the common Postgres types.
             let rs = engine
-                .execute(
+                .execute_rows(
                     "SELECT id, name, price, uid, doc, ts, flag, blob FROM t WHERE id = 1",
                     10,
                 )
@@ -2123,7 +2777,7 @@ mod tests {
 
             // NULLs across types.
             let rs = engine
-                .execute("SELECT name, price, uid, doc FROM t WHERE id = 2", 10)
+                .execute_rows("SELECT name, price, uid, doc FROM t WHERE id = 2", 10)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2137,11 +2791,11 @@ mod tests {
             // PgNumeric is pub(crate)), so it falls back to a clear ::text-cast
             // DB_ERROR — the schema is fine, the value just isn't JSON-able.
             let rs = engine
-                .execute("SELECT 'infinity'::float8 AS f", 10)
+                .execute_rows("SELECT 'infinity'::float8 AS f", 10)
                 .await
                 .unwrap();
             assert_eq!(rs.rows[0][0], Value::from("inf"));
-            match engine.execute("SELECT 'NaN'::numeric AS n", 10).await {
+            match engine.execute_rows("SELECT 'NaN'::numeric AS n", 10).await {
                 Err(EngineError::Db { hint, .. }) => {
                     assert!(hint.contains("text"), "wrong hint for NaN numeric: {hint}")
                 }
@@ -2152,7 +2806,7 @@ mod tests {
             // arbitrary_precision), not silently rounded.
             let big = "123456789012345678901234567890";
             let rs = engine
-                .execute(&format!("SELECT '{{\"n\":{big}}}'::jsonb AS j"), 10)
+                .execute_rows(&format!("SELECT '{{\"n\":{big}}}'::jsonb AS j"), 10)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2163,7 +2817,7 @@ mod tests {
 
             // fetch_limit stops the stream early.
             let rs = engine
-                .execute("SELECT id FROM t ORDER BY id", 1)
+                .execute_rows("SELECT id FROM t ORDER BY id", 1)
                 .await
                 .unwrap();
             assert_eq!(rs.rows.len(), 1);
@@ -2180,7 +2834,7 @@ mod tests {
                 connect_timeout_ms: None,
             };
             match slow
-                .execute(
+                .execute_rows(
                     "SELECT count(*) FROM generate_series(1, 100000000000) g",
                     10,
                 )
@@ -2202,7 +2856,7 @@ mod tests {
                 host_override: None,
                 connect_timeout_ms: None,
             };
-            match tls_required.execute("SELECT 1", 10).await {
+            match tls_required.execute_rows("SELECT 1", 10).await {
                 Err(EngineError::Connect { hint, .. }) => {
                     assert!(
                         hint.contains("TLS"),
@@ -2266,7 +2920,7 @@ mod tests {
             host_override: None,
             connect_timeout_ms: Some(500), // short so the hang test finishes fast
         };
-        match pg_block_on(engine.execute("SELECT 1", 10)) {
+        match pg_block_on(engine.execute_rows("SELECT 1", 10)) {
             Err(EngineError::Connect { hint, .. }) => {
                 assert!(
                     hint.contains("host") || hint.contains("reachable"),
@@ -2330,7 +2984,10 @@ mod tests {
 
             // Layer 2: a write bypassing the validator fails at the database
             // (the read-only transaction refuses it).
-            match engine.execute("INSERT INTO t (id) VALUES (99)", 10).await {
+            match engine
+                .execute_rows("INSERT INTO t (id) VALUES (99)", 10)
+                .await
+            {
                 Err(EngineError::Db { message, .. }) => {
                     assert!(message.to_lowercase().contains("read only"), "{message}")
                 }
@@ -2340,14 +2997,14 @@ mod tests {
             }
             // ...and the table is intact.
             let rs = engine
-                .execute("SELECT count(*) AS n FROM t", 10)
+                .execute_rows("SELECT count(*) AS n FROM t", 10)
                 .await
                 .unwrap();
             assert_eq!(rs.rows, vec![vec![Value::from(2)]]);
 
             // Type decoding across the common MySQL types.
             let rs = engine
-                .execute(
+                .execute_rows(
                     "SELECT id, name, price, big, flag, doc, dt, bin, bits FROM t WHERE id = 1",
                     10,
                 )
@@ -2386,7 +3043,7 @@ mod tests {
             // chrono::NaiveTime cannot hold — decoded via MySqlTime, so a normal
             // column reads back as a string instead of a DB_ERROR.
             let rs = engine
-                .execute(
+                .execute_rows(
                     "SELECT CAST('-25:00:00' AS TIME) AS a, CAST('838:59:59' AS TIME) AS b",
                     10,
                 )
@@ -2397,7 +3054,7 @@ mod tests {
 
             // NULLs across types.
             let rs = engine
-                .execute("SELECT name, price, doc, dt FROM t WHERE id = 2", 10)
+                .execute_rows("SELECT name, price, doc, dt FROM t WHERE id = 2", 10)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2407,10 +3064,34 @@ mod tests {
 
             // fetch_limit stops the stream early.
             let rs = engine
-                .execute("SELECT id FROM t ORDER BY id", 1)
+                .execute_rows("SELECT id FROM t ORDER BY id", 1)
                 .await
                 .unwrap();
             assert_eq!(rs.rows.len(), 1);
+
+            // The guardrail's plan source on the MySQL 8 flavor (the e2e covers
+            // MariaDB): the classic EXPLAIN yields a usable row estimate, and
+            // NO cost — this engine publishes none, which is why `mode = cost`
+            // is a config error for it rather than an invented number.
+            let estimate = engine
+                .estimate("SELECT * FROM t a, t b")
+                .await
+                .unwrap()
+                .expect("planning a two-table join fits any budget");
+            assert!(estimate.rows.is_some_and(|r| r >= 4), "{estimate:?}");
+            assert_eq!(estimate.cost, None);
+            assert!(estimate.plan[0]["table"].is_string(), "{estimate:?}");
+            // ...and a guarded execute really refuses when that estimate is over
+            // the limit: nothing runs, the estimate comes back instead.
+            let guard = crate::guardrail::Guardrail::resolve("mysql", None, None, Some(1)).unwrap();
+            let outcome = engine
+                .execute("SELECT * FROM t a, t b", 10, &guard)
+                .await
+                .unwrap();
+            match outcome {
+                QueryOutcome::Refused { value, .. } => assert!(value >= 4.0),
+                other => panic!("the guardrail must refuse this one: {other:?}"),
+            }
 
             // Server max_execution_time -> Timeout (exit 8), not Db. A big
             // cross join is a read-only SELECT (so max_execution_time applies)
@@ -2428,7 +3109,7 @@ mod tests {
                 connect_timeout_ms: None,
             };
             match slow
-                .execute(
+                .execute_rows(
                     "SELECT count(*) FROM information_schema.columns a, \
                      information_schema.columns b, information_schema.columns c",
                     10,
@@ -2496,7 +3177,7 @@ mod tests {
                 connect_timeout_ms: None,
             };
             let rs = engine
-                .execute("SELECT id, name FROM tls_t", 10)
+                .execute_rows("SELECT id, name FROM tls_t", 10)
                 .await
                 .unwrap();
             assert_eq!(rs.rows, vec![vec![Value::from(1), Value::from("ok")]]);
@@ -2537,7 +3218,7 @@ mod tests {
                 connect_timeout_ms: None,
             };
             let rs = e5
-                .execute("SELECT @@max_statement_time AS t", 10)
+                .execute_rows("SELECT @@max_statement_time AS t", 10)
                 .await
                 .unwrap();
             assert!(
@@ -2561,7 +3242,7 @@ mod tests {
                 connect_timeout_ms: None,
             };
             match slow
-                .execute(
+                .execute_rows(
                     "SELECT count(*) FROM information_schema.columns a, \
                      information_schema.columns b, information_schema.columns c",
                     10,

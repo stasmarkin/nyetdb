@@ -61,19 +61,25 @@ async fn start_and_seed() -> (ContainerAsync<Mariadb>, u16) {
     (container, port)
 }
 
-fn write_mysql_config(dir: &Path, port: u16) -> std::path::PathBuf {
-    let path = dir.join("config.toml");
+/// Config for the container, optionally with extra sections (a `[guardrail]`).
+/// Each variant gets its own file name so several can coexist in one temp dir.
+fn write_mysql_config_with(dir: &Path, port: u16, extra: &str) -> std::path::PathBuf {
+    let path = dir.join(format!("config{}.toml", extra.len()));
     std::fs::write(
         &path,
         format!(
             "[connections.my]\nengine = \"mariadb\"\n\
              url = \"mysql://app@127.0.0.1:{port}/test\"\n\
-             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n{extra}",
             dir.display()
         ),
     )
     .unwrap();
     path
+}
+
+fn write_mysql_config(dir: &Path, port: u16) -> std::path::PathBuf {
+    write_mysql_config_with(dir, port, "")
 }
 
 fn run(home: &Path, cfg: &Path, args: &[&str]) -> Output {
@@ -181,9 +187,18 @@ fn mysql_query_end_to_end() {
         // max_statement_time (MariaDB) or the outer tokio timeout -> exit 8.
         // sleep()/benchmark() are denylisted, so use a big information_schema
         // cross join.
+        // The guardrail is turned off for this one case: whether it stops such
+        // a query depends on what the server estimates for information_schema
+        // (which is not the behavior under test here), and the timeout path must
+        // be exercised deterministically.
+        let unguarded = write_mysql_config_with(
+            tmp.path(),
+            port,
+            "[connections.my.guardrail]\nmode = \"off\"\n",
+        );
         let out = run(
             tmp.path(),
-            &cfg,
+            &unguarded,
             &[
                 "query",
                 "my",
@@ -498,6 +513,207 @@ fn mysql8_functional_index_key_part_is_not_dropped() {
                                 "unique": true}]),
             "{table}"
         );
+
+        container.rm().await.unwrap();
+    });
+}
+
+/// The guardrail on the MySQL/MariaDB side: `rows` mode against the classic
+/// EXPLAIN, plus `nyet explain`. Nothing here depends on timing — the monster is
+/// a cross join whose row product the planner reports up front.
+#[test]
+fn mysql_guardrail_and_explain_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        // A table big enough that joining it with itself exceeds the DEFAULT
+        // row ceiling (4000 x 4000 = 1.6e7 > 1e7) while each side alone is an
+        // ordinary, allowed scan. seq_1_to_N is MariaDB's built-in generator.
+        {
+            use sqlx::{ConnectOptions, Connection, Executor};
+            let opts: sqlx::mysql::MySqlConnectOptions =
+                format!("mysql://root@127.0.0.1:{port}/test")
+                    .parse()
+                    .unwrap();
+            let mut w = opts.connect().await.unwrap();
+            w.execute("CREATE TABLE big (id int primary key, note varchar(20))")
+                .await
+                .unwrap();
+            w.execute("INSERT INTO big SELECT seq, 'x' FROM seq_1_to_4000")
+                .await
+                .unwrap();
+            w.close().await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_mysql_config(tmp.path(), port);
+
+        // 1) Defaults (rows, 1e7): an ordinary read is untouched...
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["query", "my", "SELECT * FROM big LIMIT 5"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert!(
+            !stdout(&out).contains("GUARDRAIL_SKIPPED"),
+            "{}",
+            stdout(&out)
+        );
+
+        // 2) ...and the cross-join monster is refused before it runs.
+        let monster = "SELECT count(*) FROM big a CROSS JOIN big b WHERE a.note = b.note";
+        let out = run(tmp.path(), &cfg, &["query", "my", monster]);
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["code"], "NYET");
+        assert_eq!(v["error"]["reason"], "EXPENSIVE_QUERY");
+        assert_eq!(v["estimate"]["mode"], "rows");
+        assert_eq!(v["estimate"]["verdict"], "expensive");
+        assert_eq!(v["estimate"]["threshold"], 10_000_000u64);
+        assert!(v["estimate"]["rows"].as_u64().unwrap() > 10_000_000, "{v}");
+        // No cost on this engine — it publishes none, so nyet reports none.
+        assert!(v["estimate"].get("cost").is_none(), "{v}");
+        // The plan travels as one object per EXPLAIN row.
+        assert!(v["estimate"]["plan"][0]["table"].is_string(), "{v}");
+        assert!(v["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("[connections.my.guardrail] max_rows"));
+        assert_no_password_leak(&out);
+
+        // 3) A configured threshold decides deterministically...
+        let tiny = write_mysql_config_with(
+            tmp.path(),
+            port,
+            "[connections.my.guardrail]\nmax_rows = 1\n",
+        );
+        let out = run(tmp.path(), &tiny, &["query", "my", "SELECT * FROM users"]);
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["reason"], "EXPENSIVE_QUERY");
+        assert_eq!(v["estimate"]["threshold"], 1u64);
+        // ...and `off` really is off: the same query runs.
+        let off = write_mysql_config_with(
+            tmp.path(),
+            port,
+            "[connections.my.guardrail]\nmode = \"off\"\n",
+        );
+        let out = run(tmp.path(), &off, &["query", "my", "SELECT * FROM users"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+        // 4) A cost mode this engine cannot honor is a loud config error, never
+        // a silent "unguarded" (the message says what it does support).
+        let bad = write_mysql_config_with(
+            tmp.path(),
+            port,
+            "[connections.my.guardrail]\nmode = \"cost\"\n",
+        );
+        let out = run(tmp.path(), &bad, &["query", "my", "SELECT 1"]);
+        assert_eq!(out.status.code(), Some(3), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("rows"),
+            "{v}"
+        );
+
+        // 5) A tableless plan ("No tables used") is a KNOWN trivial plan, not an
+        // unreadable one: no spurious "could not check" warning.
+        let out = run(tmp.path(), &cfg, &["query", "my", "SELECT 1 AS n"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        assert!(
+            !stdout(&out).contains("GUARDRAIL_SKIPPED"),
+            "{}",
+            stdout(&out)
+        );
+
+        // 6) REGRESSION GUARD: a role that may SELECT a view but has no rights
+        // on the tables under it. `EXPLAIN` over a view can need SHOW VIEW
+        // (MySQL raises ER 1345), and the guardrail must never turn a query
+        // that WOULD succeed into an error — a guard that breaks working
+        // queries is worse than no guard. On mariadb:11.4 the EXPLAIN turns out
+        // to be allowed, so the query simply succeeds; where it is not, the
+        // best-effort path drops the estimate and warns instead (unit-tested in
+        // src/engine.rs). Either way: exit 0 with the rows.
+        {
+            use sqlx::{ConnectOptions, Connection, Executor};
+            let opts: sqlx::mysql::MySqlConnectOptions =
+                format!("mysql://root@127.0.0.1:{port}/test")
+                    .parse()
+                    .unwrap();
+            let mut w = opts.connect().await.unwrap();
+            w.execute("CREATE VIEW v_users AS SELECT id, email FROM users")
+                .await
+                .unwrap();
+            for grant in [
+                format!("CREATE USER 'viewer'@'%' IDENTIFIED BY '{PW}'"),
+                "GRANT SELECT ON test.v_users TO 'viewer'@'%'".to_string(),
+                "FLUSH PRIVILEGES".to_string(),
+            ] {
+                w.execute(sqlx::AssertSqlSafe(grant)).await.unwrap();
+            }
+            w.close().await.unwrap();
+        }
+        let view_only = tmp.path().join("viewer.toml");
+        std::fs::write(
+            &view_only,
+            format!(
+                "[connections.my]\nengine = \"mariadb\"\n\
+                 url = \"mysql://viewer@127.0.0.1:{port}/test\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(
+            tmp.path(),
+            &view_only,
+            &["query", "my", "SELECT * FROM v_users"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["meta"]["row_count"], 3, "{v}");
+
+        // 6b) The guardrail lends its EXPLAIN a SHORTER server-side cap and puts
+        // the query's own back afterwards. Without the cap an abandoned EXPLAIN
+        // keeps running and its late error lands on the NEXT statement; without
+        // the restore the query would inherit the 5s guardrail budget. The
+        // session variable is observable, so assert it directly: with
+        // --timeout 10 the query must see 10 seconds, not the budget.
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &[
+                "query",
+                "my",
+                "SELECT @@max_statement_time AS t",
+                "--timeout",
+                "10",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(
+            v["rows"][0]["t"], 10.0,
+            "the query's own cap is restored: {v}"
+        );
+
+        // 7) nyet explain: plan + informational verdict, nothing executed.
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["explain", "my", "SELECT id FROM users WHERE id = 1"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["estimate"]["mode"], "rows");
+        assert_eq!(v["estimate"]["verdict"], "ok");
+        assert!(v["estimate"]["plan"][0]["select_type"].is_string(), "{v}");
+        assert_eq!(v["meta"]["connection"], "my");
+        let out = run(tmp.path(), &cfg, &["explain", "my", monster]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["estimate"]["verdict"], "expensive");
+        assert_no_password_leak(&out);
 
         container.rm().await.unwrap();
     });
