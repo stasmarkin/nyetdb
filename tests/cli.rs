@@ -342,22 +342,22 @@ fn query_outside_allowed_dirs_is_exit_4() {
 #[test]
 fn query_unsupported_engine_is_not_implemented_exit_1() {
     let tmp = tempfile::tempdir().unwrap();
-    // A postgres connection that IS allowed from cwd: resolution succeeds,
-    // the engine is honestly not supported yet. Pins pipeline order too:
-    // the engine check fires before the validator, so even SQL the
-    // validator would refuse gets NOT_IMPLEMENTED (a NYET with a
-    // "fix your SQL" hint would be misleading here).
+    // A mysql connection that IS allowed from cwd: resolution succeeds, the
+    // engine is honestly not supported yet (mysql lands in a later step).
+    // Pins pipeline order too: the engine check fires before the validator,
+    // so even SQL the validator would refuse gets NOT_IMPLEMENTED (a NYET
+    // with a "fix your SQL" hint would be misleading here).
     let cfg = write_config(
         tmp.path(),
         &format!(
-            "[connections.pg]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+            "[connections.my]\nengine = \"mysql\"\nurl = \"mysql://u@h/db\"\n\
              allowed_dirs = [\"{}\"]\n",
             tmp.path().display()
         ),
     );
     for sql in ["select 1", "DELETE FROM users", "not sql at all"] {
         let out = nyet(tmp.path())
-            .args(["query", "pg", sql, "--config"])
+            .args(["query", "my", sql, "--config"])
             .arg(&cfg)
             .current_dir(tmp.path())
             .output()

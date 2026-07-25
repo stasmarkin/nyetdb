@@ -25,6 +25,9 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # ubuntu-latest ships a running Docker daemon, so the testcontainers
+      # PostgreSQL tests (src/engine.rs, tests/postgres.rs) run for real —
+      # testcontainers pulls postgres:16-alpine over the runner's network.
       - run: cargo test
 
   # Supply chain gates (Д8): licenses/bans/advisories + RustSec audit.

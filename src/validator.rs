@@ -8,7 +8,7 @@
 //! locking clauses, function denylist).
 
 use sqlparser::ast::{Expr, ObjectName, Query, Select, Statement, TableFactor, Visit, Visitor};
-use sqlparser::dialect::SQLiteDialect;
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -59,11 +59,26 @@ pub enum Verdict {
     },
 }
 
-/// Function denylist policy: built-in per-engine list merged with the
-/// per-connection config (`validator.allow_functions` / `deny_functions`).
+/// The SQL dialect to parse and classify with (per engine). Held inside the
+/// Policy so dialect and function policy can never drift apart — one source of
+/// truth per engine.
+#[derive(Clone, Copy)]
+enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+/// Per-engine validation policy: the SQL dialect plus the function denylist
+/// (built-in list merged with the per-connection config
+/// `validator.allow_functions` / `deny_functions`).
 pub struct Policy {
+    dialect: Dialect,
     /// Lowercased effective denylist (matching is case-insensitive).
     denied_functions: BTreeSet<String>,
+    /// Built-in, non-config-tunable name prefixes that are denied wholesale
+    /// (e.g. the `dblink*` and `pg_read_*` families, DESIGN §3 п.7) — fail
+    /// closed on functions we did not enumerate by exact name.
+    denied_prefixes: &'static [&'static str],
 }
 
 /// Built-in SQLite denylist (rationale in docs/DEV.md). All defense in
@@ -77,16 +92,68 @@ const SQLITE_DENIED_FUNCTIONS: &[&str] = &[
     "edit",           // sqlite3 CLI function: spawns an editor process
 ];
 
+/// Built-in PostgreSQL denylist (DESIGN §3 п.7; rationale in docs/DEV.md):
+/// functions that act OUTSIDE the read-only transaction — layer 2 does not
+/// stop them, so the validator is the only guard. Exact names here; the
+/// file-read and dblink families are prefix-matched (see below).
+const POSTGRES_DENIED_FUNCTIONS: &[&str] = &[
+    "pg_terminate_backend", // kills another backend
+    "pg_cancel_backend",    // cancels another backend's query
+    "pg_reload_conf",       // reloads server configuration
+    "pg_promote",           // promotes a standby (cluster-level)
+    // pg_sleep family: silent DoS (ties up a pooled connection). Enumerated,
+    // not prefixed, so `validator.allow_functions = ["pg_sleep"]` (DESIGN's
+    // documented escape hatch) still works — prefixes are not config-tunable.
+    "pg_sleep",
+    "pg_sleep_for",
+    "pg_sleep_until",
+    "pg_stat_file", // stats an arbitrary server file (not a pg_ls_/pg_read_ name)
+    // nextval/setval are EXCLUDED from SET TRANSACTION READ ONLY by Postgres:
+    // a durable sequence mutation through a read-only tool. (currval/lastval
+    // are pure reads and stay allowed.)
+    "nextval",
+    "setval",
+    // non-transactional WAL message: survives ROLLBACK, so it mutates durably
+    // through a read-only transaction (same class as nextval/setval).
+    "pg_logical_emit_message",
+    "lo_import", // reads a server file into a large object
+    "lo_export", // writes a large object to a server file
+];
+
+/// Prefix-matched denied families — fail closed on members we did not
+/// enumerate (every current and future member is dangerous, none is a
+/// legitimate agent read, so making them non-config-tunable is deliberate):
+/// - `dblink*` — outbound connections / remote SQL (extension).
+/// - `pg_read_*` — pg_read_file, pg_read_binary_file: arbitrary server-file read.
+/// - `pg_ls_*` — pg_ls_dir, pg_ls_logdir, pg_ls_waldir, ...: server-dir listing.
+const POSTGRES_DENIED_PREFIXES: &[&str] = &["dblink", "pg_read_", "pg_ls_"];
+
 impl Policy {
     /// Effective SQLite policy: built-in list minus `allow_functions` plus
     /// `deny_functions`. Deny wins when a name appears in both (fail closed).
     pub fn sqlite(allow_functions: &[String], deny_functions: &[String]) -> Policy {
         Policy {
+            dialect: Dialect::Sqlite,
             denied_functions: merge_denylist(
                 SQLITE_DENIED_FUNCTIONS,
                 allow_functions,
                 deny_functions,
             ),
+            denied_prefixes: &[],
+        }
+    }
+
+    /// Effective PostgreSQL policy: built-in list (plus the denied prefixes)
+    /// tuned by config the same way as sqlite(). Prefixes are built-in only.
+    pub fn postgres(allow_functions: &[String], deny_functions: &[String]) -> Policy {
+        Policy {
+            dialect: Dialect::Postgres,
+            denied_functions: merge_denylist(
+                POSTGRES_DENIED_FUNCTIONS,
+                allow_functions,
+                deny_functions,
+            ),
+            denied_prefixes: POSTGRES_DENIED_PREFIXES,
         }
     }
 }
@@ -132,23 +199,29 @@ pub fn strip_control(sql: &str) -> (Cow<'_, str>, usize) {
     }
 }
 
-/// Classify one query (SQLite dialect — the only engine in this step; the
-/// dialect becomes a parameter when a second engine lands).
+/// Classify one query under the engine's policy (which carries the dialect).
 pub fn validate(sql: &str, policy: &Policy) -> Verdict {
     let (sql, removed) = strip_control(sql);
-    // Before parsing: sqlparser cannot parse several PRAGMA forms (the call
-    // form `PRAGMA table_info(users)`, keyword values `PRAGMA journal_mode =
+    // SQLite only: sqlparser cannot parse several PRAGMA forms (the call form
+    // `PRAGMA table_info(users)`, keyword values `PRAGMA journal_mode =
     // DELETE`), which would fall into a generic PARSE_FAILED whose "fix the
     // SQL syntax" hint is a dead end. Catch the keyword up front so every
-    // PRAGMA gets the teaching refusal.
-    let first_token_len = sql
-        .trim_start()
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .unwrap_or(sql.trim_start().len());
-    if sql.trim_start()[..first_token_len].eq_ignore_ascii_case("pragma") {
-        return pragma_deny();
+    // PRAGMA gets the teaching refusal. PostgreSQL has no PRAGMA — there it is
+    // just an unknown token that fails closed as PARSE_FAILED.
+    if matches!(policy.dialect, Dialect::Sqlite) {
+        let first_token_len = sql
+            .trim_start()
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(sql.trim_start().len());
+        if sql.trim_start()[..first_token_len].eq_ignore_ascii_case("pragma") {
+            return pragma_deny();
+        }
     }
-    let statements = match Parser::parse_sql(&SQLiteDialect {}, &sql) {
+    let parsed = match policy.dialect {
+        Dialect::Sqlite => Parser::parse_sql(&SQLiteDialect {}, &sql),
+        Dialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, &sql),
+    };
+    let statements = match parsed {
         Ok(s) => s,
         // The parser error names the offending token — it comes from the
         // caller's own query, so echoing it back is safe and actionable.
@@ -326,25 +399,35 @@ impl Visitor for Checker<'_> {
 }
 
 impl Checker<'_> {
-    /// Case-insensitive denylist match on any identifier part of the (maybe
-    /// qualified) name: `LOAD_EXTENSION` and `main.load_extension` both hit.
+    /// Case-insensitive denylist match on the TERMINAL component of a (maybe
+    /// qualified) function name — that component IS the function name. So
+    /// `pg_catalog.pg_read_file` matches (terminal `pg_read_file`), but
+    /// `pg_sleep.safe_fn()` (a schema/table happens to be named `pg_sleep`)
+    /// does NOT — it is a call to `safe_fn`, not to anything denied. The
+    /// config denylists (`deny_functions`/`allow_functions`) likewise carry
+    /// unqualified names; a dotted entry is matched literally and so never hits
+    /// a terminal name (documented).
     fn check_function_name(&mut self, name: &ObjectName) -> ControlFlow<Box<Verdict>> {
-        for part in &name.0 {
-            let Some(ident) = part.as_ident() else {
-                continue;
-            };
-            let lower = ident.value.to_lowercase();
-            if self.policy.denied_functions.contains(&lower) {
-                return break_deny(deny(
-                    DenyReason::DeniedFunction,
-                    format!("the function '{lower}' is on the denylist for this connection"),
-                    &format!(
-                        "'{lower}' can affect state outside a read-only query; if you \
-                         accept the risk, add it to validator.allow_functions for this \
-                         connection in the config"
-                    ),
-                ));
-            }
+        let Some(ident) = name.0.last().and_then(|p| p.as_ident()) else {
+            return ControlFlow::Continue(());
+        };
+        let lower = ident.value.to_lowercase();
+        let denied = self.policy.denied_functions.contains(&lower)
+            || self
+                .policy
+                .denied_prefixes
+                .iter()
+                .any(|p| lower.starts_with(p));
+        if denied {
+            return break_deny(deny(
+                DenyReason::DeniedFunction,
+                format!("the function '{lower}' is on the denylist for this connection"),
+                &format!(
+                    "'{lower}' can affect state outside a read-only query; if you \
+                     accept the risk, add it to validator.allow_functions for this \
+                     connection in the config"
+                ),
+            ));
         }
         ControlFlow::Continue(())
     }
@@ -439,6 +522,14 @@ mod tests {
 
     fn parse_corpus(file: &Path) -> Vec<Case> {
         let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        // Default dialect from the filename prefix (sqlite_/postgres_), so
+        // per-engine files need no repeated `dialect:` key; a per-case
+        // `dialect:` still overrides.
+        let default_dialect = if name.starts_with("postgres") {
+            "postgres"
+        } else {
+            "sqlite"
+        };
         let text = std::fs::read_to_string(file).unwrap();
         let mut cases: Vec<Case> = Vec::new();
         for (idx, raw) in text.lines().enumerate() {
@@ -451,7 +542,7 @@ mod tests {
                     file: name.clone(),
                     line: idx + 1,
                     query: q.to_string(),
-                    dialect: "sqlite".to_string(),
+                    dialect: default_dialect.to_string(),
                     verdict: String::new(),
                     reason: None,
                     warnings: None,
@@ -491,8 +582,12 @@ mod tests {
             for case in parse_corpus(&file) {
                 total += 1;
                 let at = format!("{}:{} {:?}", case.file, case.line, case.query);
-                assert_eq!(case.dialect, "sqlite", "{at}: only sqlite in this step");
-                match validate_default(&case.query) {
+                let verdict = match case.dialect.as_str() {
+                    "sqlite" => validate(&case.query, &Policy::sqlite(&[], &[])),
+                    "postgres" => validate(&case.query, &Policy::postgres(&[], &[])),
+                    other => panic!("{at}: unknown dialect {other:?}"),
+                };
+                match verdict {
                     Verdict::Allow { warnings, .. } => {
                         assert_eq!(case.verdict, "allow", "{at}: got allow");
                         assert!(case.reason.is_none(), "{at}: reason on an allow case");
@@ -529,7 +624,7 @@ mod tests {
         }
         // Tripwire against accidental corpus loss (a whole file or a large
         // chunk vanishing must fail loudly). Raise as the corpus grows.
-        assert!(total >= 85, "corpus suspiciously small: {total} cases");
+        assert!(total >= 150, "corpus suspiciously small: {total} cases");
     }
 
     #[test]
@@ -627,6 +722,69 @@ mod tests {
             }
             Verdict::Allow { .. } => panic!("must be denied"),
         }
+    }
+
+    #[test]
+    fn postgres_sleep_is_overridable_but_prefixes_are_not() {
+        // pg_sleep is enumerated (not prefixed) precisely so DESIGN's
+        // documented escape hatch `allow_functions = ["pg_sleep"]` still works.
+        let relaxed = Policy::postgres(&["pg_sleep".to_string()], &[]);
+        assert!(matches!(
+            validate("SELECT pg_sleep(1)", &relaxed),
+            Verdict::Allow { .. }
+        ));
+        // The dangerous prefix families (pg_read_*, pg_ls_*, dblink*) are
+        // built-in only — allow_functions cannot reach them (fail closed).
+        for (sql, allow) in [
+            ("SELECT pg_read_binary_file('/x')", "pg_read_binary_file"),
+            ("SELECT pg_ls_dir('/')", "pg_ls_dir"),
+            ("SELECT dblink_exec('c', 'q')", "dblink_exec"),
+        ] {
+            let p = Policy::postgres(&[allow.to_string()], &[]);
+            assert!(
+                matches!(
+                    validate(sql, &p),
+                    Verdict::Deny {
+                        reason: DenyReason::DeniedFunction,
+                        ..
+                    }
+                ),
+                "{sql} must stay denied despite allow_functions"
+            );
+        }
+    }
+
+    #[test]
+    fn denylist_matches_the_terminal_component_only() {
+        let pg = Policy::postgres(&[], &[]);
+        // Qualified targets: the real function is the terminal component.
+        for sql in [
+            "SELECT pg_catalog.pg_sleep(1)",
+            "SELECT pg_catalog.pg_read_file('/x')", // prefix family via terminal
+            "SELECT pg_catalog.dblink_exec('c', 'q')",
+            "SELECT pg_logical_emit_message(false, 'a', 'b')",
+        ] {
+            assert!(
+                matches!(
+                    validate(sql, &pg),
+                    Verdict::Deny {
+                        reason: DenyReason::DeniedFunction,
+                        ..
+                    }
+                ),
+                "{sql} must be denied"
+            );
+        }
+        // A schema/table NAMED like a denied function is not a call to it —
+        // the terminal component (safe_fn / col) is what runs.
+        assert!(matches!(
+            validate("SELECT pg_sleep.safe_fn(1)", &pg),
+            Verdict::Allow { .. }
+        ));
+        assert!(matches!(
+            validate("SELECT pg_read_file.col FROM t", &pg),
+            Verdict::Allow { .. }
+        ));
     }
 
     #[test]

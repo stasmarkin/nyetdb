@@ -17,14 +17,18 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
 - config: parsing, validation (unknown keys are hard errors), `${VAR}`
   substitution, `password_env`, file permission warnings;
 - directory scoping (`allowed_dirs`) and `nyet list`;
-- `nyet query` for **SQLite**: the full SQL validator (read-only allowlist,
-  recursive AST walk, Unicode stripping, locking clauses, function denylist
-  with per-connection policy), the database file opened read-only
-  (`mode=ro`), row limit, timeout, json / jsonl / csv / table output;
+- `nyet query` for **SQLite** and **PostgreSQL**: the full SQL validator
+  (read-only allowlist, recursive AST walk, Unicode stripping, locking clauses,
+  per-engine function denylist with per-connection policy), session read-only
+  enforcement (SQLite `mode=ro`; PostgreSQL `default_transaction_read_only` +
+  server `statement_timeout` + an explicit `BEGIN READ ONLY`), row limit,
+  timeout, json / jsonl / csv / table output;
 - the stable JSON envelope and exit-code contract.
 
-Server engines (PostgreSQL, MySQL) arrive in later releases; `nyet query`
-against them resolves the connection and returns `NOT_IMPLEMENTED`.
+MySQL/MariaDB and SSH tunnels arrive in later releases; `nyet query` against a
+not-yet-supported engine resolves the connection and returns `NOT_IMPLEMENTED`.
+PostgreSQL over TLS is not wired up yet (connect to localhost, e.g. via the
+coming SSH tunnel).
 
 - [Roadmap](ROADMAP.md)
 - [Design](docs/DESIGN.md)
@@ -93,6 +97,38 @@ relative `path` resolves against the directory `nyet` runs from (an absolute
 path is the predictable choice). The file is opened read-only (`mode=ro`), so
 even a write that somehow slipped past the SQL validator fails in the
 database itself.
+
+PostgreSQL specifics: `url` is required (`postgres://user@host:port/dbname`);
+put the password in the env var named by `password_env`, never in the file or
+the url. If `password_env` is set but the variable is missing, that is a hard
+config error (exit 3). With no `password_env`, `nyet` connects without a
+password (local trust/peer auth). Every query runs in an explicit
+`BEGIN READ ONLY` transaction on a connection opened with
+`default_transaction_read_only=on` and a server-side `statement_timeout`, so a
+write that slipped past the validator is refused by the server (and a runaway
+query is cancelled server-side → exit 8). Result types map to JSON as:
+integers/floats/bool natively, `numeric` → string (exact, no rounding),
+`uuid`/`timestamp`/`date`/`time` → string, `json`/`jsonb` → structured JSON,
+`bytea` → lowercase hex, `NULL` → null; an exotic type nyet cannot serialize
+returns a DB_ERROR asking you to `::text`-cast the column.
+
+### Recommended: a read-only PostgreSQL role (layer 3)
+
+`nyet` is read-only, but an agent with shell access could bypass it and reach
+the database directly (threat model). The durable fix is a read-only role, so
+even direct access is read-only. Create one and point `url` at it:
+
+```sql
+CREATE ROLE nyet_ro LOGIN PASSWORD 'set-a-strong-one' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+GRANT CONNECT ON DATABASE app TO nyet_ro;
+GRANT USAGE ON SCHEMA public TO nyet_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO nyet_ro;
+-- so future tables are readable too:
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO nyet_ro;
+```
+
+Then `url = "postgres://nyet_ro@db.internal:5432/app"` and
+`password_env = "NYET_RO_PASSWORD"`.
 
 Rules:
 
@@ -193,15 +229,18 @@ agent (see the threat model in [docs/DESIGN.md](docs/DESIGN.md)):
 1. **SQL validator** (this section) — pure AST classification before
    anything touches the database; fail closed: anything not understood is
    denied.
-2. **Session/file read-only** — SQLite files are opened `mode=ro`; server
-   engines will get read-only sessions when they land.
+2. **Session/file read-only** — SQLite files are opened `mode=ro`; PostgreSQL
+   runs each query in an explicit `BEGIN READ ONLY` transaction on a
+   `default_transaction_read_only=on` connection with a server `statement_timeout`.
 3. **Read-only database roles** — recommended; makes even direct access
-   (bypassing nyet) read-only.
+   (bypassing nyet) read-only. See the PostgreSQL role recipe above.
 
 The validator pipeline: strip invisible Unicode (Cf/Cc) characters → parse
-(SQLite dialect) → exactly one statement → recursive AST walk. The walk
-denies write/DDL statements anywhere in the tree (CTE bodies, derived
-tables, subqueries), locking clauses, and denylisted functions.
+(the engine's SQL dialect — SQLite or PostgreSQL) → exactly one statement →
+recursive AST walk. The walk denies write/DDL statements anywhere in the tree
+(CTE bodies including data-modifying CTEs like `WITH x AS (DELETE ... RETURNING)`,
+derived tables, subqueries), locking clauses (`FOR UPDATE`/`FOR SHARE`),
+`COPY`, `SET`, and denylisted functions.
 
 ### How to read a refusal
 
@@ -237,11 +276,26 @@ query, the success envelope carries a `UNICODE_STRIPPED` warning.
 ### Function denylist
 
 Some functions are dangerous even inside a read-only query. The built-in
-SQLite list: `load_extension`, `fts3_tokenizer`, `readfile`, `writefile`,
-`edit` (rationale in [docs/DEV.md](docs/DEV.md)). Matching is
-case-insensitive and sees qualified names (`main.load_extension`) and
-table-valued calls (`SELECT * FROM load_extension(...)`); a mere column or
-table *named* like a denied function is not a call and stays allowed.
+lists (per engine; rationale in [docs/DEV.md](docs/DEV.md)):
+
+- **SQLite:** `load_extension`, `fts3_tokenizer`, `readfile`, `writefile`, `edit`.
+- **PostgreSQL:** `pg_terminate_backend`, `pg_cancel_backend`, `pg_reload_conf`,
+  `pg_promote`, the `pg_sleep` family (`pg_sleep`/`pg_sleep_for`/`pg_sleep_until`),
+  `nextval`/`setval`/`pg_logical_emit_message` (sequence mutation and
+  non-transactional WAL writes — Postgres runs these even inside a read-only
+  transaction, the durable writes that bypass both layers; `currval`/`lastval`
+  stay allowed), `lo_import`/`lo_export`, `pg_stat_file`, and the prefix families
+  `dblink*`, `pg_read_*` (server-file read) and `pg_ls_*` (server-dir listing).
+  These act outside the read-only transaction, so the validator is the only
+  guard. Prefix families are built-in and not tunable via `allow_functions`; the
+  enumerated names (including `pg_sleep`) are.
+
+Matching is case-insensitive and is done on the **terminal** name component, so
+qualified targets (`pg_catalog.pg_sleep`, `main.load_extension`) and table-valued
+calls (`SELECT * FROM dblink(...)`) are caught, but a column or table merely
+*named* like a denied function (`pg_sleep.some_col`) is not a call and stays
+allowed. `allow_functions` / `deny_functions` therefore take **unqualified**
+names — a dotted entry is matched literally and never hits.
 
 Per-connection tuning in the config:
 

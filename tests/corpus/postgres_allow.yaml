@@ -1,0 +1,77 @@
+# Golden corpus — legitimate reads that must pass (PostgreSQL dialect).
+# Dialect defaults to `postgres` from the filename prefix (see docs/DEV.md).
+# Format: one case per `- query:` line.
+
+- query: SELECT 1
+  verdict: allow
+- query: SELECT * FROM users WHERE id = 1
+  verdict: allow
+- query: SELECT u.id, o.total FROM users u JOIN orders o ON o.user_id = u.id
+  verdict: allow
+- query: SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.id IS NULL
+  verdict: allow
+
+# CTE, window functions, aggregates
+- query: WITH top AS (SELECT user_id, sum(total) s FROM orders GROUP BY 1) SELECT * FROM top WHERE s > 100
+  verdict: allow
+- query: WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 5) SELECT x FROM cnt
+  verdict: allow
+- query: SELECT id, row_number() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn FROM orders
+  verdict: allow
+- query: SELECT count(*), avg(total) FROM orders GROUP BY user_id HAVING count(*) > 2
+  verdict: allow
+
+# PostgreSQL-specific syntax that must not be mistaken for something dangerous
+- query: SELECT '1'::int AS n, id::text AS s FROM users
+  verdict: allow
+- query: SELECT ARRAY[1, 2, 3] AS a
+  verdict: allow
+- query: SELECT tags[1] AS first_tag FROM posts
+  verdict: allow
+- query: SELECT data->>'name' AS name, data #> '{a,b}' AS nested FROM events
+  verdict: allow
+- query: SELECT data @> '{"k":1}' AS has FROM events
+  verdict: allow
+- query: SELECT DISTINCT ON (user_id) user_id, total FROM orders ORDER BY user_id, created_at DESC
+  verdict: allow
+- query: SELECT n FROM generate_series(1, 10) AS n
+  verdict: allow
+- query: SELECT u.id, c.cnt FROM users u, LATERAL (SELECT count(*) cnt FROM orders o WHERE o.user_id = u.id) c
+  verdict: allow
+
+# EXPLAIN (read), SHOW and set operations
+- query: EXPLAIN SELECT * FROM users
+  verdict: allow
+# SHOW is a read (twin of the SET search_path deny case)
+- query: SHOW search_path
+  verdict: allow
+- query: SELECT id FROM a UNION SELECT id FROM b
+  verdict: allow
+- query: VALUES (1, 2)
+  verdict: allow
+
+# a non-denylisted admin-looking function is still just a read
+- query: SELECT pg_typeof(id) FROM users LIMIT 1
+  verdict: allow
+# currval/lastval are pure reads (unlike nextval/setval) — must NOT be denied
+- query: SELECT currval('users_id_seq')
+  verdict: allow
+- query: SELECT lastval()
+  verdict: allow
+# pg_relation_size starts with pg_ but not a denied prefix — must NOT be denied
+# (guards the pg_read_/pg_ls_ prefix boundary against over-matching)
+- query: SELECT pg_relation_size('users')
+  verdict: allow
+# a plain TABLE named like a denied family is not a call
+- query: SELECT * FROM dblink
+  verdict: allow
+# a COLUMN named like a denied function is not a call
+- query: SELECT pg_sleep FROM settings
+  verdict: allow
+# a SCHEMA/TABLE named like a denied function: the terminal component (the
+# real function/column) is what matters, so this is not a denied call
+- query: SELECT pg_sleep.col FROM t
+  verdict: allow
+# derived table (subquery in FROM) with a plain read -> allowed
+- query: SELECT * FROM (SELECT id FROM users) d
+  verdict: allow

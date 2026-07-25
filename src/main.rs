@@ -151,6 +151,26 @@ impl Failure {
     }
 }
 
+/// Engine dispatch. `Engine::execute` is a native `async fn` in a trait, which
+/// is not object-safe, so a small enum stands in for `Box<dyn Engine>`.
+enum Db {
+    Sqlite(engine::Sqlite),
+    Postgres(engine::Postgres),
+}
+
+impl Db {
+    async fn execute(
+        &self,
+        sql: &str,
+        fetch_limit: u64,
+    ) -> Result<engine::ResultSet, engine::EngineError> {
+        match self {
+            Db::Sqlite(e) => e.execute(sql, fetch_limit).await,
+            Db::Postgres(e) => e.execute(sql, fetch_limit).await,
+        }
+    }
+}
+
 /// The single owner of stream routing (DESIGN §1): the envelope's place is
 /// decided by the format, not the outcome. json — the envelope is the whole
 /// stdout output; table/jsonl/csv — data on stdout, envelope as one JSON
@@ -333,7 +353,29 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     },
                 ));
             }
-            let engine = match conn.engine.as_str() {
+            // Flag > per-connection > [defaults] > built-in. Timeout is
+            // resolved here (before the engine) because Postgres feeds it into
+            // the server-side statement_timeout at connect time.
+            let limit = limit
+                .or(conn.row_limit)
+                .or(cfg.defaults.row_limit)
+                .unwrap_or(1000);
+            let timeout_secs = timeout
+                .or(conn.timeout_secs)
+                .or(cfg.defaults.timeout_secs)
+                .unwrap_or(30);
+
+            // Per-connection validator policy tunes only the function denylist.
+            let (v_allow, v_deny) = match &conn.validator {
+                Some(v) => (
+                    v.allow_functions.as_deref().unwrap_or(&[]),
+                    v.deny_functions.as_deref().unwrap_or(&[]),
+                ),
+                None => (&[][..], &[][..]),
+            };
+            // Engine dispatch: the concrete engine, its SQL dialect and its
+            // built-in policy are chosen together by `engine`.
+            let (db, policy) = match conn.engine.as_str() {
                 "sqlite" => {
                     let Some(path) = &conn.path else {
                         return Err(Failure::new(
@@ -342,29 +384,69 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                             "add path = \"/path/to/file.db\" to this connection in the config",
                         ));
                     };
-                    engine::Sqlite {
-                        path: PathBuf::from(path),
-                    }
+                    (
+                        Db::Sqlite(engine::Sqlite {
+                            path: PathBuf::from(path),
+                        }),
+                        validator::Policy::sqlite(v_allow, v_deny),
+                    )
+                }
+                "postgres" => {
+                    let Some(url) = &conn.url else {
+                        return Err(Failure::new(
+                            ErrorCode::ConfigInvalid,
+                            format!("connection '{alias}' has engine = \"postgres\" but no `url`"),
+                            "add url = \"postgres://user@host:port/dbname\" to this connection \
+                             in the config",
+                        ));
+                    };
+                    // password_env holds the NAME of an env var; its value is
+                    // read here and never printed. A named-but-unset var is a
+                    // hard config error (like a missing ${VAR}).
+                    let password = match &conn.password_env {
+                        Some(var) => match std::env::var(var) {
+                            Ok(v) => Some(v),
+                            Err(_) => {
+                                return Err(Failure::new(
+                                    ErrorCode::ConfigInvalid,
+                                    format!(
+                                        "connection '{alias}' sets password_env = \"{var}\" but \
+                                         that environment variable is not set"
+                                    ),
+                                    format!(
+                                        "export {var}=... before running nyet, or remove \
+                                         password_env to connect without a password"
+                                    ),
+                                ))
+                            }
+                        },
+                        None => None,
+                    };
+                    (
+                        Db::Postgres(engine::Postgres {
+                            url: url.clone(),
+                            password,
+                            // Postgres rejects statement_timeout > INT_MAX ms
+                            // at connect; clamp so a huge timeout_secs still
+                            // connects (the external tokio timeout still caps
+                            // the wall clock). i32::MAX ms is ~24.8 days.
+                            statement_timeout_ms: timeout_secs
+                                .saturating_mul(1000)
+                                .min(i32::MAX as u64),
+                        }),
+                        validator::Policy::postgres(v_allow, v_deny),
+                    )
                 }
                 other => {
                     return Err(Failure::new(
                         ErrorCode::NotImplemented,
                         format!("engine \"{other}\" of connection '{alias}' is not supported yet"),
-                        "sqlite is the only engine in this version; other engines arrive \
-                         in later releases",
+                        "supported engines: sqlite, postgres; others arrive in later releases",
                     ))
                 }
             };
 
             // Layer 1: the validator. Any deny -> code NYET + reason, exit 5.
-            // The per-connection policy tunes only the function denylist.
-            let policy = match &conn.validator {
-                Some(v) => validator::Policy::sqlite(
-                    v.allow_functions.as_deref().unwrap_or(&[]),
-                    v.deny_functions.as_deref().unwrap_or(&[]),
-                ),
-                None => validator::Policy::sqlite(&[], &[]),
-            };
             let (query, mut warnings) = match validator::validate(&query, &policy) {
                 validator::Verdict::Deny {
                     reason,
@@ -392,20 +474,13 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 ),
             };
 
-            // Flag > per-connection > [defaults] > built-in.
-            let limit = limit
-                .or(conn.row_limit)
-                .or(cfg.defaults.row_limit)
-                .unwrap_or(1000);
-            let timeout_secs = timeout
-                .or(conn.timeout_secs)
-                .or(cfg.defaults.timeout_secs)
-                .unwrap_or(30);
-
             // The runtime is built lazily, only when an engine actually runs
             // (Д9: config/validator failures never pay the async tax).
+            // enable_all: the time driver arms the query timeout and the IO
+            // driver backs the Postgres TCP connection (SQLite needs neither
+            // but pays nothing measurable for them).
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
                 .map_err(|e| {
                     Failure::new(
@@ -420,7 +495,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             let result = rt.block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(timeout_secs),
-                    engine.execute(&query, limit.saturating_add(1)),
+                    db.execute(&query, limit.saturating_add(1)),
                 )
                 .await
             });
@@ -447,6 +522,11 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 }
                 Ok(Err(engine::EngineError::Db { message, hint })) => {
                     return Err(Failure::new(ErrorCode::DbError, message, hint))
+                }
+                // Server-side statement_timeout (Postgres 57014): same exit 8
+                // as the tokio timeout above, so the code is deterministic.
+                Ok(Err(engine::EngineError::Timeout { message, hint })) => {
+                    return Err(Failure::new(ErrorCode::Timeout, message, hint))
                 }
                 Ok(Ok(rs)) => rs,
             };
