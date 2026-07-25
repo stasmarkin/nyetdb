@@ -94,6 +94,26 @@ enum Command {
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
+    /// Diagnose a connection's setup honestly (UX-7): connectivity, transport
+    /// encryption, whether layer 3 (a read-only role) actually holds, superuser
+    /// status, and config-file permissions
+    ///
+    /// Runs a harmless write probe to prove read-only for real (PostgreSQL: in a
+    /// rolled-back transaction; MySQL/MariaDB: create-then-drop, as DDL auto-commits).
+    /// Always exits 0 when it ran — the per-check verdicts are in the envelope.
+    ///
+    /// Examples:
+    ///   nyet doctor              # config-file checks + connections available here
+    ///   nyet doctor prod         # full per-connection diagnosis
+    // verbatim: see the Schema arm — the examples are the point (UX-3).
+    #[command(verbatim_doc_comment)]
+    Doctor {
+        /// Connection alias to diagnose in full (omit for config-level checks)
+        alias: Option<String>,
+        /// Output format (default: table — doctor is the one human-facing command)
+        #[arg(long, value_enum)]
+        format: Option<PlainFormat>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -246,6 +266,14 @@ impl Db {
             Db::Mysql(e) => e.schema(table).await,
         }
     }
+
+    async fn diagnose(&self) -> output::Diagnosis {
+        match self {
+            Db::Sqlite(e) => e.diagnose().await,
+            Db::Postgres(e) => e.diagnose().await,
+            Db::Mysql(e) => e.diagnose().await,
+        }
+    }
 }
 
 /// The single owner of stream routing (DESIGN §1): the envelope's place is
@@ -300,14 +328,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     // Effective format for envelope routing. Before the config is read only
     // the flag is known; run() updates this once [defaults].format applies.
-    let mut format = match &cli.command {
-        Command::List { format } => format.map(PlainFormat::as_format),
-        Command::Schema { format, .. } | Command::Explain { format, .. } => {
-            format.map(PlainFormat::as_format)
-        }
-        Command::Query { format, .. } => *format,
-    }
-    .unwrap_or(Format::Json);
+    let mut format = command_format_flag(&cli.command).unwrap_or(default_format(&cli.command));
     match run(cli, &mut format) {
         Ok(()) => ExitCode::SUCCESS,
         Err(f) => {
@@ -336,24 +357,23 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
     // under [defaults].format = "csv" still routes its envelope by that
     // format (data stream on stdout, envelope on stderr) instead of
     // defaulting to json on stdout.
-    let format = resolve_format(
-        match &cli.command {
-            Command::List { format } => format.map(PlainFormat::as_format),
-            Command::Schema { format, .. } | Command::Explain { format, .. } => {
-                format.map(PlainFormat::as_format)
-            }
-            Command::Query { format, .. } => *format,
-        },
-        config::peek_defaults_format(&text).as_deref(),
-    )?;
-    // list/schema have no row stream, so a jsonl/csv [defaults].format (set
-    // for query workflows) degrades to json for them — documented in README.
-    let format = match (&cli.command, format) {
-        (
-            Command::List { .. } | Command::Schema { .. } | Command::Explain { .. },
-            Format::Jsonl | Format::Csv,
-        ) => Format::Json,
-        (_, f) => f,
+    let flag = command_format_flag(&cli.command);
+    // doctor is the one human-facing command: it defaults to `table` and ignores
+    // [defaults].format (set for query row workflows) — only an explicit --format
+    // flag (json|table) changes it.
+    let format = if matches!(cli.command, Command::Doctor { .. }) {
+        flag.unwrap_or(Format::Table)
+    } else {
+        let resolved = resolve_format(flag, config::peek_defaults_format(&text).as_deref())?;
+        // list/schema/explain have no row stream, so a jsonl/csv [defaults].format
+        // (set for query workflows) degrades to json for them.
+        match (&cli.command, resolved) {
+            (
+                Command::List { .. } | Command::Schema { .. } | Command::Explain { .. },
+                Format::Jsonl | Format::Csv,
+            ) => Format::Json,
+            (_, f) => f,
+        }
     };
     *route_format = format;
 
@@ -655,6 +675,67 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     String::new(),
                     output::explain_json(&estimate, &meta, &warnings),
                 ),
+            };
+            emit(format, &data, &envelope).map_err(output_write_failure)?;
+            Ok(())
+        }
+        Command::Doctor { alias, format: _ } => {
+            // doctor is the human's setup tool: it exits 0 whenever it ran, with
+            // the per-check verdicts in the envelope (a failed connect is a
+            // `fail` check, not exit 6 — diagnosing that is the whole point). The
+            // only non-zero exits are the config-level ones already handled above
+            // (config unreadable / unknown alias -> 3, unsupported engine -> 1).
+            let permissions = config_permissions(&path);
+            let (checks, meta) = match alias {
+                None => {
+                    // No alias: config-file permissions plus the connections
+                    // reachable from here (directory scoping applies to the
+                    // listing only — a named alias is diagnosed regardless).
+                    let aliases: Vec<String> = cfg
+                        .connections
+                        .iter()
+                        .filter(|(_, conn)| allowed(conn))
+                        .map(|(a, _)| a.clone())
+                        .collect();
+                    (
+                        output::doctor_config_checks(&permissions, &aliases),
+                        output::DoctorMeta {
+                            connection: None,
+                            duration_ms: 0,
+                        },
+                    )
+                }
+                Some(alias) => {
+                    // A named connection is diagnosed regardless of directory
+                    // scoping (the human owns the config and is testing it, quite
+                    // possibly not yet in the project dir).
+                    let conn = lookup_alias(&cfg, &path, &alias)?;
+                    let timeout_secs = cfg.timeout_secs(conn, None);
+                    let (mut db, _policy) = build_engine(&alias, conn, timeout_secs)?;
+                    let (diagnosis, duration_ms) =
+                        diagnose_connection(conn, timeout_secs, &mut db)?;
+                    let input = output::DoctorInput {
+                        engine: engine_kind(&conn.engine),
+                        diagnosis,
+                        transport: doctor_transport(conn),
+                        permissions,
+                    };
+                    (
+                        output::doctor_checks(&input),
+                        output::DoctorMeta {
+                            connection: Some(alias),
+                            duration_ms,
+                        },
+                    )
+                }
+            };
+            let (data, envelope) = match format {
+                Format::Table => (
+                    output::doctor_text(&checks),
+                    output::doctor_meta_json(&meta),
+                ),
+                // Only Json remains (doctor accepts json|table only).
+                _ => (String::new(), output::doctor_json(&checks, &meta)),
             };
             emit(format, &data, &envelope).map_err(output_write_failure)?;
             Ok(())
@@ -1035,6 +1116,108 @@ fn engine_failure(e: engine::EngineError) -> Failure {
             Failure::new(ErrorCode::Timeout, message, hint)
         }
     }
+}
+
+/// The flag the user passed on `--format` (if any), normalized to `Format`.
+fn command_format_flag(command: &Command) -> Option<Format> {
+    match command {
+        Command::List { format } => format.map(PlainFormat::as_format),
+        Command::Schema { format, .. }
+        | Command::Explain { format, .. }
+        | Command::Doctor { format, .. } => format.map(PlainFormat::as_format),
+        Command::Query { format, .. } => *format,
+    }
+}
+
+/// The default output format per command: `table` for `doctor` (the one
+/// human-facing command), `json` for everything else (the agent contract).
+fn default_format(command: &Command) -> Format {
+    match command {
+        Command::Doctor { .. } => Format::Table,
+        _ => Format::Json,
+    }
+}
+
+/// The `engine` string -> the pure doctor `EngineKind`. Called only after
+/// `build_engine` succeeded, so the value is one of the four supported engines.
+fn engine_kind(engine: &str) -> output::EngineKind {
+    match engine {
+        "sqlite" => output::EngineKind::Sqlite,
+        "postgres" => output::EngineKind::Postgres,
+        // mysql | mariadb — one driver, one dialect.
+        _ => output::EngineKind::Mysql,
+    }
+}
+
+/// The transport guarantee for doctor, from config + url only (no round-trip):
+/// an ssh tunnel encrypts the hop, a direct url at `require`+ enforces TLS,
+/// anything below that is not guaranteed encrypted, and SQLite has no transport.
+fn doctor_transport(conn: &config::Connection) -> output::Transport {
+    if conn.engine == "sqlite" {
+        return output::Transport::Na;
+    }
+    if conn.ssh.is_some() {
+        return output::Transport::Tunnel;
+    }
+    if insecure_transport(conn) {
+        output::Transport::InsecureDirect
+    } else {
+        output::Transport::TlsDirect
+    }
+}
+
+/// The config-file permission fact for doctor, from the file mode (unix only).
+fn config_permissions(path: &Path) -> output::Permissions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(md) => match config::permissions_warning(md.mode()) {
+                Some(message) => output::Permissions::Loose(message),
+                None => output::Permissions::Secure,
+            },
+            Err(_) => output::Permissions::Na,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        output::Permissions::Na
+    }
+}
+
+/// Open the tunnel (if any) and run the engine's diagnosis, returning the facts
+/// and the wall time. A tunnel failure is captured as a connectivity FACT (a
+/// `fail` check, exit 0) — not exit 6 — because doctor exists to diagnose a
+/// broken connection.
+fn diagnose_connection(
+    conn: &config::Connection,
+    timeout_secs: u64,
+    db: &mut Db,
+) -> Result<(output::Diagnosis, u64), Failure> {
+    let started = Instant::now();
+    let elapsed =
+        |started: Instant| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let _tunnel = match open_tunnel(conn, timeout_secs, db) {
+        Ok(tunnel) => tunnel,
+        Err(f) => {
+            return Ok((
+                output::Diagnosis {
+                    connect: output::ConnectFact::Failed {
+                        message: f.message,
+                        hint: f.hint,
+                    },
+                    server: None,
+                },
+                elapsed(started),
+            ));
+        }
+    };
+    let rt = runtime()?;
+    let diagnosis = rt.block_on(db.diagnose());
+    // A slow/abandoned probe future must not join a busy worker on exit.
+    rt.shutdown_background();
+    Ok((diagnosis, elapsed(started)))
 }
 
 /// Static transport check for the INSECURE_TRANSPORT warning: a direct (no ssh)

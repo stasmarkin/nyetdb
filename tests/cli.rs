@@ -1887,3 +1887,175 @@ fn loose_permissions_warn_on_stderr_but_do_not_fail() {
         .unwrap();
     assert!(!stderr(&out).contains("warning"));
 }
+
+// ---------------------------------------------------------------------------
+// nyet doctor (SQLite / config-level, no Docker)
+// ---------------------------------------------------------------------------
+
+/// The default format is table (doctor is the human-facing command): the checks
+/// render on stdout, the envelope on stderr — and SQLite is honestly reported as
+/// having no roles/server/transport (`na`), never a faked pass (UX-7). Exit 0.
+#[cfg(unix)]
+#[test]
+fn doctor_sqlite_is_honest_and_exits_0() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, cfg) = sqlite_fixture("");
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o600)).unwrap();
+    // Default format is table: checks on stdout, envelope (json line) on stderr.
+    let out = nyet(tmp.path())
+        .args(["doctor", "db", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let table = stdout(&out);
+    assert!(
+        table.contains("ok") && table.contains("connectivity"),
+        "{table}"
+    );
+    assert!(
+        table.contains("na") && table.contains("read_only_role"),
+        "{table}"
+    );
+    let env: serde_json::Value =
+        serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+    assert_eq!(env["ok"], true);
+    assert!(
+        env.get("checks").is_none(),
+        "table envelope carries no checks"
+    );
+
+    // json format: the whole envelope on stdout; every na/ok honesty pinned.
+    let out = nyet(tmp.path())
+        .args(["doctor", "db", "--format", "json", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["meta"]["connection"], "db");
+    let checks = v["checks"].as_array().unwrap();
+    let by = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no {name}: {v}"))
+            .clone()
+    };
+    assert_eq!(by("connectivity")["status"], "ok");
+    for name in ["transport_encrypted", "read_only_role", "not_superuser"] {
+        assert_eq!(by(name)["status"], "na", "{name}");
+        assert!(by(name).get("hint").is_none(), "na carries no hint: {name}");
+    }
+    assert_eq!(by("config_permissions")["status"], "ok");
+}
+
+/// Loose config permissions are a `warn` check (not a refusal); a probe/role
+/// check does not apply to SQLite. Pins that a problem is exit 0, not a failure.
+#[cfg(unix)]
+#[test]
+fn doctor_flags_loose_config_permissions_but_exits_0() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, cfg) = sqlite_fixture("");
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = nyet(tmp.path())
+        .args(["doctor", "db", "--format", "json", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    let perms = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "config_permissions")
+        .unwrap();
+    assert_eq!(perms["status"], "warn");
+    // Actionable (Д10): the hint says how to fix it.
+    assert!(
+        perms["hint"].as_str().unwrap().contains("chmod 600"),
+        "{perms}"
+    );
+}
+
+/// A connection that cannot be opened is a `fail` CHECK with exit 0 — NOT
+/// CONNECTION_FAILED / exit 6. Diagnosing a broken connection is doctor's job.
+#[test]
+fn doctor_connect_failure_is_a_fail_check_not_exit_6() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.db]\nengine = \"sqlite\"\npath = \"{}/absent.db\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            tmp.path().display(),
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["doctor", "db", "--format", "json", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["ok"], true);
+    let conn = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "connectivity")
+        .unwrap();
+    assert_eq!(conn["status"], "fail");
+    assert!(conn["hint"].is_string(), "{conn}");
+}
+
+/// `nyet doctor` with no alias: config-file permissions + the connections
+/// reachable from here. Exit 0.
+#[test]
+fn doctor_without_alias_lists_reachable_connections() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(tmp.path(), &two_conn_config(tmp.path()));
+    let out = nyet(tmp.path())
+        .args(["doctor", "--format", "json", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    // No connection field in meta for the config-level run.
+    assert!(v["meta"].get("connection").is_none(), "{v}");
+    let checks = v["checks"].as_array().unwrap();
+    let connections = checks.iter().find(|c| c["name"] == "connections").unwrap();
+    // `local` is reachable from cwd, `prod` is scoped elsewhere.
+    assert_eq!(connections["status"], "ok");
+    let msg = connections["message"].as_str().unwrap();
+    assert!(msg.contains("local") && !msg.contains("prod"), "{msg}");
+    assert!(checks.iter().any(|c| c["name"] == "config_permissions"));
+}
+
+/// An unknown alias is still a config error (exit 3), like every other command.
+#[test]
+fn doctor_unknown_alias_is_exit_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(tmp.path(), &two_conn_config(tmp.path()));
+    let out = nyet(tmp.path())
+        .args(["doctor", "nope", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    // Default format is table for doctor, so the error envelope routes to stderr.
+    assert_eq!(stdout(&out), "");
+    let v: serde_json::Value =
+        serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+}

@@ -168,8 +168,8 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 │                                 is the only IO. std only (net/process), no
 │                                 sqlx/config/clap
 └─ output    (src/output.rs)    — pure: values -> envelope/table strings;
-                                  also owns the `schema` data model (the
-                                  contract shape) and its pk/unique rules
+                                  also owns the `schema` and `doctor` data
+                                  models (the contract shapes) + their rules
 ```
 
 Dependencies flow downward only: the pure modules do no IO and know nothing
@@ -186,7 +186,10 @@ structs are the serialized contract, so they live in the pure module (with
 engines fill them in. That direction is still downward — `output` depends on
 serde alone, `engine` on all of sqlx. The runtime is built
 lazily, only when an engine actually executes (Д9: `list`, config errors and
-validator refusals never start it).
+validator refusals never start it). `nyet doctor` reuses this same
+`engine -> output` edge: the engine's `diagnose()` fills in `output`'s pure
+`Diagnosis` facts, and the pure `output::doctor_checks` turns them into the
+verdicts (see the doctor section below).
 
 ### SSH tunnels (`src/tunnel.rs`)
 
@@ -779,6 +782,242 @@ depends on statistics, parameters and server settings, and a stale cached
 estimate would be a guardrail that lies. Reconsider only if a connection daemon
 (ROADMAP v0.5) ever gives it a natural home.
 
+## `nyet doctor` (`src/output.rs` verdicts, `engine::diagnose` facts)
+
+Honest setup diagnostics for a **human** (UX-7). No new dependency. The split
+follows Д1/Д2: the engine gathers FACTS (`Engine::diagnose -> output::Diagnosis`,
+an IO call), the pure `output::doctor_checks` compares them with the expectation
+and builds the verdicts (fixture-free, unit-tested), and the cli orchestrates and
+formats. The envelope carries a new append-only field `checks: [{name, status,
+message, hint?}]`; `status` is a **closed list** (`ok` | `warn` | `fail` | `na`),
+and doctor is always `ok: true` (it ran — the verdicts are per-check).
+
+**Exit codes: doctor lives in 0/3 only.** It exits 0 whenever it *ran*, even when
+checks find problems — a failed *connection* is a `fail` check, NOT exit 6:
+diagnosing a broken connection is the whole point. The only non-zero exits are
+the config-level ones every command shares (config unreadable / unknown alias ->
+3, unsupported engine -> 1). The exit table is NOT extended.
+
+**Default format is `table`** (the one human-facing command). Unlike list/schema/
+explain it ignores `[defaults].format` (set for agent query workflows) — only an
+explicit `--format json|table` changes it. Stream convention is the usual one:
+`table` puts the readable checks on stdout and the (checks-less) envelope on
+stderr; `json` puts the whole envelope on stdout.
+
+**No directory scoping for a named alias.** `nyet doctor <alias>` diagnoses
+regardless of `allowed_dirs` — the human owns the config and is often testing it
+before `cd`-ing into the project. `nyet doctor` with no alias lists the
+connections reachable from cwd (scoping applies to that listing only).
+
+The five checks (order = presentation order): `connectivity`,
+`transport_encrypted`, `read_only_role`, `not_superuser`, `config_permissions`.
+`transport_encrypted` reuses the same static rule as the `INSECURE_TRANSPORT`
+warning (`engine::transport_below_require`, ssh vs. sslmode >= require);
+`config_permissions` reuses `config::permissions_warning`. SQLite reports
+`transport_encrypted` / `read_only_role` / `not_superuser` as `na` (no server,
+roles or network) — an honest non-answer, never a faked pass.
+
+### The layer-3 write probe — the ONE place layer 2 is removed
+
+`read_only_role` is a **hybrid**: metadata explains *why* a write is (or is not)
+refused, and a **probe write proves the fact**. Layer 2 (nyet's read-only
+session) would refuse ANY write and prove nothing about the role, so `diagnose`
+connects on a dedicated path (`connect_plain`) that does **not** apply layer 2
+(no `default_transaction_read_only`, no `BEGIN READ ONLY` / `START TRANSACTION
+READ ONLY`) and runs a write the SERVER would refuse for a read-only role /
+replica. This is the only code path in all of nyet where layer 2 is deliberately
+off, and it is reached only by `doctor` — `query`/`explain`/`schema` never call
+`diagnose`.
+
+The probe object is uniquely named (`nyet_doctor_probe_<pid>_<nanos>_<seq>`, a
+reserved prefix that cannot hit a real table; the process-local `seq` hardens the
+name when the clock reads at the epoch) and the write is a `CREATE TABLE` — a
+write **not tied to any existing object**.
+
+**Classification is the honesty crux (UX-1/UX-7): unknown ≠ ok.** A false pass is
+the worst outcome for a security tool (UX-1: a false pass destroys the human's
+trust, worse than a false warn), so ONLY a KNOWN server read-only error reads as
+`ok`. The three outcomes:
+
+- **the write succeeded** → `ProbeFact::Wrote` → `fail`: the role can write.
+- **a KNOWN read-only error** → `ProbeFact::Blocked { ddl_only }` → `ok`: the
+  server refused the write. The `ddl_only` flag splits the `ok` HEADLINE so it
+  does not over-promise (UX-7): a real read-only refusal (`ddl_only = false`) says
+  "a direct write would be rejected"; an access-denied on CREATE
+  (`ddl_only = true`) says only DDL was proven refused and DML was not probed. The
+  status is `ok` either way. Exact codes (`pg_readonly_refusal` /
+  `mysql_readonly_refusal` return `Some(ddl_only)`):
+  - **PostgreSQL** — SQLSTATE `25006` (`read_only_sql_transaction`: a hot standby,
+    or a role/db that defaults to read-only) and `42501` (`insufficient_privilege`:
+    the role lacks CREATE).
+  - **MySQL/MariaDB** — errno `1290` (ER_OPTION_PREVENTS_STATEMENT:
+    `read_only`/`super_read_only`), `1836` (ER_READ_ONLY_MODE), and the
+    access-denied codes for the write `1142` (ER_TABLEACCESS_DENIED_ERROR), `1044`
+    (ER_DBACCESS_DENIED_ERROR), `1227` (ER_SPECIFIC_ACCESS_DENIED_ERROR).
+- **any OTHER error** (connection loss, timeout, a name collision like PG `42P07`
+  / MySQL `1050`, a lock-wait timeout, no database selected, disk full, …) →
+  `ProbeFact::Unknown` → **`warn`** ("could not verify the server rejects
+  writes"), NOT a false `ok`. Before this rule every CREATE error mapped to
+  `Blocked`/`ok` — a lost MySQL ACK (server created the table, client saw the
+  error) even read as `ok` while orphaning a table.
+
+**Known limitation — the probe proves DDL-write capability, NOT DML.** A `CREATE
+TABLE` refused with `42501` / `1142` proves the role cannot CREATE, which for the
+**recommended SELECT-only layer-3 role is genuinely read-only** — but a role with
+`INSERT`/`UPDATE`/`DELETE` grants and no `CREATE` also lands on that code and
+therefore reads as `read_only_role: ok` even though it can write data. The
+compromise is accepted because the recommended layer-3 role is SELECT-only (no
+DDL, no DML); a DDL-write probe would be far messier to make DML-general. Pinned
+by the `writer` role in `postgres_doctor_end_to_end` so a change is a conscious
+one. (Treating `42501`/`1142` as `warn` instead was rejected: it would report the
+correct SELECT-only setup as "could not verify", training the human to ignore the
+tool — the opposite UX-1 damage.)
+
+**No stray object in the normal case — a possible orphan is always NAMED, never
+lost:**
+
+- **PostgreSQL** — DDL is transactional, so the probe runs inside an explicit
+  transaction that is only ever **ROLLED BACK, never committed**. The rollback
+  runs on every path, and because nyet never issues `COMMIT`, even a panic, an
+  early return or the cancellable deadline firing drops the socket and the backend
+  discards the uncommitted transaction. Nothing can persist — no orphan is
+  possible. The connection is **dropped, not gracefully closed** after diagnose
+  (`close().await` on a deadline-abandoned socket would itself be an un-cancelled
+  await).
+- **MySQL/MariaDB** — DDL **auto-commits** (a transaction cannot roll it back), so
+  the probe is a **create-then-drop**: it leaves nothing in the normal case, but a
+  refused DROP / a dead socket / a timed-out probe can leave a table, which is why
+  a possible orphan is always NAMED for manual cleanup. The safety rules:
+  1. **DROP only after a CONFIRMED CREATE, and only our exact name** — never
+     `IF EXISTS`, so a CREATE that failed on a name collision cannot delete a
+     pre-existing table, and a failed CREATE (read-only / collision / lock-wait)
+     touches nothing.
+  2. **NO un-cancelled await anywhere.** The invariant is not "the CREATE is the
+     only un-cancelled step" — every await is time-bounded:
+     - the **metadata** queries run under a client deadline; a timeout POISONS the
+       MySQL connection (a dropped op leaves it busy), so the connection is NOT
+       reused — the probe is **skipped** and the socket **dropped** (never a
+       graceful close, which could hang on the abandoned op). Here BOTH `superuser`
+       and `read_only_role` become `warn` (the metadata never answered).
+     - **cap-arming** (`arm_probe_bounds`, only `SET`s — which create nothing, so a
+       client deadline here does NOT re-open the orphan risk) also runs under a
+       client deadline; a timeout → skip + drop.
+     - the **probe itself** (CREATE + DROP) is bounded BOTH server-side (primary —
+       `arm_probe_bounds` sets `max_statement_time` / `lock_wait_timeout`; the
+       usual way a stuck statement is cancelled) AND by a generous CLIENT backstop
+       (`probe_backstop_ms` = **2 × the server cap + grace** — the probe runs TWO
+       statements, CREATE and DROP, each of which can independently wait a full cap
+       on a metadata lock, so the worst-case live duration is `2 × cap`; a single-cap
+       backstop would fire during a slow-but-legitimate DROP and cry a false orphan):
+       on a **dead socket** the server cap cannot reach the client, so the `.await`
+       would hang forever — the backstop fires, the outcome is unknown, and the
+       possible orphan is NAMED (`probe_backstop_expired`). The connection is
+       **dropped, not closed** (a `close().await` on a dead socket is itself an
+       un-cancelled await).
+     - the server-side bound is **fail-safe (gate `mysql_probe_bounded`)**: a DDL
+       statement is capped by `lock_wait_timeout` (both flavors — the metadata-lock
+       wait that actually hangs a CREATE) OR MariaDB's `max_statement_time`; MySQL's
+       `max_execution_time` is SELECT-only and does NOT count. If neither can be
+       armed → skip.
+
+     Every skip is a `warn` with an honest reason (`PROBE_SKIP_METADATA_TIMEOUT` /
+     `PROBE_SKIP_ARM_TIMEOUT` / `PROBE_SKIP_NO_BOUND`, the branch chosen by the pure
+     `probe_after_arming`), never an un-bounded CREATE on a sick connection (a
+     self-DoS). For the cap-arming / no-bound skips the metadata verdict
+     (`superuser`) is kept and only `read_only_role` warns; the metadata-timeout
+     skip warns on both.
+  3. **a DROP that is not acknowledged reports the possible orphan NAME**
+     (`Wrote { orphan: Some(name) }`) instead of swallowing it. The message says
+     the table **may remain** (a transport loss after a successful server-side DROP
+     is "unknown", not "definitely there"). The check stays `fail` (the role
+     writes). Pinned by the `nodrop` account (CREATE but not DROP) in
+     `mysql_doctor_end_to_end`, which asserts the orphan is real *and* reported.
+  4. **a CREATE whose outcome is unknown NAMES the possible orphan too.** A failed
+     CREATE is classified (`classify_mysql_create_failure`, pure) by its error
+     number: a read-only errno → `Blocked` (nothing created); another SERVER error
+     (`1050` collision, `1205` lock-wait — the server replied) → `Unknown`, no
+     orphan (the CREATE did not commit); but a **transport failure with no error
+     number** (a connection drop / IO error where the auto-committed CREATE may
+     already have committed) → `Unknown` whose message NAMES the possible orphan
+     ("if the connection dropped after the CREATE, a table named
+     `nyet_doctor_probe_…` may remain — check and DROP it manually"), symmetric
+     with rule 3. So no lost-ACK orphan is ever left unnamed.
+
+     *Residual (documented, not over-engineered):* the transport-loss discriminator
+     is `mysql_err_number().is_none()` — a reasonable heuristic, not a proof of how
+     sqlx 0.9 represents a mid-statement transport loss. If a future sqlx ever
+     surfaced transport loss as a *numbered* error, that case would fall into
+     `ServerRejected` and the possible orphan would go unnamed — conservatively
+     accepted; revisit on an sqlx upgrade.
+
+  Making the guarding role SELECT-only (the recommendation) removes the whole
+  question: a read-only role's CREATE is refused before any write, so nothing is
+  ever created.
+
+The normal-case no-orphan behavior is proven by tests that run `nyet doctor`
+against a writable role and assert, on a separate connection, that no
+`nyet_doctor_probe_%` table survives and the seed data is intact
+(`postgres_doctor_end_to_end`, `mysql_doctor_end_to_end`) — direct factual
+assertions, not timing ones. The orphan-NAMING paths (a refused DROP, and the
+client backstop firing on a dead socket) are pinned by `mysql_doctor_end_to_end`'s
+`nodrop` account and the pure `probe_backstop_cuts_off_a_dead_socket_and_names_the_orphan`.
+
+### Per-engine metadata and superuser facts
+
+Honesty-first again: a metadata failure is `SuperuserFact::Unknown` → `warn`
+("could not determine superuser status"), NEVER a false "not a superuser".
+
+- **PostgreSQL** — `current_setting('is_superuser')` (`Yes`/`No`, or `Unknown` on
+  a query error), `pg_is_in_recovery()` (hot standby), and
+  `current_setting('default_transaction_read_only')` (a read-only role/db
+  default). The replica / read-only-default note is folded into the
+  `read_only_role` ok message (the *why*). The replica/default queries are the
+  only ones read leniently (they merely color the message).
+- **MySQL/MariaDB** — `@@global.read_only` / `@@global.super_read_only` (the latter
+  is a MariaDB-unknown variable, so its error yields `None`), and `SHOW GRANTS`.
+  The grant scan is deliberately narrow: `ALL PRIVILEGES` / `SUPER` on `*.*` →
+  `Yes` (a universal `USAGE ON *.*` and a db-scoped `SELECT ON app.*` do not trip
+  it); a `SHOW GRANTS` failure or empty result → `Unknown`; **role or PROXY grants
+  nyet does not resolve → `Unresolved` → `warn`** ("nyet checks direct grants
+  only — verify elevated privileges by hand"), never a false "not a superuser" (no
+  role resolver, Д5 — just an honest gap). The raw grant line is never echoed
+  (MariaDB embeds `IDENTIFIED BY PASSWORD '*hash'`): only the privilege type is
+  named. The probe remains the authoritative writability check; the grant scan
+  only feeds `not_superuser`.
+
+### Tests
+
+- **Pure (`src/output.rs`)** — `doctor_checks` over hand-built facts: all four
+  statuses with hints (Д10), the probe-blocked ok path (both `ddl_only` headlines)
+  with a replica note, the **unknown-is-warn-never-a-false-ok** path (a
+  non-read-only probe error and an undetermined superuser status both `warn`), the
+  **orphan reporting** (a `Wrote { orphan }` surfaces the leftover name) and
+  `Unresolved` grants `warn`, the connect-failure shape, the SQLite `na` honesty,
+  the config-level (no-alias) checks, and a compact envelope + table snapshot (Д7).
+- **Pure (`src/engine.rs`)** — `classify_mysql_create_failure` over error numbers
+  (read-only errnos → `Blocked`; another server error → no orphan; `None` /
+  transport failure → `MaybeOrphan`, the lost-ACK case that must name the table),
+  `mysql_probe_bounded` (the fail-safe gate: EITHER cap bounds it, and it must NOT
+  require both — MySQL never has `max_statement_time`), `probe_after_arming` (the
+  probe runs only on a bounded, healthy connection; a cap-arming timeout `None` — a
+  poisoned connection — skips it, never runs un-bounded), and
+  `probe_backstop_cuts_off_a_dead_socket_and_names_the_orphan` (a stubbed hung
+  future is cut off by the client backstop, which names the possible orphan — no
+  un-cancelled await, no lost orphan).
+- **SQLite (`tests/cli.rs`, no Docker)** — the honest `na` output in table and
+  json with the stream convention, loose vs. 0600 config permissions, a connect
+  failure that is a `fail` check with exit 0 (not exit 6), the no-alias listing,
+  and unknown-alias -> exit 3.
+- **PostgreSQL / MariaDB (testcontainers)** — `postgres_doctor_end_to_end` /
+  `mysql_doctor_end_to_end`: a writable/superuser account fails read_only_role +
+  not_superuser, a SELECT-only role passes both, the probe leaves nothing behind
+  (no probe table survives, data intact), the documented DDL-vs-DML false ok is
+  pinned (a PG `writer` role with INSERT but no CREATE reads `ok`), the MySQL
+  orphan is reported when DROP is denied (`nodrop` — CREATE but not DROP —
+  produces a `fail` naming a table that really remains), and (Postgres) a
+  `require`-mode url reads `transport_encrypted: ok` even when the connect then
+  fails on the no-TLS container. All exit 0.
+
 ## Dependencies (Д8: each one justified)
 
 Runtime:
@@ -1262,6 +1501,12 @@ answered without touching the database).
 Codes are append-only; renaming/removing one is a breaking change (bump `v`).
 Every error must carry an actionable `hint` (Д10) — tests enforce it.
 
+`nyet doctor` adds no error/warning code — it exits 0/3 only (see the doctor
+section above). It introduces one append-only envelope field, `checks:
+[{name, status, message, hint?}]`, whose `status` is a **closed list**
+(`ok` | `warn` | `fail` | `na`); the check `name`s and the status list follow the
+same append-only rule as the codes above (renaming/removing = bump `v`).
+
 `nyet query` pipeline order is pinned by tests: format (right after config
 parse — it routes every later envelope) -> alias -> directory scoping ->
 engine support / connection config -> validator -> **guardrail (EXPLAIN)** ->
@@ -1274,4 +1519,8 @@ engine support answer before the validator so the agent gets the real
 blocker, not a SQL lecture. `nyet schema` runs the same order minus the
 validator (no agent SQL), sharing the very same code: `lookup_alias`,
 `check_scope`, `build_engine`, `open_tunnel`, `runtime`, `engine_failure` in
-`src/main.rs` — pinned by `schema_pipeline_order_matches_query`.
+`src/main.rs` — pinned by `schema_pipeline_order_matches_query`. `nyet doctor`
+shares `lookup_alias` (unknown alias -> exit 3) and `build_engine` but
+deliberately **skips `check_scope`** (a named alias is diagnosed from any
+directory) and never calls `engine_failure` (a connect failure becomes a `fail`
+check via `diagnose_connection`, not an exit-6 envelope).

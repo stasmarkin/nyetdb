@@ -701,6 +701,161 @@ fn postgres_guardrail_and_explain_end_to_end() {
     });
 }
 
+/// `nyet doctor` against a real PostgreSQL: the hybrid layer-3 check (metadata +
+/// a write probe with layer 2 removed). A superuser fails read_only_role AND
+/// not_superuser; a SELECT-only role passes both. The probe is proven to ROLL
+/// BACK — no probe table survives and the data is intact — and the transport
+/// check reports the guarantee (a require-mode url is `ok` even when the connect
+/// then fails on the no-TLS container). Always exit 0.
+#[test]
+fn postgres_doctor_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A dedicated read-only role: SELECT only, no CREATE on schema public
+        // (PostgreSQL 15+ no longer grants that to PUBLIC), so its probe write
+        // is refused by the server.
+        use sqlx::{ConnectOptions, Connection, Executor};
+        let opts: sqlx::postgres::PgConnectOptions =
+            format!("postgres://postgres@127.0.0.1:{port}/postgres")
+                .parse()
+                .unwrap();
+        let mut w = opts.password(PW).connect().await.unwrap();
+        for ddl in [
+            format!(
+                "CREATE ROLE nyet_ro LOGIN PASSWORD '{PW}' NOSUPERUSER NOCREATEDB NOCREATEROLE"
+            ),
+            "GRANT CONNECT ON DATABASE postgres TO nyet_ro".to_string(),
+            "GRANT USAGE ON SCHEMA public TO nyet_ro".to_string(),
+            "GRANT SELECT ON ALL TABLES IN SCHEMA public TO nyet_ro".to_string(),
+            // A role that CAN write (INSERT) but lacks CREATE on the schema: its
+            // probe CREATE is refused with 42501, which reads as read_only ok even
+            // though it can INSERT — the documented DDL-vs-DML compromise.
+            format!("CREATE ROLE writer LOGIN PASSWORD '{PW}' NOSUPERUSER NOCREATEDB NOCREATEROLE"),
+            "GRANT CONNECT ON DATABASE postgres TO writer".to_string(),
+            "GRANT USAGE ON SCHEMA public TO writer".to_string(),
+            "GRANT INSERT ON users TO writer".to_string(),
+        ] {
+            w.execute(sqlx::AssertSqlSafe(ddl)).await.unwrap();
+        }
+        w.close().await.unwrap();
+
+        let by = |v: &serde_json::Value, name: &str| {
+            v["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap_or_else(|| panic!("no {name}: {v}"))
+                .clone()
+        };
+
+        // 1) The superuser (postgres) role: it CAN write and IS a superuser, so
+        // both layer-3 checks FAIL — but exit 0 (a diagnosis, not a refusal).
+        let cfg = write_pg_config(tmp.path(), port);
+        let out = run(tmp.path(), &cfg, &["doctor", "pg", "--format", "json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_no_password_leak(&out);
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(by(&v, "connectivity")["status"], "ok");
+        assert_eq!(by(&v, "read_only_role")["status"], "fail", "{v}");
+        // The fail hint carries the actual SQL to create a read-only role (Д10).
+        assert!(by(&v, "read_only_role")["hint"]
+            .as_str()
+            .unwrap()
+            .contains("CREATE ROLE nyet_ro"));
+        assert_eq!(by(&v, "not_superuser")["status"], "fail", "{v}");
+        // Default sslmode (prefer) gives no encryption guarantee -> warn.
+        assert_eq!(by(&v, "transport_encrypted")["status"], "warn", "{v}");
+
+        // 2) The probe ROLLED BACK: no probe table remains and the data is
+        // untouched — the write never committed.
+        let opts: sqlx::postgres::PgConnectOptions =
+            format!("postgres://postgres@127.0.0.1:{port}/postgres")
+                .parse()
+                .unwrap();
+        let mut c = opts.password(PW).connect().await.unwrap();
+        let probes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_tables WHERE tablename LIKE 'nyet_doctor_probe_%'",
+        )
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+        assert_eq!(probes, 0, "the probe table must not survive");
+        let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(users, 3, "the probe must not touch real data");
+        c.close().await.unwrap();
+
+        // 3) The read-only role: the server refuses its probe write, so
+        // read_only_role is OK, and it is not a superuser.
+        let ro = tmp.path().join("ro.toml");
+        std::fs::write(
+            &ro,
+            format!(
+                "[connections.pg]\nengine = \"postgres\"\n\
+                 url = \"postgres://nyet_ro@127.0.0.1:{port}/postgres\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(tmp.path(), &ro, &["doctor", "pg", "--format", "json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(by(&v, "read_only_role")["status"], "ok", "{v}");
+        assert!(by(&v, "read_only_role").get("hint").is_none(), "{v}");
+        assert_eq!(by(&v, "not_superuser")["status"], "ok", "{v}");
+
+        // 3b) DOCUMENTED FALSE OK (the DDL-vs-DML compromise, pinned): the
+        // `writer` role can INSERT but lacks CREATE, so its probe CREATE is
+        // refused with 42501 and reads as read_only ok even though it can write.
+        // The recommended layer-3 role is SELECT-only, so the compromise is
+        // acceptable — but pinned here so a change is a conscious one.
+        let writer = tmp.path().join("writer.toml");
+        std::fs::write(
+            &writer,
+            format!(
+                "[connections.pg]\nengine = \"postgres\"\n\
+                 url = \"postgres://writer@127.0.0.1:{port}/postgres\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(tmp.path(), &writer, &["doctor", "pg", "--format", "json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(by(&v, "read_only_role")["status"], "ok", "{v}");
+
+        // 4) Transport reports the GUARANTEE, statically: a require-mode url is
+        // `ok` for transport even though the connect then FAILS against the
+        // no-TLS container (connectivity fail) — both are exit 0.
+        let tls = tmp.path().join("tls.toml");
+        std::fs::write(
+            &tls,
+            format!(
+                "[connections.pg]\nengine = \"postgres\"\n\
+                 url = \"postgres://postgres@127.0.0.1:{port}/postgres?sslmode=require\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(tmp.path(), &tls, &["doctor", "pg", "--format", "json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(by(&v, "transport_encrypted")["status"], "ok", "{v}");
+        assert_eq!(by(&v, "connectivity")["status"], "fail", "{v}");
+
+        container.rm().await.unwrap();
+    });
+}
+
 #[test]
 fn postgres_connection_failed_is_exit_6() {
     // No server on this port -> the connection is refused -> CONNECTION_FAILED.

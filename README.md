@@ -328,6 +328,7 @@ nyet list --format table   # human-friendly table (envelope goes to stderr)
 nyet schema <alias> [table] [--format json|table]
 nyet explain <alias> <sql> [--format json|table]
 nyet query <alias> <sql> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
+nyet doctor [alias] [--format json|table]
 ```
 
 `nyet list` prints aliases and engines only — never URLs or credentials:
@@ -733,6 +734,97 @@ security theatre (a refusal it can wave away is not a limit). The hint on a
 refusal says exactly that — narrow the query, or ask the human to raise
 `max_cost` / `max_rows` for that connection.
 
+### nyet doctor
+
+```sh
+nyet doctor              # config-file checks + the connections reachable from here
+nyet doctor <alias>      # full per-connection diagnosis
+```
+
+`nyet doctor` is the one command written for a **human**: it checks your setup
+honestly and names the weak spots (UX-7 — no security theatre). Unlike the other
+commands it defaults to `--format table`; `--format json` gives the same checks
+as an envelope.
+
+```sh
+$ nyet doctor prod
+ok    connectivity         connected to the database
+warn  transport_encrypted  the transport is not guaranteed encrypted or verified: the url's sslmode/ssl-mode is below require and there is no ssh tunnel, so nyet may talk to the server in plaintext
+                           → set sslmode=verify-full (Postgres) or ssl-mode=VERIFY_IDENTITY (MySQL) in the url to encrypt and authenticate the connection, or route it through an ssh tunnel
+fail  read_only_role       these credentials CAN write to the database directly: a probe write (a rolled-back CREATE TABLE) succeeded, so an agent with shell access could bypass nyet and modify data — layer 3 is not in place
+                           → create a read-only role and point the url at it:
+                           → CREATE ROLE nyet_ro LOGIN PASSWORD '...' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+                           → ...
+ok    not_superuser        the role is not a superuser (the role is not a PostgreSQL superuser)
+ok    config_permissions   the config file is readable only by its owner (mode 0600)
+```
+
+Each check carries a `status` and a human `message`; every `warn`/`fail` adds an
+actionable `hint`. **Statuses** (a closed list): `ok`, `warn` (a weak spot, fix
+recommended), `fail` (a real problem for the read-only guarantee), `na` (the
+check does not apply to this engine — never a faked pass or a made-up metric).
+
+`nyet doctor` **always exits 0 when it ran** — the verdicts live in the checks,
+not the exit code (a failed *connection* is a `fail` check, not exit 6:
+diagnosing that is the whole point). The only non-zero exits are the config-level
+ones every command shares: a config that cannot be read or an unknown alias
+(exit 3), or an engine this build does not ship (exit 1).
+
+**Unknown is never `ok`.** When doctor cannot actually verify something — the
+write probe hit an error that does not prove read-only (a dropped connection, a
+timeout), or the superuser status could not be read — it reports `warn` ("could
+not verify …"), never a green `ok`. A false pass in a security tool is worse than
+a false warning.
+
+What each check means and what to do about it:
+
+- **connectivity** — can nyet reach the database (through the ssh tunnel, if
+  any)? A `fail` carries the connection error and its hint.
+- **transport_encrypted** — is the channel encrypted? An ssh tunnel or a direct
+  url at `sslmode`/`ssl-mode` ≥ `require` is `ok`; anything below that with no
+  tunnel is a `warn` (nyet may talk plaintext). The check reports the
+  *guarantee* from the config, so a `require`-mode url reads `ok` here even if
+  the connect itself then fails against a server without TLS. Fix: set
+  `sslmode=verify-full` / `ssl-mode=VERIFY_IDENTITY`, or use a tunnel.
+- **read_only_role** (layer 3) — *hybrid*: metadata (superuser? replica?
+  read-only default?) explains **why**, and a **probe write proves the fact**.
+  The probe runs a write (a `CREATE TABLE nyet_doctor_probe_…`) with nyet's
+  layer-2 read-only session **deliberately removed**, so it tests whether the
+  **server** refuses this role's write. If it is refused → `ok` (a direct
+  connection with these credentials is read-only — layer 3 holds; a replica /
+  read-only default is noted). If it succeeds → `fail` (the role can write
+  directly, bypassing nyet). **The probe targets no real object** (a
+  uniquely-named `nyet_doctor_probe_…` table): on PostgreSQL it runs inside a
+  transaction that is only ever rolled back (never committed), so it leaves
+  nothing; on MySQL/MariaDB (where DDL auto-commits) it is a create-then-drop —
+  which normally leaves nothing, **but if the role lacks `DROP`, the connection
+  drops, or the probe times out, a `nyet_doctor_probe_…` table may remain, and
+  doctor NAMES it in the output** so you can remove it by hand (a SELECT-only role
+  never gets that far — its CREATE is refused before anything is written). Fix a
+  `fail` with the read-only role recipe the hint prints (see the
+  layer-3 recipes above). Only a *known* server read-only refusal reads as `ok`;
+  any other probe error is `warn` ("could not verify"), never a false pass. One
+  honest limitation: the probe proves the role cannot run a `CREATE` (a DDL
+  write), which for the recommended **SELECT-only** role is genuinely read-only —
+  but a role granted `INSERT`/`UPDATE`/`DELETE` yet not `CREATE` would also read
+  `ok` here, so grant your agent's role **only `SELECT`** (the recipes above), not
+  "everything except CREATE".
+- **not_superuser** — is the role a superuser / all-privileges account (which
+  bypasses every read-only layer)? Superuser → `fail`. Fix: use a dedicated
+  `NOSUPERUSER` role with only the `SELECT` grants the agent needs.
+- **config_permissions** — is the config file `0600` (owner-only)? Group/other
+  bits → `warn`. Fix: `chmod 600` on the config file.
+
+**SQLite is reported honestly.** It has no roles, no server and no network, so
+`transport_encrypted`, `read_only_role` and `not_superuser` come back `na` with
+a plain explanation (nyet opens the file read-only via `mode=ro`; there is no
+role to make read-only) — nyet does not invent a metric where there is none.
+
+`nyet doctor` with **no alias** checks the config-file permissions and lists the
+connections reachable from the current directory (a named alias, by contrast, is
+diagnosed regardless of `allowed_dirs` — you own the config and may be testing
+it from anywhere).
+
 ## Security
 
 `nyet` enforces read-only in layers, assuming a cooperative but fallible
@@ -882,6 +974,10 @@ Every error carries an actionable `hint`. Error codes today:
 (with `reason`, see above), `CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
 Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
 `INSECURE_TRANSPORT`, `SCHEMA_TRUNCATED`, `GUARDRAIL_SKIPPED`, `NO_PLAN`.
+
+`nyet doctor` carries a `checks` array instead — one object per diagnostic
+(`{name, status, message, hint?}`) — and always `ok: true` (it ran; the verdicts
+are per-check). `status` is a closed list: `ok`, `warn`, `fail`, `na`.
 
 Exit codes:
 

@@ -710,6 +710,495 @@ pub fn list_table(connections: &[ConnectionInfo]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// nyet doctor — honest setup diagnostics (UX-7)
+// ---------------------------------------------------------------------------
+
+/// Which engine is being diagnosed. Drives the honest `na` messaging: SQLite
+/// has no roles, no server and no network transport, so those checks do not
+/// apply to it and nyet says so plainly instead of inventing a metric (UX-7).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EngineKind {
+    Sqlite,
+    Postgres,
+    Mysql,
+}
+
+/// Closed, append-only status list for a doctor check. `na` = the check does
+/// not apply to this engine — never a faked pass, never a faked metric (UX-7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CheckStatus {
+    Ok,
+    Warn,
+    Fail,
+    Na,
+}
+
+impl CheckStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            CheckStatus::Ok => "ok",
+            CheckStatus::Warn => "warn",
+            CheckStatus::Fail => "fail",
+            CheckStatus::Na => "na",
+        }
+    }
+}
+
+impl Serialize for CheckStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// One diagnostic line. The shape is the contract (Д7): fields are only added,
+/// never renamed or dropped without a `v` bump; `status` values are the closed
+/// list above.
+#[derive(Serialize)]
+pub struct DoctorCheck {
+    pub name: &'static str,
+    pub status: CheckStatus,
+    pub message: String,
+    /// Present for every `warn`/`fail` (Д10 — a diagnostic with no way forward
+    /// is not a diagnostic) and omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// Whether the connect attempt (through the ssh tunnel, if any) succeeded — a
+/// FACT the engine gathers, turned into the `connectivity` check here.
+pub enum ConnectFact {
+    Ok { via_tunnel: bool },
+    Failed { message: String, hint: String },
+}
+
+/// The layer-3 write probe result. The probe runs a write that is deliberately
+/// NOT wrapped in nyet's layer-2 read-only session (the one place layer 2 is
+/// removed), so it proves what the SERVER does with these very credentials.
+///
+/// Classification is the honesty crux (UX-1/UX-7): a KNOWN read-only refusal is
+/// the only thing that reads as `ok`. Any other failure (connection loss,
+/// timeout, name collision, ...) is `Unknown` -> `warn` ("could not verify"),
+/// NOT a false `ok` — a false pass in a security tool is worse than a false warn.
+pub enum ProbeFact {
+    /// A KNOWN server read-only refusal — a direct connection is read-only. `ok`.
+    /// `ddl_only` distinguishes the two sub-cases so the headline does not
+    /// over-promise (UX-7): `false` = a read-only transaction / replica /
+    /// read_only mode (the server rejects EVERY write); `true` = an access-denied
+    /// on the probe CREATE, which proves only that the role lacks DDL — a role
+    /// with table-level write grants but no CREATE would land here too.
+    Blocked { detail: String, ddl_only: bool },
+    /// The write succeeded — the role can write directly, bypassing every nyet
+    /// layer. `fail`. `orphan` is the probe table that could not be cleaned up
+    /// (MySQL only — PostgreSQL rolls back), surfaced for manual removal.
+    Wrote { orphan: Option<String> },
+    /// The write failed for a reason that does NOT prove read-only — could not
+    /// verify. `warn`.
+    Unknown { detail: String },
+}
+
+/// Whether the role is a superuser / holds dangerous global privileges. An
+/// honesty-first four-way: a metadata failure is `Unknown` (-> `warn`), NEVER a
+/// false `No`/`ok`; MySQL role/proxy grants nyet does not resolve are
+/// `Unresolved` (-> `warn`), not a false `No`.
+pub enum SuperuserFact {
+    Yes(String),
+    No(String),
+    Unknown(String),
+    /// MySQL only: the account has role/proxy grants nyet does not resolve, so
+    /// its effective privileges are unknown — verify by hand.
+    Unresolved(String),
+}
+
+/// Server-role facts. `None` for SQLite (no server) or when the connect failed.
+pub struct ServerFacts {
+    pub superuser: SuperuserFact,
+    /// Why writes are (or may be) refused — a replica, a read-only default —
+    /// folded into the `read_only_role` ok message when the probe was blocked.
+    pub read_only_note: Option<String>,
+    pub probe: ProbeFact,
+}
+
+pub struct Diagnosis {
+    pub connect: ConnectFact,
+    pub server: Option<ServerFacts>,
+}
+
+/// Transport guarantee, computed by the cli from the connection config alone.
+pub enum Transport {
+    Tunnel,
+    TlsDirect,
+    InsecureDirect,
+    Na,
+}
+
+/// Config-file permission fact, computed by the cli from the file mode.
+pub enum Permissions {
+    Secure,
+    Loose(String),
+    Na,
+}
+
+/// Everything `doctor_checks` needs: engine facts plus the two the cli computes
+/// without the database (transport guarantee, config-file permissions).
+pub struct DoctorInput {
+    pub engine: EngineKind,
+    pub diagnosis: Diagnosis,
+    pub transport: Transport,
+    pub permissions: Permissions,
+}
+
+fn ok_check(name: &'static str, message: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status: CheckStatus::Ok,
+        message: message.into(),
+        hint: None,
+    }
+}
+
+fn na_check(name: &'static str, message: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status: CheckStatus::Na,
+        message: message.into(),
+        hint: None,
+    }
+}
+
+fn warn_check(
+    name: &'static str,
+    message: impl Into<String>,
+    hint: impl Into<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status: CheckStatus::Warn,
+        message: message.into(),
+        hint: Some(hint.into()),
+    }
+}
+
+fn fail_check(
+    name: &'static str,
+    message: impl Into<String>,
+    hint: impl Into<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status: CheckStatus::Fail,
+        message: message.into(),
+        hint: Some(hint.into()),
+    }
+}
+
+/// The full per-connection diagnosis (`nyet doctor <alias>`): compare the facts
+/// with the expectation and build the verdicts. PURE (Д1) — unit-tested with no
+/// database. Order is the contract's presentation order.
+pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
+    vec![
+        connectivity_check(&input.diagnosis.connect, input.engine),
+        transport_check(&input.transport),
+        read_only_role_check(input),
+        not_superuser_check(input),
+        permissions_check(&input.permissions),
+    ]
+}
+
+/// The config-level diagnosis (`nyet doctor` with no alias): the file
+/// permissions plus which connections are reachable from here.
+pub fn doctor_config_checks(permissions: &Permissions, aliases: &[String]) -> Vec<DoctorCheck> {
+    let connections = if aliases.is_empty() {
+        warn_check(
+            "connections",
+            "no connections are reachable from this directory",
+            "cd into a directory listed in a connection's allowed_dirs, or run \
+             `nyet doctor <alias>` to diagnose a specific connection regardless of directory",
+        )
+    } else {
+        ok_check(
+            "connections",
+            format!(
+                "{} connection(s) reachable from here: {} — run `nyet doctor <alias>` for a \
+                 full per-connection diagnosis",
+                aliases.len(),
+                aliases.join(", ")
+            ),
+        )
+    };
+    vec![connections, permissions_check(permissions)]
+}
+
+fn connectivity_check(connect: &ConnectFact, engine: EngineKind) -> DoctorCheck {
+    match connect {
+        ConnectFact::Ok { via_tunnel } => ok_check(
+            "connectivity",
+            match (engine, via_tunnel) {
+                (EngineKind::Sqlite, _) => "opened the SQLite database file read-only".to_string(),
+                (_, true) => "connected to the database through the SSH tunnel".to_string(),
+                (_, false) => "connected to the database".to_string(),
+            },
+        ),
+        ConnectFact::Failed { message, hint } => {
+            fail_check("connectivity", message.clone(), hint.clone())
+        }
+    }
+}
+
+fn transport_check(transport: &Transport) -> DoctorCheck {
+    match transport {
+        Transport::Tunnel => ok_check(
+            "transport_encrypted",
+            "traffic to the bastion is encrypted by the SSH tunnel (the bastion→database hop \
+             is a separate plaintext TCP connection — keep the database on a segment trusted \
+             relative to the bastion)",
+        ),
+        Transport::TlsDirect => ok_check(
+            "transport_encrypted",
+            "the direct connection requires TLS (the url's sslmode/ssl-mode is require or stricter)",
+        ),
+        Transport::InsecureDirect => warn_check(
+            "transport_encrypted",
+            "the transport is not guaranteed encrypted or verified: the url's sslmode/ssl-mode \
+             is below require and there is no ssh tunnel, so nyet may talk to the server in \
+             plaintext",
+            "set sslmode=verify-full (Postgres) or ssl-mode=VERIFY_IDENTITY (MySQL) in the url \
+             to encrypt and authenticate the connection, or route it through an ssh tunnel",
+        ),
+        Transport::Na => na_check(
+            "transport_encrypted",
+            "SQLite is a local file — there is no network transport to encrypt",
+        ),
+    }
+}
+
+fn read_only_role_check(input: &DoctorInput) -> DoctorCheck {
+    if input.engine == EngineKind::Sqlite {
+        return na_check(
+            "read_only_role",
+            "SQLite has no database roles; nyet opens the file read-only (mode=ro), so there \
+             is no role to make read-only — layer 3 does not apply",
+        );
+    }
+    match &input.diagnosis.server {
+        None => warn_check(
+            "read_only_role",
+            "could not verify: there is no connection to the database",
+            "fix the connectivity check above, then re-run nyet doctor",
+        ),
+        Some(server) => match &server.probe {
+            ProbeFact::Blocked { detail, ddl_only } => {
+                // Honest headline (UX-7): only a real read-only refusal claims
+                // "every write is rejected"; an access-denied on CREATE proves
+                // only the DDL right is missing, so it says so.
+                let mut message = if *ddl_only {
+                    format!(
+                        "the server refused a probe CREATE with these credentials (probe: {detail}) \
+                         — this proves the role cannot run DDL (CREATE), but DML write capability \
+                         (INSERT/UPDATE/DELETE on existing tables) was NOT separately probed: a \
+                         role with table-level write grants but no CREATE would also read as ok here"
+                    )
+                } else {
+                    format!(
+                        "the server refused a probe write with these credentials, so an agent that \
+                         bypassed nyet and connected directly would still be read-only (probe: {detail})"
+                    )
+                };
+                if let Some(note) = &server.read_only_note {
+                    message.push_str(&format!("; {note}"));
+                }
+                ok_check("read_only_role", message)
+            }
+            ProbeFact::Wrote { orphan } => {
+                let mut message = "these credentials CAN write to the database directly: a probe \
+                     CREATE TABLE succeeded, so an agent with shell access could bypass nyet and \
+                     modify data — layer 3 is not in place"
+                    .to_string();
+                if let Some(name) = orphan {
+                    // "may remain", not "does remain": a transport loss AFTER a
+                    // successful server-side DROP means the outcome is unknown, not
+                    // that the table is definitely still there (symmetric with the
+                    // lost-ACK CREATE wording).
+                    message.push_str(&format!(
+                        " (the cleanup DROP of the probe table `{name}` was not acknowledged — it \
+                         may remain in the database, so check for it and DROP it manually)"
+                    ));
+                }
+                fail_check("read_only_role", message, read_only_role_hint(input.engine))
+            }
+            // NOT ok: an error that does not prove read-only is "could not
+            // verify", never a false pass (UX-1 — a false ok is the worst outcome
+            // for a security tool).
+            ProbeFact::Unknown { detail } => warn_check(
+                "read_only_role",
+                format!(
+                    "could not verify the server rejects writes with these credentials: {detail}"
+                ),
+                "check connectivity and the account's privileges, re-run nyet doctor, or verify by \
+                 hand that a direct write is refused",
+            ),
+        },
+    }
+}
+
+fn not_superuser_check(input: &DoctorInput) -> DoctorCheck {
+    if input.engine == EngineKind::Sqlite {
+        return na_check("not_superuser", "SQLite has no roles or superuser concept");
+    }
+    match &input.diagnosis.server {
+        None => warn_check(
+            "not_superuser",
+            "could not verify: there is no connection to the database",
+            "fix the connectivity check above, then re-run nyet doctor",
+        ),
+        Some(server) => match &server.superuser {
+            SuperuserFact::Yes(detail) => fail_check(
+                "not_superuser",
+                format!(
+                    "{detail}: a superuser / all-privileges role has full administrative power and \
+                     bypasses every read-only layer"
+                ),
+                not_superuser_hint(input.engine),
+            ),
+            SuperuserFact::No(detail) => {
+                ok_check("not_superuser", format!("the role is not a superuser ({detail})"))
+            }
+            // Unknown metadata is NOT ok (UX-1): say so and point at the fix.
+            SuperuserFact::Unknown(detail) => warn_check(
+                "not_superuser",
+                format!("could not determine superuser status: {detail}"),
+                "check connectivity and re-run nyet doctor, or verify the role's privileges by hand",
+            ),
+            // Roles/proxy grants nyet does not resolve: honestly incomplete, not
+            // a false pass (Д5 — no role resolver, just flag the gap).
+            SuperuserFact::Unresolved(detail) => warn_check(
+                "not_superuser",
+                detail.clone(),
+                "nyet checks direct grants only — verify the effective (role/proxy) privileges by \
+                 hand, and prefer an account with only the SELECT grants the agent needs",
+            ),
+        },
+    }
+}
+
+fn permissions_check(permissions: &Permissions) -> DoctorCheck {
+    match permissions {
+        Permissions::Secure => ok_check(
+            "config_permissions",
+            "the config file is readable only by its owner (mode 0600)",
+        ),
+        Permissions::Loose(message) => warn_check(
+            "config_permissions",
+            message.clone(),
+            "run `chmod 600` on the config file so only you can read it — it may hold credentials",
+        ),
+        Permissions::Na => na_check(
+            "config_permissions",
+            "config-file permission checks are not available on this platform",
+        ),
+    }
+}
+
+/// The layer-3 remedy per engine, straight from the README recipe (Д10).
+fn read_only_role_hint(engine: EngineKind) -> String {
+    match engine {
+        EngineKind::Postgres => {
+            "create a read-only role and point the url at it:\n\
+             CREATE ROLE nyet_ro LOGIN PASSWORD '...' NOSUPERUSER NOCREATEDB NOCREATEROLE;\n\
+             GRANT CONNECT ON DATABASE <db> TO nyet_ro;\n\
+             GRANT USAGE ON SCHEMA public TO nyet_ro;\n\
+             GRANT SELECT ON ALL TABLES IN SCHEMA public TO nyet_ro;\n\
+             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO nyet_ro;\n\
+             (see the README layer-3 recipe)"
+        }
+        EngineKind::Mysql => {
+            "create a SELECT-only user and point the url at it:\n\
+             CREATE USER 'nyet_ro'@'%' IDENTIFIED BY '...';\n\
+             GRANT SELECT ON app.* TO 'nyet_ro'@'%';\n\
+             FLUSH PRIVILEGES;\n\
+             (see the README layer-3 recipe)"
+        }
+        // Never reached: SQLite short-circuits to `na` above.
+        EngineKind::Sqlite => "open the SQLite file read-only (nyet already does)",
+    }
+    .to_string()
+}
+
+fn not_superuser_hint(engine: EngineKind) -> String {
+    match engine {
+        EngineKind::Postgres => {
+            "use a dedicated NOSUPERUSER role with only the SELECT grants the agent needs \
+             (see the read-only role recipe in the README), not a superuser"
+        }
+        EngineKind::Mysql => {
+            "grant only SELECT on the specific database(s) the agent needs; do not use an \
+             account with ALL PRIVILEGES ON *.* or SUPER"
+        }
+        EngineKind::Sqlite => "not applicable to SQLite",
+    }
+    .to_string()
+}
+
+#[derive(Serialize)]
+pub struct DoctorMeta {
+    /// Absent for the config-level (`nyet doctor` with no alias) run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
+    pub duration_ms: u64,
+}
+
+#[derive(Serialize)]
+struct DoctorEnvelope<'a> {
+    v: u8,
+    ok: bool,
+    /// Absent in the data-less (stderr) envelope of the table format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checks: Option<&'a [DoctorCheck]>,
+    meta: &'a DoctorMeta,
+}
+
+pub fn doctor_json(checks: &[DoctorCheck], meta: &DoctorMeta) -> String {
+    to_json(&DoctorEnvelope {
+        v: ENVELOPE_V,
+        // doctor ran, so the envelope is a success; the per-check verdicts live
+        // in `checks`, and even a `fail` there is exit 0 (a diagnosis, not a
+        // refusal).
+        ok: true,
+        checks: Some(checks),
+        meta,
+    })
+}
+
+pub fn doctor_meta_json(meta: &DoctorMeta) -> String {
+    to_json(&DoctorEnvelope {
+        v: ENVELOPE_V,
+        ok: true,
+        checks: None,
+        meta,
+    })
+}
+
+/// Human rendering of the checks (the default `table` format): one aligned line
+/// per check, with each warn/fail hint on indented continuation lines.
+pub fn doctor_text(checks: &[DoctorCheck]) -> String {
+    let name_w = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for c in checks {
+        out.push_str(&format!(
+            "{:<6}{:<name_w$}  {}\n",
+            c.status.as_str(),
+            c.name,
+            c.message
+        ));
+        if let Some(hint) = &c.hint {
+            for line in hint.lines() {
+                out.push_str(&format!("{:<6}{:<name_w$}  → {line}\n", "", ""));
+            }
+        }
+    }
+    out
+}
+
 fn to_json<T: Serialize>(value: &T) -> String {
     // Internal invariant (fail-fast, Д3): serde_json only fails on non-string
     // map keys / failing Serialize impls; ours are plain structs.
@@ -1300,6 +1789,317 @@ mod tests {
     #[test]
     fn bare_envelope() {
         assert_eq!(bare_success(), r#"{"v":1,"ok":true}"#);
+    }
+
+    // ---- doctor ----
+
+    fn by<'a>(checks: &'a [DoctorCheck], name: &str) -> &'a DoctorCheck {
+        checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no check {name}"))
+    }
+
+    /// A worst-case Postgres setup: the role can write and is a superuser, the
+    /// transport is insecure and the config file is loose. Every warn/fail
+    /// carries an actionable hint (Д10); every ok/na does not.
+    #[test]
+    fn doctor_checks_cover_all_statuses_with_hints() {
+        let input = DoctorInput {
+            engine: EngineKind::Postgres,
+            diagnosis: Diagnosis {
+                connect: ConnectFact::Ok { via_tunnel: false },
+                server: Some(ServerFacts {
+                    superuser: SuperuserFact::Yes("current_setting('is_superuser') = on".into()),
+                    read_only_note: None,
+                    probe: ProbeFact::Wrote { orphan: None },
+                }),
+            },
+            transport: Transport::InsecureDirect,
+            permissions: Permissions::Loose("mode 644".into()),
+        };
+        let checks = doctor_checks(&input);
+        assert_eq!(by(&checks, "connectivity").status, CheckStatus::Ok);
+        assert_eq!(by(&checks, "transport_encrypted").status, CheckStatus::Warn);
+        assert_eq!(by(&checks, "read_only_role").status, CheckStatus::Fail);
+        assert_eq!(by(&checks, "not_superuser").status, CheckStatus::Fail);
+        assert_eq!(by(&checks, "config_permissions").status, CheckStatus::Warn);
+        for c in &checks {
+            match c.status {
+                CheckStatus::Warn | CheckStatus::Fail => {
+                    assert!(
+                        c.hint.as_deref().is_some_and(|h| !h.is_empty()),
+                        "{} must carry a hint",
+                        c.name
+                    );
+                }
+                CheckStatus::Ok | CheckStatus::Na => assert!(c.hint.is_none(), "{}", c.name),
+            }
+        }
+        // The read-only-role fail hint carries the actual SQL to fix it.
+        assert!(by(&checks, "read_only_role")
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("CREATE ROLE nyet_ro"));
+    }
+
+    /// A read-only-transaction / replica refusal is the strong layer-3 pass: the
+    /// message claims every direct write is rejected, and the replica note is
+    /// folded in. A non-superuser role over TLS with a 0600 config is all green.
+    #[test]
+    fn doctor_read_only_role_ok_when_the_probe_is_blocked() {
+        let input = DoctorInput {
+            engine: EngineKind::Postgres,
+            diagnosis: Diagnosis {
+                connect: ConnectFact::Ok { via_tunnel: false },
+                server: Some(ServerFacts {
+                    superuser: SuperuserFact::No("current_setting('is_superuser') = off".into()),
+                    read_only_note: Some("the server is a read-only replica (hot standby)".into()),
+                    probe: ProbeFact::Blocked {
+                        detail: "cannot execute CREATE TABLE in a read-only transaction".into(),
+                        ddl_only: false,
+                    },
+                }),
+            },
+            transport: Transport::TlsDirect,
+            permissions: Permissions::Secure,
+        };
+        let checks = doctor_checks(&input);
+        let ro = by(&checks, "read_only_role");
+        assert_eq!(ro.status, CheckStatus::Ok);
+        assert!(
+            ro.message.contains("would still be read-only"),
+            "{}",
+            ro.message
+        );
+        assert!(ro.message.contains("read-only replica"), "{}", ro.message);
+        assert_eq!(by(&checks, "not_superuser").status, CheckStatus::Ok);
+        assert_eq!(by(&checks, "transport_encrypted").status, CheckStatus::Ok);
+        assert_eq!(by(&checks, "config_permissions").status, CheckStatus::Ok);
+    }
+
+    /// UX-7: an access-denied-on-CREATE block stays `ok` (the recommended
+    /// SELECT-only role lands here) but the headline must NOT over-promise — it
+    /// says only DDL was proven refused, DML was not probed. The two Blocked
+    /// sub-cases produce distinct messages.
+    #[test]
+    fn doctor_blocked_headline_does_not_over_promise_on_ddl_only() {
+        let blocked = |ddl_only: bool| {
+            let input = DoctorInput {
+                engine: EngineKind::Postgres,
+                diagnosis: Diagnosis {
+                    connect: ConnectFact::Ok { via_tunnel: false },
+                    server: Some(ServerFacts {
+                        superuser: SuperuserFact::No("off".into()),
+                        read_only_note: None,
+                        probe: ProbeFact::Blocked {
+                            detail: "permission denied for schema public".into(),
+                            ddl_only,
+                        },
+                    }),
+                },
+                transport: Transport::TlsDirect,
+                permissions: Permissions::Secure,
+            };
+            let checks = doctor_checks(&input);
+            // Status is `ok` in BOTH sub-cases (the SELECT-only role lands here).
+            assert_eq!(by(&checks, "read_only_role").status, CheckStatus::Ok);
+            by(&checks, "read_only_role").message.clone()
+        };
+        let access = blocked(true);
+        assert!(access.contains("cannot run DDL"), "{access}");
+        assert!(access.contains("NOT separately probed"), "{access}");
+        let readonly = blocked(false);
+        assert!(readonly.contains("would still be read-only"), "{readonly}");
+        assert_ne!(access, readonly, "the two sub-cases must read differently");
+    }
+
+    /// Honesty crux (UX-1): a probe error that does NOT prove read-only, and an
+    /// undetermined superuser status, are `warn` ("could not verify") — NEVER a
+    /// false `ok`. A false pass is the worst outcome for a security tool.
+    #[test]
+    fn doctor_unknown_is_warn_never_a_false_ok() {
+        let input = DoctorInput {
+            engine: EngineKind::Postgres,
+            diagnosis: Diagnosis {
+                connect: ConnectFact::Ok { via_tunnel: false },
+                server: Some(ServerFacts {
+                    superuser: SuperuserFact::Unknown("could not read is_superuser".into()),
+                    read_only_note: None,
+                    probe: ProbeFact::Unknown {
+                        detail: "server closed the connection".into(),
+                    },
+                }),
+            },
+            transport: Transport::TlsDirect,
+            permissions: Permissions::Secure,
+        };
+        let checks = doctor_checks(&input);
+        assert_eq!(by(&checks, "read_only_role").status, CheckStatus::Warn);
+        assert!(by(&checks, "read_only_role")
+            .message
+            .contains("could not verify"));
+        assert_eq!(by(&checks, "not_superuser").status, CheckStatus::Warn);
+        // Both carry an actionable hint.
+        assert!(by(&checks, "read_only_role").hint.is_some());
+        assert!(by(&checks, "not_superuser").hint.is_some());
+    }
+
+    /// A MySQL probe that wrote but could not clean up: the orphan table name is
+    /// surfaced (forensics), not swallowed — the check is still `fail` (the role
+    /// writes). And unresolved role/proxy grants are `warn`, not a false `ok`.
+    #[test]
+    fn doctor_reports_orphan_probe_table_and_unresolved_grants() {
+        let input = DoctorInput {
+            engine: EngineKind::Mysql,
+            diagnosis: Diagnosis {
+                connect: ConnectFact::Ok { via_tunnel: false },
+                server: Some(ServerFacts {
+                    superuser: SuperuserFact::Unresolved(
+                        "the account has role/proxy grants nyet does not resolve".into(),
+                    ),
+                    read_only_note: None,
+                    probe: ProbeFact::Wrote {
+                        orphan: Some("nyet_doctor_probe_42_99_0".into()),
+                    },
+                }),
+            },
+            transport: Transport::InsecureDirect,
+            permissions: Permissions::Secure,
+        };
+        let checks = doctor_checks(&input);
+        let ro = by(&checks, "read_only_role");
+        assert_eq!(ro.status, CheckStatus::Fail);
+        assert!(
+            ro.message.contains("nyet_doctor_probe_42_99_0"),
+            "{}",
+            ro.message
+        );
+        assert_eq!(by(&checks, "not_superuser").status, CheckStatus::Warn);
+    }
+
+    /// SQLite has no roles/server/network — those checks are honestly `na`, not
+    /// a faked pass or a made-up metric (UX-7).
+    #[test]
+    fn doctor_sqlite_is_honest_about_na() {
+        let input = DoctorInput {
+            engine: EngineKind::Sqlite,
+            diagnosis: Diagnosis {
+                connect: ConnectFact::Ok { via_tunnel: false },
+                server: None,
+            },
+            transport: Transport::Na,
+            permissions: Permissions::Secure,
+        };
+        let checks = doctor_checks(&input);
+        assert_eq!(by(&checks, "connectivity").status, CheckStatus::Ok);
+        for name in ["transport_encrypted", "read_only_role", "not_superuser"] {
+            assert_eq!(by(&checks, name).status, CheckStatus::Na, "{name}");
+            assert!(by(&checks, name).hint.is_none(), "{name}");
+        }
+        assert_eq!(by(&checks, "config_permissions").status, CheckStatus::Ok);
+    }
+
+    /// A failed connect is a `fail` check (exit 0 in the cli), never an error
+    /// envelope — diagnosing a broken connection is exactly what doctor is for.
+    #[test]
+    fn doctor_connect_failure_is_a_fail_check_not_an_error() {
+        let input = DoctorInput {
+            engine: EngineKind::Postgres,
+            diagnosis: Diagnosis {
+                connect: ConnectFact::Failed {
+                    message: "cannot connect".into(),
+                    hint: "check host/port".into(),
+                },
+                server: None,
+            },
+            transport: Transport::InsecureDirect,
+            permissions: Permissions::Secure,
+        };
+        let checks = doctor_checks(&input);
+        assert_eq!(by(&checks, "connectivity").status, CheckStatus::Fail);
+        // The DB-dependent checks cannot be verified, so they warn (not fail).
+        assert_eq!(by(&checks, "read_only_role").status, CheckStatus::Warn);
+        assert_eq!(by(&checks, "not_superuser").status, CheckStatus::Warn);
+        // ...but the config-only checks still answer.
+        assert_eq!(by(&checks, "transport_encrypted").status, CheckStatus::Warn);
+        assert_eq!(by(&checks, "config_permissions").status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn doctor_config_checks_list_aliases_or_warn_when_none() {
+        let some = doctor_config_checks(&Permissions::Secure, &["a".into(), "b".into()]);
+        assert_eq!(by(&some, "connections").status, CheckStatus::Ok);
+        assert!(by(&some, "connections").message.contains("a, b"));
+        let none = doctor_config_checks(&Permissions::Loose("mode 644".into()), &[]);
+        assert_eq!(by(&none, "connections").status, CheckStatus::Warn);
+        assert_eq!(by(&none, "config_permissions").status, CheckStatus::Warn);
+    }
+
+    /// Contract shape (Д7): keys and order are pinned, `hint` omitted when
+    /// absent, `connection` omitted in the config-level (meta-only) envelope.
+    #[test]
+    fn doctor_envelope_is_compact_and_stable() {
+        let checks = vec![
+            DoctorCheck {
+                name: "connectivity",
+                status: CheckStatus::Ok,
+                message: "ok".into(),
+                hint: None,
+            },
+            DoctorCheck {
+                name: "read_only_role",
+                status: CheckStatus::Fail,
+                message: "no".into(),
+                hint: Some("do x".into()),
+            },
+        ];
+        let meta = DoctorMeta {
+            connection: Some("prod".into()),
+            duration_ms: 5,
+        };
+        assert_eq!(
+            doctor_json(&checks, &meta),
+            r#"{"v":1,"ok":true,"checks":[{"name":"connectivity","status":"ok","message":"ok"},{"name":"read_only_role","status":"fail","message":"no","hint":"do x"}],"meta":{"connection":"prod","duration_ms":5}}"#
+        );
+        // table format: the checks render on stdout, this data-less envelope on
+        // stderr — and the config-level run omits `connection`.
+        let meta = DoctorMeta {
+            connection: None,
+            duration_ms: 0,
+        };
+        assert_eq!(
+            doctor_meta_json(&meta),
+            r#"{"v":1,"ok":true,"meta":{"duration_ms":0}}"#
+        );
+    }
+
+    #[test]
+    fn doctor_text_renders_status_name_message_and_indented_hint() {
+        let checks = vec![
+            DoctorCheck {
+                name: "connectivity",
+                status: CheckStatus::Ok,
+                message: "connected".into(),
+                hint: None,
+            },
+            DoctorCheck {
+                name: "read_only_role",
+                status: CheckStatus::Fail,
+                message: "can write".into(),
+                hint: Some("line1\nline2".into()),
+            },
+        ];
+        let text = doctor_text(&checks);
+        assert!(text.contains("ok"), "{text}");
+        assert!(text.contains("connectivity"), "{text}");
+        assert!(text.contains("fail"), "{text}");
+        assert!(text.contains("can write"), "{text}");
+        assert!(
+            text.contains("→ line1") && text.contains("→ line2"),
+            "{text}"
+        );
     }
 
     #[test]

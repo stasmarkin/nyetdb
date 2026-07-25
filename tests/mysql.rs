@@ -400,6 +400,169 @@ fn mysql_schema_end_to_end() {
     });
 }
 
+/// `nyet doctor` against a real MariaDB: the hybrid layer-3 check (metadata + a
+/// write probe with layer 2 removed). The `app` account holds `ALL PRIVILEGES ON
+/// *.*`, so it FAILS both read_only_role (the probe writes) and not_superuser; a
+/// SELECT-only account passes both. The probe (a create-then-drop, since MySQL
+/// DDL auto-commits) is proven to leave NO table behind and touch no data.
+#[test]
+fn mysql_doctor_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A SELECT-only account: its probe CREATE is refused (no CREATE priv).
+        use sqlx::{ConnectOptions, Connection, Executor};
+        let opts: sqlx::mysql::MySqlConnectOptions = format!("mysql://root@127.0.0.1:{port}/test")
+            .parse()
+            .unwrap();
+        let mut w = opts.connect().await.unwrap();
+        w.execute(sqlx::AssertSqlSafe(format!(
+            "CREATE USER 'ro'@'%' IDENTIFIED BY '{PW}'"
+        )))
+        .await
+        .unwrap();
+        w.execute("GRANT SELECT ON test.* TO 'ro'@'%'")
+            .await
+            .unwrap();
+        w.execute("FLUSH PRIVILEGES").await.unwrap();
+        w.close().await.unwrap();
+
+        let by = |v: &serde_json::Value, name: &str| {
+            v["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap_or_else(|| panic!("no {name}: {v}"))
+                .clone()
+        };
+
+        // 1) The `app` account holds ALL PRIVILEGES ON *.*: it can write and is
+        // an admin, so both layer-3 checks FAIL — exit 0 regardless.
+        let cfg = write_mysql_config(tmp.path(), port);
+        let out = run(tmp.path(), &cfg, &["doctor", "my", "--format", "json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_no_password_leak(&out);
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(by(&v, "connectivity")["status"], "ok");
+        assert_eq!(by(&v, "read_only_role")["status"], "fail", "{v}");
+        assert!(by(&v, "read_only_role")["hint"]
+            .as_str()
+            .unwrap()
+            .contains("CREATE USER 'nyet_ro'"));
+        assert_eq!(by(&v, "not_superuser")["status"], "fail", "{v}");
+        assert_eq!(by(&v, "transport_encrypted")["status"], "warn", "{v}");
+        // The raw SHOW GRANTS line is never echoed (MariaDB can embed a password
+        // hash after `IDENTIFIED BY PASSWORD`): only the privilege type is named.
+        // (The read-only-role hint's own `IDENTIFIED BY '...'` template is fine —
+        // the leak form is `IDENTIFIED BY PASSWORD '*hash'`.)
+        assert!(
+            !stdout(&out).contains("IDENTIFIED BY PASSWORD"),
+            "{}",
+            stdout(&out)
+        );
+
+        // 2) The probe left NO table behind and did not touch the data.
+        let opts: sqlx::mysql::MySqlConnectOptions = format!("mysql://root@127.0.0.1:{port}/test")
+            .parse()
+            .unwrap();
+        let mut c = opts.connect().await.unwrap();
+        let probes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.TABLES \
+             WHERE TABLE_NAME LIKE 'nyet_doctor_probe_%'",
+        )
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+        assert_eq!(probes, 0, "the probe table must not survive");
+        let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(users, 3, "the probe must not touch real data");
+        c.close().await.unwrap();
+
+        // 3) The SELECT-only account: the server refuses its probe write, so
+        // read_only_role is OK and it is not an admin.
+        let ro = tmp.path().join("ro.toml");
+        std::fs::write(
+            &ro,
+            format!(
+                "[connections.my]\nengine = \"mariadb\"\n\
+                 url = \"mysql://ro@127.0.0.1:{port}/test\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(tmp.path(), &ro, &["doctor", "my", "--format", "json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(by(&v, "read_only_role")["status"], "ok", "{v}");
+        assert!(by(&v, "read_only_role").get("hint").is_none(), "{v}");
+        assert_eq!(by(&v, "not_superuser")["status"], "ok", "{v}");
+
+        // 4) ORPHAN REPORTING: an account with CREATE but NOT DROP writes the
+        // probe table (auto-committed) and then cannot drop it. The orphan must
+        // be REPORTED with its name (forensics), never left silently.
+        let opts: sqlx::mysql::MySqlConnectOptions = format!("mysql://root@127.0.0.1:{port}/test")
+            .parse()
+            .unwrap();
+        let mut c = opts.connect().await.unwrap();
+        c.execute(sqlx::AssertSqlSafe(format!(
+            "CREATE USER 'nodrop'@'%' IDENTIFIED BY '{PW}'"
+        )))
+        .await
+        .unwrap();
+        c.execute("GRANT SELECT, CREATE ON test.* TO 'nodrop'@'%'")
+            .await
+            .unwrap();
+        c.execute("FLUSH PRIVILEGES").await.unwrap();
+        c.close().await.unwrap();
+
+        let nodrop = tmp.path().join("nodrop.toml");
+        std::fs::write(
+            &nodrop,
+            format!(
+                "[connections.my]\nengine = \"mariadb\"\n\
+                 url = \"mysql://nodrop@127.0.0.1:{port}/test\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(tmp.path(), &nodrop, &["doctor", "my", "--format", "json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        // The role can write -> fail, and the leftover probe name is surfaced.
+        assert_eq!(by(&v, "read_only_role")["status"], "fail", "{v}");
+        let msg = by(&v, "read_only_role")["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(msg.contains("nyet_doctor_probe_"), "{msg}");
+        // The orphan is REAL: a table by that name actually remains.
+        let opts: sqlx::mysql::MySqlConnectOptions = format!("mysql://root@127.0.0.1:{port}/test")
+            .parse()
+            .unwrap();
+        let mut c = opts.connect().await.unwrap();
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.TABLES \
+             WHERE TABLE_NAME LIKE 'nyet_doctor_probe_%'",
+        )
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+        assert_eq!(orphans, 1, "the reported orphan must actually exist");
+        c.close().await.unwrap();
+        // The throwaway container is dropped next, taking the orphan with it.
+
+        container.rm().await.unwrap();
+    });
+}
+
 #[test]
 fn mysql_connection_failed_is_exit_6() {
     // No server on this port -> the connection is refused -> CONNECTION_FAILED.

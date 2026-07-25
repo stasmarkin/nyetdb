@@ -7,7 +7,8 @@
 
 use crate::guardrail::{CostEstimate, Guardrail};
 use crate::output::{
-    build_table, KeyPart, Schema, SchemaColumn, SchemaFk, SchemaIndex, SchemaTable,
+    build_table, ConnectFact, Diagnosis, KeyPart, ProbeFact, Schema, SchemaColumn, SchemaFk,
+    SchemaIndex, SchemaTable, ServerFacts, SuperuserFact,
 };
 use futures_util::TryStreamExt;
 use serde_json::Value;
@@ -254,6 +255,119 @@ pub trait Engine {
     /// lists everything — with details only while the object count stays
     /// within `output::DETAIL_LIMIT`.
     async fn schema(&self, table: Option<&str>) -> Result<Schema, EngineError>;
+
+    /// Diagnose the setup for `nyet doctor`: whether the connection works, and
+    /// (for a server engine) whether these credentials are read-only and
+    /// non-superuser. Infallible on purpose — a failed connect is a FACT
+    /// (`ConnectFact::Failed`) that becomes a `fail` check, not an error that
+    /// bubbles to exit 6: diagnosing a broken connection is doctor's whole job.
+    ///
+    /// **The write probe is the ONE place layer 2 is deliberately removed.** It
+    /// connects WITHOUT nyet's read-only session and runs a write that the
+    /// SERVER (a read-only role / replica) would refuse — proving layer 3 for
+    /// real. PostgreSQL runs the write in a transaction that is only ever rolled
+    /// back (never committed), so it leaves nothing. MySQL/MariaDB (where DDL
+    /// auto-commits) create-then-drop — normally leaving nothing, but if the DROP
+    /// is refused / the socket dies / the probe times out, a possible orphan is
+    /// NAMED in the verdict for manual cleanup (see `pg_probe` / `mysql_probe`).
+    async fn diagnose(&self) -> Diagnosis;
+}
+
+/// A unique, collision-proof name for the throwaway probe object: the prefix is
+/// documented and reserved, the pid + nanoseconds + a process-local counter
+/// suffix cannot hit a real table. The counter hardens the fallback when the
+/// system clock reads at the epoch (nanos = 0), so two probes never collide.
+/// Only ever created inside a transaction we roll back (Postgres) or dropped
+/// right after a confirmed create (MySQL).
+fn probe_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("nyet_doctor_probe_{pid}_{nanos}_{seq}")
+}
+
+/// The SQLSTATE of a database error, if any (Postgres/MySQL both expose it).
+fn sqlstate(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error()
+        .and_then(|db| db.code())
+        .map(|c| c.into_owned())
+}
+
+/// Does this PostgreSQL error PROVE the server refused the probe write, and if so
+/// is it DDL-only? `Some(false)` = `25006` (`read_only_sql_transaction`: a hot
+/// standby / read-only default — EVERY write is rejected). `Some(true)` = `42501`
+/// (`insufficient_privilege`: the role lacks CREATE — only DDL is proven refused;
+/// a role with INSERT/UPDATE/DELETE but no CREATE lands here too, the documented
+/// DDL-vs-DML gap). `None` = any other error (connection loss, name collision,
+/// disk full, ...) — NOT a read-only proof, so `Unknown` -> `warn`.
+fn pg_readonly_refusal(e: &sqlx::Error) -> Option<bool> {
+    match sqlstate(e).as_deref() {
+        Some("25006") => Some(false),
+        Some("42501") => Some(true),
+        _ => None,
+    }
+}
+
+/// What a FAILED MySQL/MariaDB probe CREATE means, classified from the error's
+/// number alone so it is pure and unit-testable (a live `sqlx::Error` is awkward
+/// to fabricate). `None` = a transport-level failure (no server error number).
+#[derive(Debug, PartialEq, Eq)]
+enum MysqlCreateFailure {
+    /// A KNOWN server read-only refusal — the write was rejected. `ddl_only`
+    /// distinguishes a real read-only mode (`1290`/`1836` — every write rejected)
+    /// from an access-denied on CREATE (`1142`/`1044`/`1227` — only DDL proven
+    /// refused; the recommended SELECT-only role lands here, same DDL-vs-DML gap
+    /// as Postgres). -> `Blocked` (ok).
+    Blocked { ddl_only: bool },
+    /// The SERVER replied with some other error (`1050` already-exists, `1205`
+    /// lock-wait, ...): the CREATE definitively did NOT commit, so there is no
+    /// orphan and we do not touch anything. -> `Unknown` (warn).
+    ServerRejected,
+    /// NO server error number: a transport failure (connection drop / IO error)
+    /// where the auto-committed CREATE MAY already have committed — the outcome is
+    /// unknown, so the possible orphan is NAMED. -> `Unknown` (warn) + orphan name.
+    MaybeOrphan,
+}
+
+/// Pure classification of a failed probe CREATE from its MySQL error number.
+fn classify_mysql_create_failure(errno: Option<u16>) -> MysqlCreateFailure {
+    match errno {
+        Some(1290 | 1836) => MysqlCreateFailure::Blocked { ddl_only: false },
+        Some(1142 | 1044 | 1227) => MysqlCreateFailure::Blocked { ddl_only: true },
+        Some(_) => MysqlCreateFailure::ServerRejected,
+        None => MysqlCreateFailure::MaybeOrphan,
+    }
+}
+
+/// Is the probe's CREATE guaranteed to be time-bounded on the SERVER? A DDL
+/// statement is capped by `lock_wait_timeout` (both flavors) or MariaDB's
+/// `max_statement_time`; MySQL's `max_execution_time` is SELECT-only and does not
+/// count. Pure (the truth table) so a change to `&&` — which would wrongly skip
+/// the probe on MySQL, where `max_statement_time` is never set — is caught.
+fn mysql_probe_bounded(lock_wait_ok: bool, max_statement_ok: bool) -> bool {
+    lock_wait_ok || max_statement_ok
+}
+
+/// The first line of a (possibly multi-line) server error, trimmed — enough to
+/// say WHY the probe was refused (`permission denied for schema public`) without
+/// dumping a stack of context into the doctor message.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Destructure an `EngineError` into (message, hint) for a doctor connectivity
+/// fact — every variant already carries curated, secret-free strings.
+fn error_parts(e: EngineError) -> (String, String) {
+    match e {
+        EngineError::Connect { message, hint }
+        | EngineError::Db { message, hint }
+        | EngineError::Timeout { message, hint } => (message, hint),
+    }
 }
 
 /// Per-object accumulator while catalog rows (one query per aspect) are
@@ -489,6 +603,31 @@ impl Engine for Sqlite {
                 r
             }
             Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
+        }
+    }
+
+    /// SQLite has no server, roles or network, so doctor only checks that the
+    /// file opens (read-only). Everything else (transport, role, superuser) is
+    /// reported `na` by the pure layer from `server: None`.
+    async fn diagnose(&self) -> Diagnosis {
+        match self.open().await {
+            Ok(conn) => {
+                // DROP, not close().await — mirrors the pg/mysql diagnose rule so
+                // the "no un-cancelled await in any diagnose path" invariant holds
+                // literally (SQLite has no socket, so behavior is unchanged).
+                drop(conn);
+                Diagnosis {
+                    connect: ConnectFact::Ok { via_tunnel: false },
+                    server: None,
+                }
+            }
+            Err(e) => {
+                let (message, hint) = error_parts(e);
+                Diagnosis {
+                    connect: ConnectFact::Failed { message, hint },
+                    server: None,
+                }
+            }
         }
     }
 }
@@ -827,6 +966,42 @@ impl Postgres {
             }),
         }
     }
+
+    /// Connect for `doctor` WITHOUT layer 2 (no `default_transaction_read_only`,
+    /// no `BEGIN READ ONLY`) so the write probe sees what the SERVER does with
+    /// these credentials — the one place layer 2 is deliberately off. A
+    /// `statement_timeout` is still set so a probe can never hang server-side;
+    /// the direct leg's `sslmode` from the url is honored (see `connect`).
+    async fn connect_plain(&self) -> Result<sqlx::PgConnection, EngineError> {
+        let opts: PgConnectOptions = self.url.parse().map_err(|_| EngineError::Connect {
+            message: "the `url` for this connection is not a valid PostgreSQL URL".to_string(),
+            hint: "use the form postgres://user@host:port/dbname; put the password in the \
+                   env var named by password_env, not in the url"
+                .to_string(),
+        })?;
+        let opts = opts
+            .options([("statement_timeout", self.statement_timeout_ms.to_string())])
+            .application_name("nyet");
+        let opts = match &self.password {
+            Some(pw) => opts.password(pw),
+            None => opts,
+        };
+        let opts = apply_host_override(opts, &self.host_override);
+        let deadline = self
+            .connect_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| connect_deadline(self.statement_timeout_ms));
+        match tokio::time::timeout(deadline, opts.connect()).await {
+            Ok(r) => r.map_err(pg_connect_error),
+            Err(_elapsed) => Err(EngineError::Connect {
+                message: "the connection to the PostgreSQL database did not complete in time"
+                    .to_string(),
+                hint: "check the host/port in `url` and that the server is reachable \
+                       (a firewall may be dropping the connection)"
+                    .to_string(),
+            }),
+        }
+    }
 }
 
 impl Engine for Postgres {
@@ -993,6 +1168,138 @@ impl Engine for Postgres {
             Ok(r) => r,
             Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
+    }
+
+    async fn diagnose(&self) -> Diagnosis {
+        let mut conn = match self.connect_plain().await {
+            Ok(c) => c,
+            Err(e) => {
+                let (message, hint) = error_parts(e);
+                return Diagnosis {
+                    connect: ConnectFact::Failed { message, hint },
+                    server: None,
+                };
+            }
+        };
+        // Backstop the plain connection (no client statement_timeout was set on
+        // the session vars beyond connect) so the diagnostics cannot hang.
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        // The whole pg diagnose (probe included) is safe to cancel: the probe is
+        // a transaction we only ever ROLL BACK, so a dropped future drops the
+        // socket and the backend discards the uncommitted transaction — no orphan.
+        let server = match tokio::time::timeout(deadline, pg_diagnose(&mut conn)).await {
+            Ok(facts) => facts,
+            Err(_elapsed) => ServerFacts {
+                superuser: SuperuserFact::Unknown(
+                    "the privilege query did not finish within the timeout".to_string(),
+                ),
+                read_only_note: None,
+                probe: ProbeFact::Unknown {
+                    detail: "the diagnostic queries did not finish within the timeout".to_string(),
+                },
+            },
+        };
+        // DROP, never a graceful close: this diagnostic connection may have been
+        // abandoned by the deadline above, and `close().await` on a dead/busy
+        // socket is itself an un-cancelled await that could hang. Dropping the
+        // socket is instant (sqlx's Drop closes it in the background).
+        drop(conn);
+        Diagnosis {
+            connect: ConnectFact::Ok {
+                via_tunnel: self.host_override.is_some(),
+            },
+            server: Some(server),
+        }
+    }
+}
+
+/// Gather the PostgreSQL role facts for doctor: superuser status, whether the
+/// server is a hot standby / defaults to read-only (WHY a write would be
+/// refused), and the write probe (the FACT that it is).
+async fn pg_diagnose(conn: &mut sqlx::PgConnection) -> ServerFacts {
+    // A metadata failure is UNKNOWN, never a false "not a superuser" (UX-1).
+    let superuser =
+        match pg_scalar_bool(conn, "SELECT current_setting('is_superuser') = 'on'").await {
+            Some(true) => SuperuserFact::Yes("current_setting('is_superuser') = on".to_string()),
+            Some(false) => SuperuserFact::No("current_setting('is_superuser') = off".to_string()),
+            None => {
+                SuperuserFact::Unknown("could not read current_setting('is_superuser')".to_string())
+            }
+        };
+    // These only COLOR the read_only ok message, so a failure just drops the note.
+    let is_replica = pg_scalar_bool(conn, "SELECT pg_is_in_recovery()")
+        .await
+        .unwrap_or(false);
+    let default_ro = pg_scalar_bool(
+        conn,
+        "SELECT current_setting('default_transaction_read_only') = 'on'",
+    )
+    .await
+    .unwrap_or(false);
+    let read_only_note = if is_replica {
+        Some("the server is a read-only replica (hot standby)".to_string())
+    } else if default_ro {
+        Some("the role or database defaults to read-only transactions".to_string())
+    } else {
+        None
+    };
+    let probe = pg_probe(conn).await;
+    ServerFacts {
+        superuser,
+        read_only_note,
+        probe,
+    }
+}
+
+async fn pg_scalar_bool(conn: &mut sqlx::PgConnection, sql: &str) -> Option<bool> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+        .fetch_one(&mut *conn)
+        .await
+        .ok()?;
+    row.try_get::<bool, _>(0).ok()
+}
+
+/// The layer-3 write probe (PostgreSQL). A `CREATE TABLE` is a write not tied to
+/// any existing object: a writable role/superuser creates it (and we roll back),
+/// a read-only role/replica refuses it (permission denied / read-only
+/// transaction) — that refusal IS the proof that a direct connection is
+/// read-only.
+///
+/// **Guaranteed no commit, in every outcome.** The write runs inside an explicit
+/// transaction that is only ever ROLLED BACK — never committed — so even a
+/// panic or an early return drops the socket and the server discards it (an
+/// uncommitted transaction dies with the connection). PostgreSQL DDL is
+/// transactional, so nothing ever persists.
+async fn pg_probe(conn: &mut sqlx::PgConnection) -> ProbeFact {
+    use sqlx::Executor;
+    let name = probe_name();
+    if let Err(e) = conn.execute("BEGIN").await {
+        return ProbeFact::Unknown {
+            detail: first_line(&error_text(&e)),
+        };
+    }
+    let create = conn
+        .execute(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE {name} (probe integer)"
+        )))
+        .await;
+    // Unconditional rollback: it clears an aborted transaction after a refused
+    // CREATE and undoes a successful one. We NEVER commit.
+    let _ = conn.execute("ROLLBACK").await;
+    match create {
+        // Rolled back, so nothing ever persists -> no orphan is possible.
+        Ok(_) => ProbeFact::Wrote { orphan: None },
+        // ONLY a known read-only SQLSTATE proves read-only; anything else is
+        // "could not verify" (UX-1 — never a false ok).
+        Err(e) => match pg_readonly_refusal(&e) {
+            Some(ddl_only) => ProbeFact::Blocked {
+                detail: first_line(&error_text(&e)),
+                ddl_only,
+            },
+            None => ProbeFact::Unknown {
+                detail: first_line(&error_text(&e)),
+            },
+        },
     }
 }
 
@@ -1643,6 +1950,37 @@ impl Mysql {
         }
     }
 
+    /// Connect for `doctor` WITHOUT layer 2 (no `START TRANSACTION READ ONLY`,
+    /// no server read-only cap) so the write probe sees what the SERVER does
+    /// with these credentials — the one place layer 2 is deliberately off.
+    async fn connect_plain(&self) -> Result<sqlx::MySqlConnection, EngineError> {
+        let opts: MySqlConnectOptions = self.url.parse().map_err(|_| EngineError::Connect {
+            message: "the `url` for this connection is not a valid MySQL URL".to_string(),
+            hint: "use the form mysql://user@host:port/dbname; put the password in the \
+                   env var named by password_env, not in the url"
+                .to_string(),
+        })?;
+        let opts = match &self.password {
+            Some(pw) => opts.password(pw),
+            None => opts,
+        };
+        let opts = apply_mysql_host_override(opts, &self.host_override);
+        let deadline = self
+            .connect_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| connect_deadline(self.statement_timeout_ms));
+        match tokio::time::timeout(deadline, opts.connect()).await {
+            Ok(r) => r.map_err(mysql_connect_error),
+            Err(_elapsed) => Err(EngineError::Connect {
+                message: "the connection to the MySQL database did not complete in time"
+                    .to_string(),
+                hint: "check the host/port in `url` and that the server is reachable \
+                       (a firewall may be dropping the connection)"
+                    .to_string(),
+            }),
+        }
+    }
+
     /// Layer 2 for MySQL/MariaDB: the server-side statement timeout plus an
     /// explicit read-only transaction. Shared by `execute` and `schema`.
     ///
@@ -1881,6 +2219,350 @@ impl Engine for Mysql {
             Ok(r) => r,
             Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
+    }
+
+    async fn diagnose(&self) -> Diagnosis {
+        let mut conn = match self.connect_plain().await {
+            Ok(c) => c,
+            Err(e) => {
+                let (message, hint) = error_parts(e);
+                return Diagnosis {
+                    connect: ConnectFact::Failed { message, hint },
+                    server: None,
+                };
+            }
+        };
+        let via_tunnel = self.host_override.is_some();
+        let with_server = |server| Diagnosis {
+            connect: ConnectFact::Ok { via_tunnel },
+            server: Some(server),
+        };
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+
+        // Metadata (read-only, safe to cancel). A timeout POISONS the MySQL
+        // connection (a dropped op leaves it busy, its late error surfacing on the
+        // next statement — see set_statement_timeout below), so we must NOT reuse
+        // it: skip the probe and DROP the socket (returning drops `conn` — never a
+        // graceful close, which could hang on the very op we abandoned).
+        let (superuser, read_only_note) =
+            match tokio::time::timeout(deadline, mysql_metadata(&mut conn)).await {
+                Ok(m) => m,
+                Err(_elapsed) => {
+                    return with_server(ServerFacts {
+                        superuser: SuperuserFact::Unknown(
+                            "the privilege queries did not finish within the timeout".to_string(),
+                        ),
+                        read_only_note: None,
+                        probe: ProbeFact::Unknown {
+                            detail: PROBE_SKIP_METADATA_TIMEOUT.to_string(),
+                        },
+                    });
+                }
+            };
+
+        // Cap-arming is only SETs (they create nothing), so a client deadline here
+        // is safe — it does NOT re-open the CREATE orphan risk. A timeout means the
+        // connection is unreliable -> skip + drop (`.ok()` maps Elapsed -> None).
+        let armed = tokio::time::timeout(
+            deadline,
+            arm_probe_bounds(&mut conn, self.statement_timeout_ms),
+        )
+        .await
+        .ok();
+        match probe_after_arming(armed) {
+            // INVARIANT: NO un-cancelled await. The probe (CREATE + DROP) is bounded
+            // server-side (primary, the normal way a stuck statement is cancelled)
+            // AND by a generous CLIENT backstop (the network fail-safe: on a dead
+            // socket the server cap cannot reach us, so the backstop fires and NAMES
+            // the possible orphan rather than hanging). The connection is DROPPED,
+            // never closed with an un-cancelled `close().await`.
+            Ok(()) => {
+                let name = probe_name();
+                let backstop = Duration::from_millis(probe_backstop_ms(self.statement_timeout_ms));
+                let probe =
+                    match tokio::time::timeout(backstop, mysql_probe(&mut conn, &name)).await {
+                        Ok(probe) => probe,
+                        Err(_elapsed) => probe_backstop_expired(&name),
+                    };
+                drop(conn);
+                with_server(ServerFacts {
+                    superuser,
+                    read_only_note,
+                    probe,
+                })
+            }
+            // Skip: the metadata still answered, only read_only_role warns. `conn`
+            // is dropped (not closed) on return — poisoned on a timeout, unneeded
+            // otherwise.
+            Err(detail) => with_server(ServerFacts {
+                superuser,
+                read_only_note,
+                probe: ProbeFact::Unknown {
+                    detail: detail.to_string(),
+                },
+            }),
+        }
+    }
+}
+
+/// Why the write probe was skipped (the honest `read_only_role` warn detail).
+/// Kept as consts so the branch logic (`probe_after_arming`) is pure and
+/// unit-testable without simulating a real hang.
+const PROBE_SKIP_METADATA_TIMEOUT: &str = "the metadata queries timed out, so the connection is \
+    not reliable — verify the read-only role manually";
+const PROBE_SKIP_NO_BOUND: &str = "could not set a safe server-side time bound (lock_wait_timeout \
+    / max_statement_time), so running the probe could hang the connection on a metadata lock — \
+    verify the read-only role manually";
+const PROBE_SKIP_ARM_TIMEOUT: &str = "arming the probe's server-side time bound did not complete \
+    in time, so the connection is not reliable — verify the read-only role manually";
+
+/// Decide whether to run the probe after cap-arming (pure). `armed`: `Some(true)`
+/// a DDL bound is set -> run; `Some(false)` none could be set -> skip; `None`
+/// arming itself timed out (a poisoned connection) -> skip. `Err` carries the
+/// skip reason.
+fn probe_after_arming(armed: Option<bool>) -> Result<(), &'static str> {
+    match armed {
+        Some(true) => Ok(()),
+        Some(false) => Err(PROBE_SKIP_NO_BOUND),
+        None => Err(PROBE_SKIP_ARM_TIMEOUT),
+    }
+}
+
+/// The MySQL/MariaDB metadata half of doctor (read-only, cancellable): whether
+/// the server is read_only/super_read_only (WHY a write may be refused) and the
+/// account's superuser status.
+async fn mysql_metadata(conn: &mut sqlx::MySqlConnection) -> (SuperuserFact, Option<String>) {
+    let read_only = mysql_scalar_i64(conn, "SELECT @@global.read_only")
+        .await
+        .unwrap_or(0)
+        != 0;
+    // MariaDB has no super_read_only; the unknown-variable error just yields None.
+    let super_read_only = mysql_scalar_i64(conn, "SELECT @@global.super_read_only")
+        .await
+        .unwrap_or(0)
+        != 0;
+    let read_only_note = if super_read_only {
+        Some("the server has super_read_only enabled".to_string())
+    } else if read_only {
+        Some("the server has read_only enabled".to_string())
+    } else {
+        None
+    };
+    (mysql_superuser(conn).await, read_only_note)
+}
+
+/// The account's superuser status from `SHOW GRANTS`. Honesty-first: a query
+/// failure is `Unknown` (never a false "not a superuser"), and role/proxy grants
+/// nyet does not resolve are `Unresolved` (verify by hand) — no role resolver
+/// (Д5), just an honest gap.
+async fn mysql_superuser(conn: &mut sqlx::MySqlConnection) -> SuperuserFact {
+    let Some(grants) = mysql_grants(conn).await else {
+        return SuperuserFact::Unknown("could not read SHOW GRANTS".to_string());
+    };
+    // Every account has at least `USAGE ON *.*`; an empty list is anomalous.
+    if grants.is_empty() {
+        return SuperuserFact::Unknown("SHOW GRANTS returned no rows".to_string());
+    }
+    // Never echo the raw grant line into the envelope: MariaDB's SHOW GRANTS can
+    // include `IDENTIFIED BY PASSWORD '*hash'` (a credential). Report only which
+    // dangerous privilege it is.
+    if let Some(grant) = grants.iter().find(|g| is_dangerous_global_grant(g)) {
+        let what = if grant.to_uppercase().contains("ALL PRIVILEGES") {
+            "ALL PRIVILEGES ON *.*"
+        } else {
+            "SUPER"
+        };
+        return SuperuserFact::Yes(format!(
+            "the account holds global admin privileges ({what})"
+        ));
+    }
+    // Role/proxy grants confer privileges nyet does not resolve, so it cannot
+    // claim "not a superuser" — flag the gap honestly rather than a false ok.
+    if grants.iter().any(|g| is_role_or_proxy_grant(g)) {
+        return SuperuserFact::Unresolved(
+            "the account has role or proxy grants; nyet checks direct grants only, so elevated \
+             privileges may be hidden"
+                .to_string(),
+        );
+    }
+    SuperuserFact::No("no global ALL PRIVILEGES / SUPER grant".to_string())
+}
+
+async fn mysql_scalar_i64(conn: &mut sqlx::MySqlConnection, sql: &str) -> Option<i64> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+        .fetch_one(&mut *conn)
+        .await
+        .ok()?;
+    row.try_get::<i64, _>(0).ok()
+}
+
+/// `SHOW GRANTS` for the current account, as raw grant lines. `None` on a query
+/// error (the doctor then reports superuser status as `Unknown` — never a false
+/// "not a superuser").
+async fn mysql_grants(conn: &mut sqlx::MySqlConnection) -> Option<Vec<String>> {
+    let rows = sqlx::query("SHOW GRANTS")
+        .fetch_all(&mut *conn)
+        .await
+        .ok()?;
+    Some(
+        rows.iter()
+            .filter_map(|r| r.try_get::<String, _>(0).ok())
+            .collect(),
+    )
+}
+
+/// A heuristic for a dangerous global grant: `ALL PRIVILEGES` or `SUPER` on
+/// `*.*`. Deliberately narrow — every account has a harmless `USAGE ON *.*`, and
+/// a SELECT-only user's grant is scoped to a database (`ON app.*`), so neither
+/// trips this. The write probe is the authoritative writability check; this only
+/// flags the "administrative power" smell for `not_superuser`.
+fn is_dangerous_global_grant(grant: &str) -> bool {
+    let g = grant.to_uppercase();
+    g.contains(" ON *.*") && (g.contains("ALL PRIVILEGES") || g.contains("SUPER"))
+}
+
+/// A `SHOW GRANTS` line that grants a ROLE (`GRANT `role` TO `user`` — no `ON`
+/// clause) or PROXY privileges. nyet does not resolve what these confer, so it
+/// flags them rather than assuming "not a superuser". A normal privilege grant
+/// always has an `ON` clause (even the ubiquitous `USAGE ON *.*`).
+fn is_role_or_proxy_grant(grant: &str) -> bool {
+    let g = grant.to_uppercase();
+    g.contains("PROXY") || (g.contains(" TO ") && !g.contains(" ON "))
+}
+
+/// Arm the SERVER-side time bound the un-cancellable probe depends on, and report
+/// whether a bound that actually caps a DDL statement is now in place. A CREATE
+/// hangs on a metadata-lock wait: `lock_wait_timeout` caps that on BOTH flavors,
+/// and MariaDB's `max_statement_time` caps the whole statement. MySQL's
+/// `max_execution_time` is SELECT-only, so it does NOT count as a DDL bound. If
+/// NEITHER DDL-capping bound could be set, the caller MUST skip the probe — an
+/// unbounded CREATE can hang forever on a metadata lock held by another session
+/// (a self-DoS), and the probe is deliberately not wrapped in a cancellable timer
+/// (that would re-open the auto-commit orphan risk).
+async fn arm_probe_bounds(conn: &mut sqlx::MySqlConnection, timeout_ms: u64) -> bool {
+    use sqlx::Executor;
+    let secs = timeout_ms.div_ceil(1000).max(1);
+    // Best-effort SELECT cap (MySQL); NOT a DDL bound, so not part of the gate.
+    let _ = conn
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET SESSION max_execution_time = {}",
+            timeout_ms.max(1)
+        )))
+        .await;
+    // MariaDB whole-statement cap (unknown-variable 1193 on MySQL -> Err -> false).
+    let max_statement_ok = conn
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET SESSION max_statement_time = {secs}"
+        )))
+        .await
+        .is_ok();
+    // The universal DDL metadata-lock cap (both flavors).
+    let lock_wait_ok = conn
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET SESSION lock_wait_timeout = {secs}"
+        )))
+        .await
+        .is_ok();
+    mysql_probe_bounded(lock_wait_ok, max_statement_ok)
+}
+
+/// Grace added on top of the probe's server-side cap for the CLIENT backstop.
+const PROBE_BACKSTOP_GRACE_MS: u64 = 2_000;
+
+/// The CLIENT backstop deadline for the whole probe (CREATE + DROP), GENEROUS
+/// over the server-side cap `arm_probe_bounds` installed (`max_statement_time` /
+/// `lock_wait_timeout` at `statement_timeout_ms` rounded UP to whole seconds).
+///
+/// **TWO caps, because the probe runs TWO statements.** Both the CREATE and the
+/// DROP can independently wait up to a full server cap (each can block on a
+/// metadata lock). The worst-case live-connection duration is therefore
+/// `2 * cap` (CREATE runs to the cap, then DROP runs to the cap), so the backstop
+/// must exceed that — otherwise it would fire during a legitimately slow DROP on a
+/// HEALTHY connection and cry a false orphan. At `2 * cap + grace` the SERVER
+/// always cancels one of the two statements first on a live connection; the
+/// backstop fires ONLY on a dead socket (a network blackhole the server cap cannot
+/// reach), where the outcome is unknown and the possible orphan is named
+/// (`probe_backstop_expired`).
+fn probe_backstop_ms(statement_timeout_ms: u64) -> u64 {
+    let cap_ms = statement_timeout_ms.div_ceil(1000).saturating_mul(1000);
+    cap_ms
+        .saturating_mul(2)
+        .saturating_add(PROBE_BACKSTOP_GRACE_MS)
+}
+
+/// The probe verdict when the CLIENT backstop fired: the socket is unreachable
+/// (even the server cap could not help), so the auto-committed CREATE MAY have
+/// committed — name the possible orphan for manual cleanup. `warn`, not a false
+/// ok/fail.
+fn probe_backstop_expired(name: &str) -> ProbeFact {
+    ProbeFact::Unknown {
+        detail: format!(
+            "the write probe did not complete within its time budget (the connection may be \
+             unreachable); its outcome is unknown, so a table named `{name}` may remain — check \
+             for it and DROP it manually"
+        ),
+    }
+}
+
+/// The layer-3 write probe (MySQL/MariaDB). Unlike PostgreSQL, MySQL DDL
+/// **auto-commits** and cannot be rolled back, so the probe is a create-then-drop
+/// of a uniquely-named empty table. Two safety rules keep it from ever leaving a
+/// stray object:
+///
+/// - **DROP only after a CONFIRMED CREATE, and only our exact name.** On a failed
+///   CREATE (read-only refusal, a name collision, a lock-wait timeout, ...)
+///   NOTHING is dropped — an `IF EXISTS` there could delete a pre-existing table
+///   that happened to share the name.
+/// - **A DROP that is not confirmed reports the orphan NAME** (`Wrote { orphan }`)
+///   instead of swallowing it, so the human can remove it. The check is still
+///   `fail` (the role can write), with the leftover surfaced.
+///
+/// Classification: only a KNOWN read-only errno is `Blocked` (-> ok); any other
+/// CREATE error is `Unknown` (-> warn, "could not verify"), never a false ok.
+/// The probe's statements are bounded server-side (`arm_probe_bounds`) and the
+/// caller wraps the whole call in a generous CLIENT backstop (`probe_backstop_ms`)
+/// for the dead-socket case — `name` is passed in so that backstop can name the
+/// possible orphan too (see `Mysql::diagnose`).
+async fn mysql_probe(conn: &mut sqlx::MySqlConnection, name: &str) -> ProbeFact {
+    use sqlx::Executor;
+    let create = conn
+        .execute(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE {name} (probe int)"
+        )))
+        .await;
+    match create {
+        // CONFIRMED create (auto-committed): drop OUR exact table. If the DROP is
+        // not confirmed, surface the orphan name — never a silent leak.
+        Ok(_) => match conn
+            .execute(sqlx::AssertSqlSafe(format!("DROP TABLE {name}")))
+            .await
+        {
+            Ok(_) => ProbeFact::Wrote { orphan: None },
+            Err(_) => ProbeFact::Wrote {
+                orphan: Some(name.to_string()),
+            },
+        },
+        // On a failed CREATE we DROP nothing (a name-collision DROP could nuke a
+        // pre-existing object); the classification decides the verdict.
+        Err(e) => match classify_mysql_create_failure(mysql_err_number(&e)) {
+            MysqlCreateFailure::Blocked { ddl_only } => ProbeFact::Blocked {
+                detail: first_line(&error_text(&e)),
+                ddl_only,
+            },
+            MysqlCreateFailure::ServerRejected => ProbeFact::Unknown {
+                detail: first_line(&error_text(&e)),
+            },
+            // The server may have committed the auto-committed CREATE before the
+            // connection dropped — NAME the possible orphan (symmetric with the
+            // unconfirmed-DROP case).
+            MysqlCreateFailure::MaybeOrphan => ProbeFact::Unknown {
+                detail: format!(
+                    "{} — the probe's outcome is unknown; if the connection dropped after the \
+                     CREATE, a table named `{name}` may remain, so check for it and DROP it manually",
+                    first_line(&error_text(&e))
+                ),
+            },
+        },
     }
 }
 
@@ -2291,6 +2973,112 @@ mod tests {
             .build()
             .unwrap()
             .block_on(fut)
+    }
+
+    /// A failed probe CREATE is classified from its MySQL error number: the
+    /// read-only errnos are `Blocked` (ok), other SERVER errors are
+    /// `ServerRejected` (warn, no orphan — the server said no), and a
+    /// transport-level failure (`None`) is `MaybeOrphan` (warn + the possible
+    /// orphan is named) — the lost-ACK case that must never leave an unnamed table.
+    #[test]
+    fn mysql_create_failure_classification() {
+        use MysqlCreateFailure::{Blocked, MaybeOrphan, ServerRejected};
+        // Server read-only modes -> every write rejected.
+        assert_eq!(
+            classify_mysql_create_failure(Some(1290)),
+            Blocked { ddl_only: false }
+        );
+        assert_eq!(
+            classify_mysql_create_failure(Some(1836)),
+            Blocked { ddl_only: false }
+        );
+        // Access-denied on CREATE -> only DDL proven refused.
+        for errno in [1142, 1044, 1227] {
+            assert_eq!(
+                classify_mysql_create_failure(Some(errno)),
+                Blocked { ddl_only: true }
+            );
+        }
+        // Any other SERVER error (collision, lock-wait, syntax): the server
+        // replied, so the CREATE did not commit -> no orphan.
+        for errno in [1050, 1205, 1064] {
+            assert_eq!(classify_mysql_create_failure(Some(errno)), ServerRejected);
+        }
+        // No error number = a transport failure: the CREATE MAY have committed,
+        // so the possible orphan must be named.
+        assert_eq!(classify_mysql_create_failure(None), MaybeOrphan);
+    }
+
+    /// The probe is time-bounded if EITHER `lock_wait_timeout` (both flavors) or
+    /// MariaDB's `max_statement_time` was set. Critically it must NOT require both
+    /// (`&&`) — MySQL never has `max_statement_time`, so `&&` would always skip the
+    /// probe there. If neither is set, the probe is skipped (the un-bounded CREATE
+    /// could self-DoS).
+    #[test]
+    fn mysql_probe_bound_gate() {
+        assert!(mysql_probe_bounded(true, true));
+        assert!(
+            mysql_probe_bounded(true, false),
+            "MySQL: lock_wait alone bounds it"
+        );
+        assert!(
+            mysql_probe_bounded(false, true),
+            "MariaDB: max_statement alone bounds it"
+        );
+        assert!(
+            !mysql_probe_bounded(false, false),
+            "neither -> skip the probe"
+        );
+    }
+
+    /// The probe runs ONLY when cap-arming returned a DDL bound on a healthy
+    /// connection. A bound-that-failed (`Some(false)`) and — crucially — a
+    /// cap-arming TIMEOUT (`None`, a poisoned connection) both SKIP the probe with
+    /// an honest reason, never run it un-bounded on a sick connection.
+    #[test]
+    fn probe_runs_only_on_a_bounded_healthy_connection() {
+        assert!(probe_after_arming(Some(true)).is_ok());
+        assert_eq!(probe_after_arming(Some(false)), Err(PROBE_SKIP_NO_BOUND));
+        assert_eq!(probe_after_arming(None), Err(PROBE_SKIP_ARM_TIMEOUT));
+    }
+
+    /// The CLIENT backstop is the network fail-safe: on a dead socket the probe
+    /// `.await` would hang forever (the server cap cannot reach the client), so a
+    /// generous client deadline cuts it off and NAMES the possible orphan — no
+    /// un-cancelled await, no lost orphan. Stubbed future (no Docker), like the
+    /// guardrail `TooSlow` test.
+    #[test]
+    fn probe_backstop_cuts_off_a_dead_socket_and_names_the_orphan() {
+        let name = "nyet_doctor_probe_1_2_3";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // A probe that never returns (blackholed socket) is cut off fast.
+            let hung = async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                ProbeFact::Wrote { orphan: None }
+            };
+            let started = std::time::Instant::now();
+            let probe = match tokio::time::timeout(Duration::from_millis(50), hung).await {
+                Ok(p) => p,
+                Err(_elapsed) => probe_backstop_expired(name),
+            };
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "backstop ignored"
+            );
+            match probe {
+                ProbeFact::Unknown { detail } => assert!(detail.contains(name), "{detail}"),
+                _ => panic!("a fired backstop must be Unknown naming the orphan"),
+            }
+        });
+        // ...and the backstop exceeds TWO server caps (CREATE + DROP each can run
+        // to the cap), so the server cancels one of them first on a live connection
+        // — the backstop is the last resort, firing only on a dead socket.
+        assert!(probe_backstop_ms(30_000) > 2 * 30_000);
+        assert!(probe_backstop_ms(1_000) > 2 * 1_000);
     }
 
     fn make_db(path: &std::path::Path) {
