@@ -17,7 +17,7 @@
 ```
 nyet query <alias> <query> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
 nyet list [--format json|table]
-nyet schema <alias> [table]        # v0.3
+nyet schema <alias> [table] [--format json|table]
 nyet explain <alias> <query>       # v0.3
 nyet doctor [alias]                # v0.3
 nyet agent-setup                   # v0.3

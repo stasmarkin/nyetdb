@@ -208,6 +208,183 @@ fn mysql_query_end_to_end() {
     });
 }
 
+/// `nyet schema` against a real MariaDB: AUTO_INCREMENT, a composite primary
+/// key, a composite foreign key, a single-column UNIQUE and a view. Only the
+/// connection's own database is introspected (`DATABASE()`), so the server's
+/// system schemas never show up.
+#[test]
+fn mysql_schema_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let container = Mariadb::default()
+            .with_tag("11.4")
+            .start()
+            .await
+            .expect("start mariadb:11.4 (is docker/colima running?)");
+        let port = container.get_host_port_ipv4(3306).await.unwrap();
+
+        use sqlx::{ConnectOptions, Connection, Executor};
+        let opts: sqlx::mysql::MySqlConnectOptions = format!("mysql://root@127.0.0.1:{port}/test")
+            .parse()
+            .unwrap();
+        let mut w = opts.connect().await.unwrap();
+        for ddl in [
+            "CREATE TABLE orgs (id bigint NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+             name varchar(100) NOT NULL UNIQUE) ENGINE=InnoDB",
+            "CREATE TABLE orders (org_id bigint NOT NULL, seq int NOT NULL, note text, \
+             PRIMARY KEY (org_id, seq)) ENGINE=InnoDB",
+            "CREATE TABLE order_lines (org_id bigint NOT NULL, seq int NOT NULL, \
+             sku varchar(64), qty int DEFAULT 1, KEY order_lines_sku_idx (sku), \
+             CONSTRAINT ol_fk FOREIGN KEY (org_id, seq) REFERENCES orders(org_id, seq)) \
+             ENGINE=InnoDB",
+            "CREATE VIEW v_orgs AS SELECT id, name FROM orgs",
+            // A foreign key into another database: the parent must keep it.
+            "CREATE DATABASE other",
+            "CREATE TABLE other.parent (id bigint NOT NULL PRIMARY KEY) ENGINE=InnoDB",
+            "CREATE TABLE child (pid bigint, CONSTRAINT child_fk FOREIGN KEY (pid) \
+             REFERENCES other.parent(id)) ENGINE=InnoDB",
+            // A column-level grant: STATISTICS/KEY_COLUMN_USAGE are NOT
+            // privilege-filtered by the server, so the composite pk and the
+            // index over the ungranted column are the leak to close.
+            "CREATE TABLE pt (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b), \
+             KEY pt_b_idx (b), KEY pt_a_idx (a)) ENGINE=InnoDB",
+            &format!("CREATE USER 'app'@'%' IDENTIFIED BY '{PW}'"),
+            "GRANT ALL PRIVILEGES ON *.* TO 'app'@'%'",
+            &format!("CREATE USER 'partial'@'%' IDENTIFIED BY '{PW}'"),
+            "GRANT SELECT (a) ON test.pt TO 'partial'@'%'",
+            "FLUSH PRIVILEGES",
+        ] {
+            w.execute(sqlx::AssertSqlSafe(ddl.to_string()))
+                .await
+                .unwrap();
+        }
+        w.close().await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_mysql_config(tmp.path(), port);
+
+        let out = run(tmp.path(), &cfg, &["schema", "my"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_no_password_leak(&out);
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["meta"]["table_count"], 6, "{v}");
+        let tables = v["schema"]["tables"].as_array().unwrap();
+        // Only the connection's own database — `other.parent` is not listed.
+        let names: Vec<&str> = tables.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            ["child", "order_lines", "orders", "orgs", "pt", "v_orgs"]
+        );
+        // ...but a foreign key INTO it keeps the database qualifier, the way
+        // PostgreSQL qualifies a parent outside `public`.
+        assert_eq!(
+            tables[0]["fks"],
+            serde_json::json!([{"columns": ["pid"], "ref_table": "other.parent",
+                                "ref_columns": ["id"]}])
+        );
+
+        // AUTO_INCREMENT is reported as the column default (MySQL keeps it in
+        // EXTRA, not COLUMN_DEFAULT); the single-column UNIQUE folds into a flag.
+        let orgs = &tables[3];
+        assert_eq!(orgs["columns"][0]["name"], "id");
+        assert_eq!(orgs["columns"][0]["pk"], true);
+        assert_eq!(orgs["columns"][0]["nullable"], false);
+        assert_eq!(orgs["columns"][0]["default"], "auto_increment");
+        assert!(
+            orgs["columns"][0]["type"]
+                .as_str()
+                .unwrap()
+                .starts_with("bigint"),
+            "{orgs}"
+        );
+        assert_eq!(orgs["columns"][1]["unique"], true);
+        assert!(orgs.get("indexes").is_none(), "{orgs}");
+
+        // Composite primary key on both members, its index not repeated.
+        assert_eq!(tables[2]["columns"][0]["pk"], true);
+        assert_eq!(tables[2]["columns"][1]["pk"], true);
+        assert!(tables[2].get("indexes").is_none(), "{}", tables[2]);
+
+        // Composite foreign key, ordered.
+        assert_eq!(
+            tables[1]["fks"],
+            serde_json::json!([{
+                "columns": ["org_id", "seq"],
+                "ref_table": "orders",
+                "ref_columns": ["org_id", "seq"]
+            }])
+        );
+        // The plain index is there (InnoDB also indexes the fk columns).
+        let indexes = tables[1]["indexes"].as_array().unwrap();
+        assert!(
+            indexes.iter().any(|i| i["name"] == "order_lines_sku_idx"
+                && i["columns"] == serde_json::json!(["sku"])),
+            "{indexes:?}"
+        );
+        assert_eq!(tables[1]["columns"][3]["default"], "1");
+
+        // A view: columns, no indexes/fks.
+        assert_eq!(tables[5]["kind"], "view");
+        assert!(tables[5]["columns"].is_array());
+        assert!(tables[5].get("indexes").is_none());
+        // With full privileges nothing is filtered: pt keeps its composite pk
+        // and both indexes (contrast with the column-granted account below).
+        assert_eq!(tables[4]["columns"][0]["pk"], true);
+        assert_eq!(tables[4]["columns"][1]["pk"], true);
+        assert_eq!(tables[4]["indexes"].as_array().unwrap().len(), 2);
+
+        // One table, and the not-found path (exit 7).
+        let out = run(tmp.path(), &cfg, &["schema", "my", "orders"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["meta"]["table_count"], 1);
+        assert_eq!(v["schema"]["tables"][0]["name"], "orders");
+        for arg in ["nope", "orders; DROP TABLE orgs", "orgs'--"] {
+            let out = run(tmp.path(), &cfg, &["schema", "my", arg]);
+            assert_eq!(out.status.code(), Some(7), "{arg}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["code"], "DB_ERROR", "{arg}");
+        }
+
+        // The same server through a COLUMN-granted account: information_schema
+        // hands out the keys over `b` anyway, so nyet must drop them — a pk
+        // shown as `a` alone would be a wrong schema, and `b` a leaked name.
+        let partial_cfg = tmp.path().join("partial.toml");
+        std::fs::write(
+            &partial_cfg,
+            format!(
+                "[connections.my]\nengine = \"mariadb\"\n\
+                 url = \"mysql://partial@127.0.0.1:{port}/test\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(tmp.path(), &partial_cfg, &["schema", "my"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let body = stdout(&out);
+        let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(v["meta"]["table_count"], 1, "{v}");
+        let pt = &v["schema"]["tables"][0];
+        assert_eq!(pt["name"], "pt");
+        assert_eq!(pt["columns"].as_array().unwrap().len(), 1, "{pt}");
+        assert_eq!(pt["columns"][0]["name"], "a");
+        assert!(pt["columns"][0].get("pk").is_none(), "{pt}");
+        // Only the keys touching `b` are gone; the index over the granted
+        // column stays (the filter drops keys, not the whole section).
+        assert_eq!(
+            pt["indexes"],
+            serde_json::json!([{"name": "pt_a_idx", "columns": ["a"]}]),
+            "{pt}"
+        );
+        for leak in ["pt_b_idx", "\"b\""] {
+            assert!(!body.contains(leak), "leaked {leak}: {body}");
+        }
+        assert_no_password_leak(&out);
+
+        container.rm().await.unwrap();
+    });
+}
+
 #[test]
 fn mysql_connection_failed_is_exit_6() {
     // No server on this port -> the connection is refused -> CONNECTION_FAILED.
@@ -222,4 +399,106 @@ fn mysql_connection_failed_is_exit_6() {
     let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
     assert_eq!(v["error"]["code"], "CONNECTION_FAILED");
     assert_no_password_leak(&out);
+}
+
+/// A functional key part (`INDEX ((lower(a)), b)`) is reported as
+/// `(expression)` instead of vanishing — a dropped part would make this
+/// two-part unique index look single-column and fold into a `unique` flag on
+/// `b` that does not exist. MySQL 8, not MariaDB: only MySQL has functional
+/// indexes (root over plaintext loopback with an empty password — fast auth).
+#[test]
+fn mysql8_functional_index_key_part_is_not_dropped() {
+    use testcontainers_modules::mysql::Mysql;
+
+    multi_thread_rt().block_on(async {
+        let container = Mysql::default()
+            .with_tag("8.4")
+            .start()
+            .await
+            .expect("start mysql:8.4 (is docker/colima running?)");
+        let port = container.get_host_port_ipv4(3306).await.unwrap();
+
+        use sqlx::{ConnectOptions, Connection, Executor};
+        let opts: sqlx::mysql::MySqlConnectOptions = format!("mysql://root@127.0.0.1:{port}/test")
+            .parse()
+            .unwrap();
+        let mut w = opts.connect().await.unwrap();
+        w.execute("CREATE TABLE f (a varchar(50), b varchar(50))")
+            .await
+            .unwrap();
+        w.execute("CREATE UNIQUE INDEX f_expr_idx ON f ((lower(a)), b)")
+            .await
+            .unwrap();
+        // A column-granted account for the accepted-leak check below (MySQL 8
+        // needs TLS for a passworded caching_sha2_password user).
+        w.execute(sqlx::AssertSqlSafe(format!(
+            "CREATE USER 'partial'@'%' IDENTIFIED BY '{PW}'"
+        )))
+        .await
+        .unwrap();
+        w.execute("GRANT SELECT (b) ON test.f TO 'partial'@'%'")
+            .await
+            .unwrap();
+        w.close().await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "[connections.my]\nengine = \"mysql\"\n\
+                 url = \"mysql://root@127.0.0.1:{port}/test\"\nallowed_dirs = [\"{}\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+
+        let out = run(tmp.path(), &cfg, &["schema", "my", "f"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        let table = &v["schema"]["tables"][0];
+        assert_eq!(
+            table["indexes"],
+            serde_json::json!([{"name": "f_expr_idx", "columns": ["(expression)", "b"],
+                                "unique": true}]),
+            "{table}"
+        );
+        assert!(
+            table["columns"][1].get("unique").is_none(),
+            "b must not claim a key it does not have: {table}"
+        );
+
+        // ACCEPTED LEAK (documented in the README): with only `GRANT SELECT
+        // (b)`, column `a` is hidden — but the functional index over it stays
+        // visible, because its expression part carries no text to leak. Its
+        // NAME can still hint at the hidden column; identifiers only, no data.
+        let partial_cfg = tmp.path().join("partial.toml");
+        std::fs::write(
+            &partial_cfg,
+            format!(
+                "[connections.my]\nengine = \"mysql\"\n\
+                 url = \"mysql://partial@127.0.0.1:{port}/test?ssl-mode=REQUIRED\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(tmp.path(), &partial_cfg, &["schema", "my", "f"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        let table = &v["schema"]["tables"][0];
+        assert_eq!(
+            table["columns"],
+            serde_json::json!([{"name": "b", "type": "varchar(50)", "nullable": true}]),
+            "{table}"
+        );
+        assert_eq!(
+            table["indexes"],
+            serde_json::json!([{"name": "f_expr_idx", "columns": ["(expression)", "b"],
+                                "unique": true}]),
+            "{table}"
+        );
+
+        container.rm().await.unwrap();
+    });
 }

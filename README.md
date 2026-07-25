@@ -17,6 +17,8 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
 - config: parsing, validation (unknown keys are hard errors), `${VAR}`
   substitution, `password_env`, file permission warnings;
 - directory scoping (`allowed_dirs`) and `nyet list`;
+- `nyet schema` for all three engines: tables, views, columns, primary keys,
+  unique constraints, indexes and foreign keys as structured JSON (see below);
 - `nyet query` for **SQLite**, **PostgreSQL** and **MySQL/MariaDB**: the full
   SQL validator (read-only allowlist, recursive AST walk, Unicode stripping,
   locking clauses, per-engine function denylist with per-connection policy),
@@ -304,6 +306,7 @@ Rules:
 ```sh
 nyet list                  # connections available from the current directory
 nyet list --format table   # human-friendly table (envelope goes to stderr)
+nyet schema <alias> [table] [--format json|table]
 nyet query <alias> <sql> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
 ```
 
@@ -372,7 +375,160 @@ envelope (without `rows`) on stderr as one JSON line:
   character; use `json`/`jsonl` for byte-exact data.
 
 `nyet list` supports `json` and `table` only (it has no row stream); if
-`[defaults].format` is `jsonl`/`csv`, `list` falls back to `json`.
+`[defaults].format` is `jsonl`/`csv`, `list` falls back to `json`. `nyet
+schema` follows the same rule.
+
+### nyet schema
+
+```sh
+nyet schema <alias>          # every table and view
+nyet schema <alias> <table>  # one object, always in full detail
+```
+
+Introspection without writing catalog SQL: tables and views with their
+columns, primary keys, unique constraints, indexes and foreign keys, in one
+envelope.
+
+```sh
+$ nyet schema prod users
+{"v":1,"ok":true,"schema":{"tables":[{"name":"users","kind":"table","columns":[{"name":"id","type":"bigint","nullable":false,"pk":true,"default":"nextval('users_id_seq'::regclass)"},{"name":"email","type":"text","nullable":false,"unique":true},{"name":"org_id","type":"bigint","nullable":true}],"indexes":[{"name":"users_org_idx","columns":["org_id"]}],"fks":[{"columns":["org_id"],"ref_table":"orgs","ref_columns":["id"]}]}]},"meta":{"table_count":1,"duration_ms":12,"connection":"prod"}}
+```
+
+How to read it:
+
+- `kind` is `"table"` or `"view"`. Views carry columns but never indexes or
+  foreign keys.
+- `nullable` is always present. `pk` and `unique` appear **only when true**,
+  and `default` only when the engine reports one — omitted fields mean
+  "false"/"none" (bytes an agent does not pay for).
+- **`pk`** marks every member of the primary key, so a composite key has
+  `pk: true` on each of its columns. A pk column is always reported
+  `nullable: false`.
+- **`unique`** on a column means there is a unique index/constraint whose only
+  key part is that very column, unconditional and valid — precisely the case
+  where the flag says everything, so that index is not repeated under
+  `indexes`. Everything else stays an index entry: multi-column unique indexes
+  (with `"unique": true`), partial or invalid ones (see below), and any index
+  whose key is an expression rather than a plain column — an expression never
+  becomes a column flag, whatever its text happens to read like.
+- **`indexes`** therefore lists only what the column flags cannot express:
+  non-unique indexes and multi-column ones. The index backing the primary key is
+  never listed, and neither is the autoindex behind a single-column `UNIQUE`
+  (SQLite's `sqlite_autoindex_*` does show up for a *composite* `UNIQUE (a, b)`,
+  since no column flag can hold that). A key part that is an expression rather
+  than a column reads as `(expression)` — PostgreSQL prints the real expression
+  text instead — so the key's shape is never silently shortened.
+- A **partial (filtered) unique index** — `CREATE UNIQUE INDEX ... WHERE ...` —
+  is reported as an ordinary index, *without* `unique` and without its
+  predicate: its uniqueness holds only for the rows the predicate matches, so
+  claiming a key would be a lie. Same for a PostgreSQL index left invalid by a
+  failed `CREATE INDEX CONCURRENTLY`.
+- **`fks`** are arrays on both sides, in key order, so a composite foreign key
+  reads as `{"columns":["org_id","seq"],"ref_table":"orders","ref_columns":["org_id","seq"]}`.
+  An empty `ref_columns` (SQLite only) means the reference could not be
+  resolved to named columns — a `REFERENCES parent` whose parent declares no
+  primary key, or a parent that does not exist.
+- `type` is the type **as the engine reports it**: PostgreSQL `format_type`
+  (`bigint`, `character varying(50)`, `timestamp with time zone`), MySQL/MariaDB
+  `COLUMN_TYPE` (`bigint(20) unsigned`, `varchar(255)`, `enum('a','b')`), SQLite
+  the declared type verbatim (empty for an untyped column).
+- Tables are ordered by name; columns keep the table's own order.
+
+**Auto-increment** shows up in `default`, in each engine's own words:
+PostgreSQL `serial` → `"nextval('users_id_seq'::regclass)"` and an `IDENTITY`
+column → `"generated as identity"`; MySQL/MariaDB `AUTO_INCREMENT` →
+`"auto_increment"` (the server keeps it outside `COLUMN_DEFAULT`, nyet folds it
+in); SQLite's `INTEGER PRIMARY KEY` (the rowid alias) has no default at all —
+`pk: true` on an `INTEGER` column *is* the auto-assigned key. The portable
+signal across all three is `pk`.
+
+**Adaptive listing.** Without `[table]`, a database of **at most 50** tables +
+views comes back in full. Past that, the answer is names and kinds only, with a
+`SCHEMA_TRUNCATED` warning pointing at the way to the details:
+
+```json
+{"v":1,"ok":true,"schema":{"tables":[{"name":"accounts","kind":"table"},{"name":"v_active","kind":"view"}]},"meta":{"table_count":312,...},"warnings":[{"code":"SCHEMA_TRUNCATED","message":"schema listing truncated to names: 312 objects exceed the 50-object detail limit; run nyet schema prod <table> for one table's details"}]}
+```
+
+Naming `[table]` always returns the full detail, whatever the object count. An
+unknown name is a `DB_ERROR` (exit 7) whose hint points back at the listing.
+
+**What you see is bounded by your role's privileges — with the exact rules
+spelled out, because "we filter it" is not a promise worth guessing at:**
+
+- **PostgreSQL** covers every non-system schema (`pg_*` and `information_schema`
+  are excluded) that the role may actually read: an object appears if the role
+  has `USAGE` on its schema and `SELECT` on the object *or on any of its
+  columns*, and each column appears only if the role may `SELECT` that column.
+  So a `GRANT SELECT (id, note) ON t` shows `t` with `id` and `note` and
+  nothing else — matching what `nyet query` would let you read. Defaults of
+  columns you cannot read (they are literal values — secrets do get parked
+  there) never reach the agent.
+- **Under a partial (column-level) grant, keys are dropped whole.** The
+  catalogs still describe primary keys, indexes and foreign keys over columns
+  you cannot read, so any of them touching an invisible column is omitted
+  entirely — never shortened. A `PRIMARY KEY (id, api_key)` with only `id`
+  granted disappears rather than reading as a one-column key on `id`: a missing
+  key costs you a round trip, a *wrong* key costs you a wrong query. Keys over
+  granted columns only are unaffected — with one deliberate exception: a
+  PostgreSQL index on an *expression* is always dropped under a partial grant,
+  even when the expression only uses columns you were granted, because its text
+  is never matched against the grants. With full table-wide `SELECT` nothing is
+  filtered at all.
+- Two things that are *not* hidden, both identifiers only — no data, no
+  defaults, no column lists:
+  - a foreign key on columns you can read names its **parent table and the
+    parent columns it points at** (`ref_table` / `ref_columns`) even when the
+    parent itself is outside your privileges — the constraint is part of the
+    child's own definition, and `psql`'s `\d` shows it the same way;
+  - on **MySQL/MariaDB** a *functional* index stays listed under a partial
+    grant even when its expression uses a column you cannot read: the server
+    gives nyet no expression text (it shows as `(expression)`), so there is
+    nothing to hide there — but the **index name** may itself mention the
+    hidden column. Dropping such indexes wholesale would also blind
+    fully-privileged accounts to every functional index, which is the worse
+    trade.
+- **MySQL/MariaDB** inherits `information_schema`'s own visibility rule, which
+  is *not* SELECT-specific: an object shows up if the account holds **any**
+  privilege on it (an `INSERT`-only account sees the table and its column
+  defaults). Its column list *is* privilege-filtered, so the key-dropping rule
+  above applies here too. Grant a genuinely read-only user (see the recipe
+  above) if that matters to you.
+
+Objects in `public` read as bare names; anything else is qualified —
+`sales.orders` — which is also the form `[table]` accepts. An unqualified
+`[table]` matches in every schema, so it can return more than one object;
+qualify it to pin one down. Materialized views are reported as `kind: "view"`
+(and, like every view, without indexes); foreign tables are reported as
+`kind: "table"` (they read like one). **MySQL/MariaDB** introspects the
+connection's own database (the one in the url) and nothing else; a foreign key
+that points into another database keeps the qualifier (`other_db.parent`).
+
+**Name matching follows each engine's own rules**, so `[table]` behaves like the
+name in a query: SQLite is ASCII-case-insensitive (`USERS` finds `users`);
+PostgreSQL also tries the lowercase form, since unquoted identifiers fold that
+way (`ORGS` finds `orgs`; if both `ORGS` and `orgs` exist you get both);
+MySQL/MariaDB follow the server's collation. A `[table]` containing a dot is
+split on the **first** dot (PostgreSQL), so a bare `sales.orders` always reads
+as schema + table — a table whose *name* contains a dot is still reachable by
+qualifying it (`public.sales.orders`). Two objects that render to the same
+display name (a schema-qualified one and a quoted dotted name) are listed as
+two entries with identical `name` values; qualify the argument to fetch the one
+you mean.
+
+Introspection runs through the same read-only session, timeout (`timeout_secs`)
+and SSH tunnel as a query — and `--format table` renders a compact human view,
+with the envelope on stderr as usual:
+
+```sh
+$ nyet schema prod users --format table
+users table
+  id      bigint  not null  pk  default nextval('users_id_seq'::regclass)
+  email   text    not null  unique
+  org_id  bigint  null
+  index users_org_idx (org_id)
+  fk (org_id) -> orgs (id)
+```
 
 ## Security
 
@@ -490,7 +646,9 @@ runs with the database user's privileges even in a read-only session.
 `UNICODE_STRIPPED` (invisible characters removed from the query),
 `INSECURE_TRANSPORT` (a direct server connection whose url `sslmode`/`ssl-mode`
 is below `require` and has no ssh tunnel — the transport is not guaranteed
-encrypted or verified; the message says how to force TLS).
+encrypted or verified; the message says how to force TLS),
+`SCHEMA_TRUNCATED` (`nyet schema` listed objects by name only — more than 50
+tables + views).
 
 The full allow/deny specification is the public test corpus in
 [`tests/corpus/`](tests/corpus/): every validator rule exists there as at
@@ -513,7 +671,7 @@ Every error carries an actionable `hint`. Error codes today:
 `CONFIG_INVALID`, `DIR_NOT_ALLOWED`, `NOT_IMPLEMENTED`, `INTERNAL`, `NYET`
 (with `reason`, see above), `CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
 Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
-`INSECURE_TRANSPORT`.
+`INSECURE_TRANSPORT`, `SCHEMA_TRUNCATED`.
 
 Exit codes:
 

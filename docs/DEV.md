@@ -157,17 +157,25 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 │                                 Deny{reason,message,hint}; depends ONLY on
 │                                 sqlparser + unicode-properties (+std)
 ├─ engine    (src/engine.rs)    — IO adapters behind trait Engine; knows sqlx,
-│                                 nothing about clap/output
+│                                 nothing about clap; fills in output's pure
+│                                 schema model (the one leaf->leaf edge)
 ├─ tunnel    (src/tunnel.rs)    — SSH tunnels: pure ssh-command building +
 │                                 host parsing; the shell-out to system `ssh`
 │                                 is the only IO. std only (net/process), no
 │                                 sqlx/config/clap
-└─ output    (src/output.rs)    — pure: values -> envelope/table strings
+└─ output    (src/output.rs)    — pure: values -> envelope/table strings;
+                                  also owns the `schema` data model (the
+                                  contract shape) and its pk/unique rules
 ```
 
 Dependencies flow downward only: the pure modules do no IO and know nothing
 about clap or each other; file reading, env access, cwd/realpath, the tokio
-runtime and the query timeout live in the cli layer. The runtime is built
+runtime and the query timeout live in the cli layer. The one edge between two
+"leaf" modules is `engine -> output`: the `Schema`/`SchemaTable`/`SchemaColumn`
+structs are the serialized contract, so they live in the pure module (with
+`build_table`, the single owner of the pk/unique presentation rules) and the
+engines fill them in. That direction is still downward — `output` depends on
+serde alone, `engine` on all of sqlx. The runtime is built
 lazily, only when an engine actually executes (Д9: `list`, config errors and
 validator refusals never start it).
 
@@ -243,6 +251,178 @@ ssh) and *before* the engine connects. The split follows Д1/Д2:
   the wrong failure mode for a security step. `sqlite` + `[ssh]` is rejected at
   parse (exit 3).
 
+## Schema introspection (`nyet schema`)
+
+No new dependency: each engine reads its own catalog with the driver it
+already has, and the cli path is the query path minus the validator (there is
+no agent SQL) — same read-only session, same `timeout_secs`, same SSH tunnel,
+same exit codes 6/7/8.
+
+**The `[table]` argument is agent input and never reaches SQL.**
+
+- **SQLite** — `sqlite_master` for the object list (filtered in Rust: the
+  argument is compared against catalog names ASCII-case-insensitively, matching
+  SQLite's own identifier resolution; `sqlite_%` internals dropped), then
+  `pragma_table_xinfo` / `pragma_index_list` / `pragma_index_info` /
+  `pragma_foreign_key_list`. The **table-valued** pragma functions are used on
+  purpose: unlike the `PRAGMA x(name)` statement form they take a **bind
+  parameter**, and the name bound is the one that came *back* from the catalog.
+  So `users; DROP TABLE x` / `users'--` are just names that match nothing
+  (pinned by `schema_unknown_table_is_exit_7_and_sql_injection_is_just_a_missing_name`).
+  `table_xinfo`, not `table_info`: the latter hides GENERATED columns; its
+  `hidden` flag distinguishes them (2 VIRTUAL / 3 STORED, both shown) from a
+  virtual-table hidden column (1, dropped).
+- **PostgreSQL** — four `pg_catalog` queries (objects, columns, constraints,
+  indexes) sharing one WHERE tail with the argument bound as `$1`/`$2`
+  (name/schema). information_schema cannot do this job: it has **no index
+  catalog**. Non-system schemas only (`n.nspname NOT LIKE 'pg\_%'` +
+  `<> 'information_schema'`) **and only what the role may read**:
+  `has_schema_privilege(n.oid,'USAGE') AND has_any_column_privilege(c.oid,'SELECT')`,
+  plus `has_column_privilege(c.oid, a.attnum, 'SELECT')` per column in the
+  columns query — pg_catalog is world-readable, so without those clauses
+  introspection would hand the agent every table of every schema it cannot
+  touch, DEFAULT expressions (literal data — secrets do get parked there)
+  included, while MySQL's information_schema filters itself by privilege.
+  `has_any_column_privilege`, not `has_table_privilege`: a `GRANT SELECT (col)
+  ON t` makes `SELECT col FROM t` legal, so hiding `t` would contradict what
+  `nyet query` allows; the per-column check then drops the columns that were
+  not granted, and `has_table_privilege(c.oid,'SELECT') AS full_sel` tells the
+  key filter below whether the column list is complete. **Known, accepted
+  leak:** the constraints query does not filter the *referenced* side, so a
+  readable child shows `ref_table: "hidden.parent"` **and the `ref_columns` of
+  that parent** even when the role cannot read it — the fk is part of the
+  child's own definition (psql's `\d` shows it too) and what is exposed is
+  identifiers only, never the parent's data, full column list or defaults.
+  Documented in the README. Pinned by
+  `postgres_schema_respects_role_privileges`. `public` objects read as bare
+  names, others are qualified (`sales.orders`) — the same form `[table]`
+  accepts, split on the first `.`; the name also matches its `lower()` form
+  since unquoted SQL identifiers fold to lowercase. Index key columns come from
+  `unnest(ix.indkey) WITH ORDINALITY` joined to `pg_attribute`
+  (`k.ord <= ix.indnkeyatts` drops INCLUDE columns), with `pg_get_indexdef`
+  covering expression keys (attnum 0); the index query is restricted to
+  `relkind IN ('r','p')` so a **materialized view** (reported as a view) never
+  carries indexes, as on the other two engines. The object relkinds are
+  `('r','p','f','v','m')` — a **foreign table** (`f`) reads like a table, so a
+  role with SELECT on one must find it (covered by a `file_fdw` foreign table
+  in the e2e). (`indnkeyatts` is PG11+; older servers are out of scope.)
+- **MySQL/MariaDB** — four `information_schema` queries (TABLES, COLUMNS,
+  STATISTICS, KEY_COLUMN_USAGE) scoped to `TABLE_SCHEMA = DATABASE()`, the
+  argument bound as `?` (twice — MySQL placeholders are positional). A foreign
+  key pointing into another database keeps its qualifier
+  (`IF(REFERENCED_TABLE_SCHEMA = DATABASE(), ...)`), mirroring the Postgres
+  "bare in the default namespace, qualified otherwise" rule. No `EXPRESSION`
+  column is selected — MySQL 8 has it, MariaDB does not — so a functional key
+  part (NULL `COLUMN_NAME`) becomes the `(expression)` placeholder below.
+
+**Grouping keys are the catalog's, not the display name.** PostgreSQL groups by
+`(schema, name)` and applies `pg_display` only on the way out, so
+`public."sales.orders"` and `sales.orders` stay two objects; the final list is
+sorted by display name (the contract's order). Two consequences of the dotted
+form, both pinned by the e2e: (a) `[table]` is split on the FIRST dot, so a
+dotted *name* is still reachable by qualifying it (`public.sales.orders` →
+schema `public`, name `sales.orders`) — but a bare `sales.orders` always reads
+as schema+table; (b) two objects that render to the same display name stay two
+entries with indistinguishable `name` values. Living with (b) is deliberate: a
+separate `schema` field would cost every agent bytes on every table to
+disambiguate a case that needs a quoted dot in an identifier (YAGNI).
+
+**Presentation rules live in `output::build_table`, not in the engines**, so the
+three cannot drift: every pk member gets `pk: true` (and `nullable: false` — see
+below), a unique index/constraint over exactly one *named* column collapses into
+that column's `unique` flag and its index entry is dropped, everything else
+stays an index entry with `unique` only when true. Two guards keep that fold
+honest, and both are the engines' job because only they can see the catalog
+flags:
+
+- a **partial/filtered** unique index (SQLite `pragma_index_list.partial`,
+  Postgres `indpred IS NOT NULL`) — and an **invalid** one (Postgres
+  `indisvalid = false`, a failed `CREATE INDEX CONCURRENTLY`) — arrives with
+  `unique: false`: its uniqueness holds for some rows only, and a `unique` flag
+  would promise the agent a key the table does not have;
+- an **expression key part** the catalog cannot name is kept as the
+  `(expression)` placeholder (Postgres substitutes the real text via
+  `pg_get_indexdef`), never dropped — dropping it would make a two-part unique
+  index look single-column and fold into a bogus column flag.
+
+The PK-backing index is dropped by the engines too, since only they know its
+catalog marker (`origin = 'pk'` / `indisprimary` / the name `PRIMARY`).
+Rationale for the whole fold: `pk`/`unique` on the column already carry the
+information, and a redundant index entry is pure token cost (UX-4).
+
+**Partial column grants: keys are dropped whole, never shortened.** Neither
+`pg_index`/`pg_constraint` nor MySQL's STATISTICS/KEY_COLUMN_USAGE is
+privilege-filtered, while the column lists are — so a column-granted role would
+otherwise get index/fk entries naming columns it cannot read, and (worse) a
+composite PRIMARY KEY reading as a one-column key, which is a *wrong* schema,
+not just a chatty one (UX-1). `build_table` therefore takes `full_columns` and,
+when it is false, drops the pk if any member is invisible and drops any
+index/fk entry with an invisible key part. Two predicates do that, both shared
+by every engine so pg and MySQL cannot drift: `names_visible` for plain column
+names (the pk and a foreign key's own columns) and `key_parts_visible` for
+index keys, which are typed (see below) and need the extra expression rule. Shortening a key list is never
+an option: it would both leak "there is more here" and re-open the false fold.
+The `full_columns` signal per engine:
+
+- **PostgreSQL** — `has_table_privilege(c.oid,'SELECT')` per object. Table-wide
+  SELECT means the columns query withheld nothing, so nothing is filtered (zero
+  regression for the ordinary case).
+- **MySQL/MariaDB** — always `false`: `information_schema.COLUMNS` is filtered
+  by the server but never says whether it filtered, and there is no cheap
+  portable way to ask (parsing the privilege tables is not worth it). With full
+  privileges every named key part is visible, so the filter drops nothing.
+- **SQLite** — always `true`: no privileges exist, the pragma lists everything.
+
+**Key parts are typed, never sniffed by string** (`output::KeyPart`):
+`Named(String)` for a column, `Expression(Some(text))` when the catalog hands
+over the expression (PostgreSQL `pg_get_indexdef`), `Expression(None)` when it
+does not (SQLite's NULL `pragma_index_info.name`, MySQL's NULL `COLUMN_NAME` —
+`STATISTICS.EXPRESSION` exists on MySQL 8 only, so no portable text). The
+`(expression)` string is a serialization detail of `Expression(None)` and
+nothing else; the wire format stays one plain string per part. Two decisions
+depend on the type and would be wrong on the text alone:
+
+- **the fold** takes only a `Named` part, so a real column named
+  `(expression)` folds like any other column, while an expression whose text
+  happens to equal a column name (a quoted `"lower(b)"` column next to an index
+  on `lower(b)`) never invents a `unique` flag;
+- **the privilege filter** treats `Named` as visible only when the column is,
+  `Expression(Some(_))` as invisible (the text can embed identifiers or
+  literals from an ungranted column) and `Expression(None)` as harmless (it
+  names nothing at all).
+
+**Accepted leak (documented in the README):** because MySQL always runs with
+`full_columns = false` and its expression parts are text-free, a functional
+index over an ungranted column stays listed there — its NAME may hint at that
+column. Dropping every text-free expression entry would blind fully-privileged
+accounts to all functional indexes, the worse trade. Pinned by
+`mysql8_functional_index_key_part_is_not_dropped`, which also runs the same
+table through a `GRANT SELECT (b)` account.
+
+**What that means for SQLite's `sqlite_autoindex_*`** (the indexes SQLite
+creates for inline UNIQUE/PK constraints), precisely: the PK one is dropped by
+`origin = 'pk'`; a *single-column* `UNIQUE` one disappears in the fold (its
+column carries `unique: true`); a *multi-column* `UNIQUE (a, b)` has no column
+flag to fold into, so it survives under its generated name
+`sqlite_autoindex_<table>_1` with `unique: true` (pinned in
+`schema_sqlite_edge_cases_are_not_faked`).
+
+`nullable: false` is forced for pk columns because SQLite's rowid alias
+(`id INTEGER PRIMARY KEY`) carries no NOT NULL in the pragma, while Postgres and
+MySQL enforce it — reporting it as declared would make the same table read
+differently per engine. SQLite's legacy "a non-rowid PK column may hold NULL"
+quirk is deliberately not represented.
+
+`DETAIL_LIMIT = 50` (a const in `src/output.rs` — an output policy, so it sits
+with the schema model; deliberately not configurable, Д5) is the
+adaptive-listing threshold: past it a `nyet schema <alias>` with no table
+returns names+kinds only and the cli adds `SCHEMA_TRUNCATED` (the cli asks
+`Schema::is_listing()` — derived from the payload, not a second copy of the
+state). Naming a table always returns full detail. An argument that matches
+nothing comes back as an empty table list, which the **cli** turns into
+`DB_ERROR` (exit 7) — the engines do not know the alias the message needs, and
+no new error code was introduced for it.
+
 ## Dependencies (Д8: each one justified)
 
 Runtime:
@@ -317,6 +497,29 @@ Dev:
   `env_clear()` + a temp `HOME`, pinning exit codes and envelope structure
   (Д7: the output is an API — changing codes/structure must break tests).
   Query tests build a fixture SQLite database with sqlx.
+- `nyet schema` is covered at three levels. Unit snapshots of the envelope and
+  the pk/unique folding (`src/output.rs`). SQLite e2e in `tests/cli.rs`: the
+  full shape (composite pk/fk, unique column vs multi-column unique index, a
+  view), the adaptive listing at 51 objects, table-not-found, SQL-injection
+  arguments that stay a plain "not found", case-insensitive `[table]`, and
+  `schema_sqlite_edge_cases_are_not_faked` — the cases where a naive catalog
+  read would invent a key: expression key parts, a partial unique index, a
+  STORED generated column, an inline composite UNIQUE autoindex, an
+  unresolvable FK parent. Container e2e per server engine:
+  `postgres_schema_end_to_end` (non-public schema, qualified names, `serial`
+  default, composite fk, matview without indexes, a `file_fdw` foreign table,
+  partial unique index, colliding display names,
+  qualified/unqualified/case-folded `[table]`),
+  `postgres_schema_respects_role_privileges` (the SECURITY one: a `lowpriv`
+  role sees only its granted tables — table-wide and column-level — with the
+  ungranted columns, schemas, DEFAULT literals and every key touching an
+  ungranted column absent, while the table-wide grant keeps its pk),
+  `mysql_schema_end_to_end` (AUTO_INCREMENT, composite pk/fk, view, a
+  cross-database FK keeping its qualifier, and the same server seen through a
+  `GRANT SELECT (a)` account: composite pk and the index over `b` gone, the
+  index over `a` kept) and
+  `mysql8_functional_index_key_part_is_not_dropped` (`mysql:8.4` — MariaDB has
+  no functional indexes).
 - `tests/postgres.rs` is the same for PostgreSQL against a testcontainers
   Postgres: success (json/table), row-limit truncation, DB_ERROR (exit 7),
   server-timeout (exit 8), CONNECTION_FAILED (exit 6, closed port), and a
@@ -661,7 +864,9 @@ Warning codes (`warnings[].code`, also closed and append-only): `TRUNCATED`,
 connection with url `sslmode`/`ssl-mode` below `require` and no ssh tunnel —
 transport not guaranteed encrypted/verified; static from config+url, so it
 over-warns against a server that happens to negotiate TLS — we report the
-guarantee, not the runtime outcome).
+guarantee, not the runtime outcome), `SCHEMA_TRUNCATED` (`nyet schema` past
+`DETAIL_LIMIT` objects: names and kinds only; the message names the
+`nyet schema <alias> <table>` way out).
 
 Codes are append-only; renaming/removing one is a breaking change (bump `v`).
 Every error must carry an actionable `hint` (Д10) — tests enforce it.
@@ -670,4 +875,7 @@ Every error must carry an actionable `hint` (Д10) — tests enforce it.
 parse — it routes every later envelope) -> alias -> directory scoping ->
 engine support / connection config -> validator -> execution. Scoping and
 engine support answer before the validator so the agent gets the real
-blocker, not a SQL lecture.
+blocker, not a SQL lecture. `nyet schema` runs the same order minus the
+validator (no agent SQL), sharing the very same code: `lookup_alias`,
+`check_scope`, `build_engine`, `open_tunnel`, `runtime`, `engine_failure` in
+`src/main.rs` — pinned by `schema_pipeline_order_matches_query`.

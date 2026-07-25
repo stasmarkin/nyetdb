@@ -38,7 +38,25 @@ enum Command {
     List {
         /// Output format (default: [defaults].format from the config, then json)
         #[arg(long, value_enum)]
-        format: Option<ListFormat>,
+        format: Option<PlainFormat>,
+    },
+    /// Show the schema of a connection: tables, views, columns, indexes, foreign keys
+    ///
+    /// Examples:
+    ///   nyet schema prod                # every table and view (details up to 50 objects)
+    ///   nyet schema prod users          # one table, always in full
+    ///   nyet schema prod sales.orders   # PostgreSQL: a table outside the public schema
+    // verbatim: clap reflows a doc comment into one paragraph otherwise, and
+    // the examples are the point (UX-3: --help is written for an LLM).
+    #[command(verbatim_doc_comment)]
+    Schema {
+        /// Connection alias from the config
+        alias: String,
+        /// One table or view to detail (PostgreSQL: `schema.table` outside public)
+        table: Option<String>,
+        /// Output format (default: [defaults].format from the config, then json)
+        #[arg(long, value_enum)]
+        format: Option<PlainFormat>,
     },
     /// Run a read-only query against a connection
     Query {
@@ -68,20 +86,20 @@ enum Format {
     Csv,
 }
 
-/// `list` has no row stream, so jsonl/csv make no sense there (DESIGN §1
-/// gives list json|table only); a separate clap enum makes `--format jsonl`
-/// a native usage error (exit 2) instead of a runtime refusal.
+/// `list` and `schema` have no row stream, so jsonl/csv make no sense there
+/// (DESIGN §1 gives list json|table only); a separate clap enum makes
+/// `--format jsonl` a native usage error (exit 2) instead of a runtime refusal.
 #[derive(Clone, Copy, ValueEnum)]
-enum ListFormat {
+enum PlainFormat {
     Json,
     Table,
 }
 
-impl ListFormat {
+impl PlainFormat {
     fn as_format(self) -> Format {
         match self {
-            ListFormat::Json => Format::Json,
-            ListFormat::Table => Format::Table,
+            PlainFormat::Json => Format::Json,
+            PlainFormat::Table => Format::Table,
         }
     }
 }
@@ -184,6 +202,14 @@ impl Db {
             Db::Sqlite(_) => {}
         }
     }
+
+    async fn schema(&self, table: Option<&str>) -> Result<output::Schema, engine::EngineError> {
+        match self {
+            Db::Sqlite(e) => e.schema(table).await,
+            Db::Postgres(e) => e.schema(table).await,
+            Db::Mysql(e) => e.schema(table).await,
+        }
+    }
 }
 
 /// The single owner of stream routing (DESIGN §1): the envelope's place is
@@ -239,7 +265,8 @@ fn main() -> ExitCode {
     // Effective format for envelope routing. Before the config is read only
     // the flag is known; run() updates this once [defaults].format applies.
     let mut format = match &cli.command {
-        Command::List { format } => format.map(ListFormat::as_format),
+        Command::List { format } => format.map(PlainFormat::as_format),
+        Command::Schema { format, .. } => format.map(PlainFormat::as_format),
         Command::Query { format, .. } => *format,
     }
     .unwrap_or(Format::Json);
@@ -268,15 +295,18 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
     // defaulting to json on stdout.
     let format = resolve_format(
         match &cli.command {
-            Command::List { format } => format.map(ListFormat::as_format),
+            Command::List { format } => format.map(PlainFormat::as_format),
+            Command::Schema { format, .. } => format.map(PlainFormat::as_format),
             Command::Query { format, .. } => *format,
         },
         config::peek_defaults_format(&text).as_deref(),
     )?;
-    // list has no row stream, so a jsonl/csv [defaults].format (set for
-    // query workflows) degrades to json for it — documented in README.
+    // list/schema have no row stream, so a jsonl/csv [defaults].format (set
+    // for query workflows) degrades to json for them — documented in README.
     let format = match (&cli.command, format) {
-        (Command::List { .. }, Format::Jsonl | Format::Csv) => Format::Json,
+        (Command::List { .. } | Command::Schema { .. }, Format::Jsonl | Format::Csv) => {
+            Format::Json
+        }
         (_, f) => f,
     };
     *route_format = format;
@@ -331,43 +361,8 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // directory answers with exit 4, not a SQL lecture); engine
             // support fires before the validator (an unsupported engine
             // answers NOT_IMPLEMENTED, not NYET with a misleading SQL hint).
-            let Some(conn) = cfg.connections.get(&alias) else {
-                let known: Vec<&str> = cfg.connections.keys().map(String::as_str).collect();
-                return Err(Failure::new(
-                    ErrorCode::ConfigInvalid,
-                    format!(
-                        "unknown connection alias '{alias}': not defined in {}",
-                        path.display()
-                    ),
-                    if known.is_empty() {
-                        "the config defines no connections; add a [connections.<alias>] section"
-                            .to_string()
-                    } else {
-                        format!("known aliases: {}", known.join(", "))
-                    },
-                ));
-            };
-            if !allowed(conn) {
-                return Err(Failure::new(
-                    ErrorCode::DirNotAllowed,
-                    format!(
-                        "connection '{alias}' is not allowed from {} (directory scoping)",
-                        cwd.display()
-                    ),
-                    if conn.allowed_dirs.is_empty() {
-                        format!(
-                            "allowed_dirs for '{alias}' is empty, which denies everywhere; \
-                             add allowed_dirs = [\"~/path/to/project\"] to the config"
-                        )
-                    } else {
-                        format!(
-                            "'{alias}' is allowed from: {}; run nyet from one of those \
-                             directories or extend allowed_dirs in the config",
-                            conn.allowed_dirs.join(", ")
-                        )
-                    },
-                ));
-            }
+            let conn = lookup_alias(&cfg, &path, &alias)?;
+            check_scope(&alias, conn, &cwd, allowed(conn))?;
             // Flag > per-connection > [defaults] > built-in. Timeout is
             // resolved here (before the engine) because Postgres feeds it into
             // the server-side statement_timeout at connect time.
@@ -379,124 +374,8 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 .or(conn.timeout_secs)
                 .or(cfg.defaults.timeout_secs)
                 .unwrap_or(30);
-
-            // Per-connection validator policy tunes only the function denylist.
-            let (v_allow, v_deny) = match &conn.validator {
-                Some(v) => (
-                    v.allow_functions.as_deref().unwrap_or(&[]),
-                    v.deny_functions.as_deref().unwrap_or(&[]),
-                ),
-                None => (&[][..], &[][..]),
-            };
-            // Engine dispatch: the concrete engine, its SQL dialect and its
-            // built-in policy are chosen together by `engine`.
-            let (mut db, policy) = match conn.engine.as_str() {
-                "sqlite" => {
-                    let Some(path) = &conn.path else {
-                        return Err(Failure::new(
-                            ErrorCode::ConfigInvalid,
-                            format!("connection '{alias}' has engine = \"sqlite\" but no `path`"),
-                            "add path = \"/path/to/file.db\" to this connection in the config",
-                        ));
-                    };
-                    (
-                        Db::Sqlite(engine::Sqlite {
-                            path: PathBuf::from(path),
-                            // sqlite has no server-side timeout, so this in-process
-                            // budget (bounding the fetch inside execute) is the
-                            // ONLY query timeout — the cli no longer wraps execute
-                            // in an outer timeout.
-                            query_timeout_ms: timeout_secs.saturating_mul(1000),
-                        }),
-                        validator::Policy::sqlite(v_allow, v_deny),
-                    )
-                }
-                "postgres" => {
-                    let Some(url) = &conn.url else {
-                        return Err(Failure::new(
-                            ErrorCode::ConfigInvalid,
-                            format!("connection '{alias}' has engine = \"postgres\" but no `url`"),
-                            "add url = \"postgres://user@host:port/dbname\" to this connection \
-                             in the config",
-                        ));
-                    };
-                    let password = read_password_env(&alias, conn)?;
-                    (
-                        Db::Postgres(engine::Postgres {
-                            url: url.clone(),
-                            password,
-                            // Postgres rejects statement_timeout > INT_MAX ms
-                            // at connect; clamp so a huge timeout_secs still
-                            // connects. i32::MAX ms is ~24.8 days.
-                            statement_timeout_ms: timeout_secs
-                                .saturating_mul(1000)
-                                .min(i32::MAX as u64),
-                            // The in-process query-phase deadline (unclamped): the
-                            // full per-query wall budget, backstopping the server
-                            // statement_timeout above.
-                            query_timeout_ms: timeout_secs.saturating_mul(1000),
-                            // Filled in below once the SSH tunnel (if any) is up.
-                            host_override: None,
-                            // Production: the generous connect_deadline floor.
-                            connect_timeout_ms: None,
-                        }),
-                        validator::Policy::postgres(v_allow, v_deny),
-                    )
-                }
-                // MariaDB is dialect- and protocol-identical to MySQL here; the
-                // engine sets both server-timeout variables (MySQL's and
-                // MariaDB's) and swallows the wrong-flavor error, so the label
-                // needs no special handling.
-                "mysql" | "mariadb" => {
-                    let Some(url) = &conn.url else {
-                        return Err(Failure::new(
-                            ErrorCode::ConfigInvalid,
-                            format!(
-                                "connection '{alias}' has engine = \"{}\" but no `url`",
-                                conn.engine
-                            ),
-                            "add url = \"mysql://user@host:port/dbname\" to this connection \
-                             in the config",
-                        ));
-                    };
-                    let password = read_password_env(&alias, conn)?;
-                    (
-                        Db::Mysql(engine::Mysql {
-                            url: url.clone(),
-                            password,
-                            // Clamp to u32::MAX ms so a huge timeout_secs stays
-                            // within MySQL's max_execution_time range.
-                            statement_timeout_ms: timeout_secs
-                                .saturating_mul(1000)
-                                .min(u32::MAX as u64),
-                            // The in-process query-phase deadline (unclamped): the
-                            // full per-query wall budget, backstopping the server
-                            // max_execution_time/max_statement_time above.
-                            query_timeout_ms: timeout_secs.saturating_mul(1000),
-                            // Filled in below once the SSH tunnel (if any) is up.
-                            host_override: None,
-                            // Production: the generous connect_deadline floor.
-                            connect_timeout_ms: None,
-                        }),
-                        validator::Policy::mysql(v_allow, v_deny),
-                    )
-                }
-                other => {
-                    return Err(Failure::new(
-                        ErrorCode::NotImplemented,
-                        format!("engine \"{other}\" of connection '{alias}' is not supported yet"),
-                        "supported engines: sqlite, postgres, mysql, mariadb; others arrive in \
-                         later releases",
-                    ))
-                }
-            };
-
-            // Static transport check for the INSECURE_TRANSPORT warning: a
-            // direct (no ssh) server connection whose url sslmode is below
-            // require gives no encryption/verification guarantee. Computed from
-            // config + url only (no server round-trip); pushed on success below.
-            let insecure_transport = conn.ssh.is_none()
-                && engine::transport_below_require(&conn.engine, conn.url.as_deref().unwrap_or(""));
+            let (mut db, policy) = build_engine(&alias, conn, timeout_secs)?;
+            let insecure_transport = insecure_transport(conn);
 
             // Layer 1: the validator. Any deny -> code NYET + reason, exit 5.
             let (query, mut warnings) = match validator::validate(&query, &policy) {
@@ -528,48 +407,11 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
 
             // Layer 2.5: an SSH tunnel to a bastion, opened AFTER the validator
             // (a refused query exits 5 without paying for ssh) and BEFORE the
-            // engine connects. A tunnel failure is CONNECTION_FAILED (exit 6).
-            // sqlite + ssh was already rejected at config parse, so only the
-            // server engines (Postgres, MySQL/MariaDB) reach here; host/remote
-            // are config-validated non-empty. The guard is held for the whole
-            // query and torn down on drop (the master, if any, stays for reuse)
-            // so forwards never accumulate.
-            let mut _tunnel = None;
-            if let Some(ssh) = &conn.ssh {
-                // host/remote are guaranteed Some+valid by config parse; a None
-                // here is an internal invariant break, not agent input, so fail
-                // fast rather than silently skipping the tunnel (which would
-                // connect straight to the real host — the wrong failure mode).
-                let host = ssh
-                    .host
-                    .as_deref()
-                    .expect("ssh host validated non-empty at config parse");
-                let remote = ssh
-                    .remote
-                    .as_deref()
-                    .expect("ssh remote validated non-empty at config parse");
-                let control_persist = ssh.control_persist.as_deref().unwrap_or("15m");
-                let tunnel = tunnel::open(host, remote, control_persist, timeout_secs)
-                    .map_err(|e| Failure::new(ErrorCode::ConnectionFailed, e.message, e.hint))?;
-                db.set_host_override(("127.0.0.1".to_string(), tunnel.local_port));
-                _tunnel = Some(tunnel);
-            }
+            // engine connects. The guard is held for the whole query and torn
+            // down on drop, so forwards never accumulate.
+            let _tunnel = open_tunnel(conn, timeout_secs, &mut db)?;
 
-            // The runtime is built lazily, only when an engine actually runs
-            // (Д9: config/validator failures never pay the async tax).
-            // enable_all: the time driver arms the engine's in-process connect
-            // and query deadlines, and the IO driver backs the Postgres TCP
-            // connection (SQLite needs neither but pays nothing measurable).
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    Failure::new(
-                        ErrorCode::Internal,
-                        format!("cannot start the async runtime: {e}"),
-                        "this is a bug in nyet; please report it",
-                    )
-                })?;
+            let rt = runtime()?;
             let started = Instant::now();
             // The engine owns BOTH deadlines internally: a hung/slow CONNECT is
             // bounded by its own generous deadline (-> Connect, exit 6) and only
@@ -584,22 +426,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             rt.shutdown_background();
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-            let mut rs = match result {
-                Err(engine::EngineError::Connect { message, hint }) => {
-                    return Err(Failure::new(ErrorCode::ConnectionFailed, message, hint))
-                }
-                Err(engine::EngineError::Db { message, hint }) => {
-                    return Err(Failure::new(ErrorCode::DbError, message, hint))
-                }
-                // Both the in-process query-phase timer and a server-side
-                // statement_timeout (Postgres 57014 / MySQL 3024 / MariaDB 1969)
-                // surface as EngineError::Timeout -> exit 8, deterministic
-                // whichever fires.
-                Err(engine::EngineError::Timeout { message, hint }) => {
-                    return Err(Failure::new(ErrorCode::Timeout, message, hint))
-                }
-                Ok(rs) => rs,
-            };
+            let mut rs = result.map_err(engine_failure)?;
 
             let truncated = rs.rows.len() as u64 > limit;
             if truncated {
@@ -628,18 +455,8 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     ),
                 });
             }
-            // Security signal (not a refusal): the transport gave no encryption
-            // guarantee. Static from config/url (Warning has no hint field, so
-            // the remedy is folded into the message).
             if insecure_transport {
-                warnings.push(output::Warning {
-                    code: "INSECURE_TRANSPORT",
-                    message: "this connection's transport is not guaranteed encrypted or \
-                              verified (sslmode below require and no ssh tunnel); set \
-                              sslmode=verify-full (Postgres) or ssl-mode=VERIFY_IDENTITY \
-                              (MySQL) in the url, or route through an ssh tunnel"
-                        .to_string(),
-                });
+                warnings.push(insecure_transport_warning());
             }
             let meta = output::QueryMeta {
                 row_count: rs.rows.len() as u64,
@@ -668,6 +485,337 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             emit(format, &data, &envelope).map_err(output_write_failure)?;
             Ok(())
         }
+        Command::Schema {
+            alias,
+            table,
+            format: _,
+        } => {
+            // Same pipeline order as query, minus the validator (there is no
+            // agent SQL here): alias -> directory scoping -> engine support /
+            // connection config -> execution.
+            let conn = lookup_alias(&cfg, &path, &alias)?;
+            check_scope(&alias, conn, &cwd, allowed(conn))?;
+            let timeout_secs = conn
+                .timeout_secs
+                .or(cfg.defaults.timeout_secs)
+                .unwrap_or(30);
+            let (mut db, _policy) = build_engine(&alias, conn, timeout_secs)?;
+            let insecure_transport = insecure_transport(conn);
+            let _tunnel = open_tunnel(conn, timeout_secs, &mut db)?;
+
+            let rt = runtime()?;
+            let started = Instant::now();
+            let result = rt.block_on(db.schema(table.as_deref()));
+            rt.shutdown_background();
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let schema = result.map_err(engine_failure)?;
+
+            // An explicit [table] that matched nothing: the catalog answered,
+            // the object simply is not there. DB_ERROR (exit 7) with the way
+            // out (Д10) — no new error code for it.
+            if let Some(name) = &table {
+                if schema.tables.is_empty() {
+                    return Err(Failure::new(
+                        ErrorCode::DbError,
+                        format!("table '{name}' not found in {alias}"),
+                        format!("run nyet schema {alias} to list available tables"),
+                    ));
+                }
+            }
+
+            let mut warnings: Vec<output::Warning> = Vec::new();
+            if schema.is_listing() {
+                warnings.push(output::Warning {
+                    code: "SCHEMA_TRUNCATED",
+                    message: format!(
+                        "schema listing truncated to names: {} objects exceed the {}-object \
+                         detail limit; run nyet schema {alias} <table> for one table's details",
+                        schema.tables.len(),
+                        output::DETAIL_LIMIT
+                    ),
+                });
+            }
+            if insecure_transport {
+                warnings.push(insecure_transport_warning());
+            }
+            let meta = output::SchemaMeta {
+                table_count: schema.tables.len() as u64,
+                duration_ms,
+                connection: alias,
+            };
+            let (data, envelope) = match format {
+                Format::Table => (
+                    output::schema_text(&schema),
+                    output::schema_meta_json(&meta, &warnings),
+                ),
+                // Only Json remains: jsonl/csv were degraded to json above.
+                _ => (
+                    String::new(),
+                    output::schema_json(&schema, &meta, &warnings),
+                ),
+            };
+            emit(format, &data, &envelope).map_err(output_write_failure)?;
+            Ok(())
+        }
+    }
+}
+
+/// alias -> connection, with the known-alias hint (CONFIG_INVALID, exit 3).
+fn lookup_alias<'a>(
+    cfg: &'a config::Config,
+    path: &Path,
+    alias: &str,
+) -> Result<&'a config::Connection, Failure> {
+    cfg.connections.get(alias).ok_or_else(|| {
+        let known: Vec<&str> = cfg.connections.keys().map(String::as_str).collect();
+        Failure::new(
+            ErrorCode::ConfigInvalid,
+            format!(
+                "unknown connection alias '{alias}': not defined in {}",
+                path.display()
+            ),
+            if known.is_empty() {
+                "the config defines no connections; add a [connections.<alias>] section".to_string()
+            } else {
+                format!("known aliases: {}", known.join(", "))
+            },
+        )
+    })
+}
+
+/// Directory scoping (DIR_NOT_ALLOWED, exit 4).
+fn check_scope(
+    alias: &str,
+    conn: &config::Connection,
+    cwd: &Path,
+    allowed: bool,
+) -> Result<(), Failure> {
+    if allowed {
+        return Ok(());
+    }
+    Err(Failure::new(
+        ErrorCode::DirNotAllowed,
+        format!(
+            "connection '{alias}' is not allowed from {} (directory scoping)",
+            cwd.display()
+        ),
+        if conn.allowed_dirs.is_empty() {
+            format!(
+                "allowed_dirs for '{alias}' is empty, which denies everywhere; \
+                 add allowed_dirs = [\"~/path/to/project\"] to the config"
+            )
+        } else {
+            format!(
+                "'{alias}' is allowed from: {}; run nyet from one of those \
+                 directories or extend allowed_dirs in the config",
+                conn.allowed_dirs.join(", ")
+            )
+        },
+    ))
+}
+
+/// Engine dispatch: the concrete engine, its SQL dialect and its built-in
+/// validator policy are chosen together by `engine`. Shared by query and
+/// schema, so both answer a missing `path`/`url` (CONFIG_INVALID, exit 3) or an
+/// unsupported engine (NOT_IMPLEMENTED, exit 1) identically. `schema` ignores
+/// the policy — introspection runs no agent SQL.
+fn build_engine(
+    alias: &str,
+    conn: &config::Connection,
+    timeout_secs: u64,
+) -> Result<(Db, validator::Policy), Failure> {
+    // Per-connection validator policy tunes only the function denylist.
+    let (v_allow, v_deny) = match &conn.validator {
+        Some(v) => (
+            v.allow_functions.as_deref().unwrap_or(&[]),
+            v.deny_functions.as_deref().unwrap_or(&[]),
+        ),
+        None => (&[][..], &[][..]),
+    };
+    match conn.engine.as_str() {
+        "sqlite" => {
+            let Some(path) = &conn.path else {
+                return Err(Failure::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("connection '{alias}' has engine = \"sqlite\" but no `path`"),
+                    "add path = \"/path/to/file.db\" to this connection in the config",
+                ));
+            };
+            Ok((
+                Db::Sqlite(engine::Sqlite {
+                    path: PathBuf::from(path),
+                    // sqlite has no server-side timeout, so this in-process
+                    // budget (bounding the fetch inside execute) is the
+                    // ONLY query timeout — the cli no longer wraps execute
+                    // in an outer timeout.
+                    query_timeout_ms: timeout_secs.saturating_mul(1000),
+                }),
+                validator::Policy::sqlite(v_allow, v_deny),
+            ))
+        }
+        "postgres" => {
+            let Some(url) = &conn.url else {
+                return Err(Failure::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("connection '{alias}' has engine = \"postgres\" but no `url`"),
+                    "add url = \"postgres://user@host:port/dbname\" to this connection \
+                     in the config",
+                ));
+            };
+            let password = read_password_env(alias, conn)?;
+            Ok((
+                Db::Postgres(engine::Postgres {
+                    url: url.clone(),
+                    password,
+                    // Postgres rejects statement_timeout > INT_MAX ms
+                    // at connect; clamp so a huge timeout_secs still
+                    // connects. i32::MAX ms is ~24.8 days.
+                    statement_timeout_ms: timeout_secs.saturating_mul(1000).min(i32::MAX as u64),
+                    // The in-process query-phase deadline (unclamped): the
+                    // full per-query wall budget, backstopping the server
+                    // statement_timeout above.
+                    query_timeout_ms: timeout_secs.saturating_mul(1000),
+                    // Filled in by open_tunnel once the SSH tunnel (if any) is up.
+                    host_override: None,
+                    // Production: the generous connect_deadline floor.
+                    connect_timeout_ms: None,
+                }),
+                validator::Policy::postgres(v_allow, v_deny),
+            ))
+        }
+        // MariaDB is dialect- and protocol-identical to MySQL here; the
+        // engine sets both server-timeout variables (MySQL's and
+        // MariaDB's) and swallows the wrong-flavor error, so the label
+        // needs no special handling.
+        "mysql" | "mariadb" => {
+            let Some(url) = &conn.url else {
+                return Err(Failure::new(
+                    ErrorCode::ConfigInvalid,
+                    format!(
+                        "connection '{alias}' has engine = \"{}\" but no `url`",
+                        conn.engine
+                    ),
+                    "add url = \"mysql://user@host:port/dbname\" to this connection \
+                     in the config",
+                ));
+            };
+            let password = read_password_env(alias, conn)?;
+            Ok((
+                Db::Mysql(engine::Mysql {
+                    url: url.clone(),
+                    password,
+                    // Clamp to u32::MAX ms so a huge timeout_secs stays
+                    // within MySQL's max_execution_time range.
+                    statement_timeout_ms: timeout_secs.saturating_mul(1000).min(u32::MAX as u64),
+                    // The in-process query-phase deadline (unclamped): the
+                    // full per-query wall budget, backstopping the server
+                    // max_execution_time/max_statement_time above.
+                    query_timeout_ms: timeout_secs.saturating_mul(1000),
+                    // Filled in by open_tunnel once the SSH tunnel (if any) is up.
+                    host_override: None,
+                    // Production: the generous connect_deadline floor.
+                    connect_timeout_ms: None,
+                }),
+                validator::Policy::mysql(v_allow, v_deny),
+            ))
+        }
+        other => Err(Failure::new(
+            ErrorCode::NotImplemented,
+            format!("engine \"{other}\" of connection '{alias}' is not supported yet"),
+            "supported engines: sqlite, postgres, mysql, mariadb; others arrive in \
+             later releases",
+        )),
+    }
+}
+
+/// Open the SSH tunnel (if the connection has one) and point the engine at its
+/// local end. A tunnel failure is CONNECTION_FAILED (exit 6). sqlite + ssh was
+/// already rejected at config parse, so only the server engines reach here.
+/// The returned guard tears the forward down on drop — the caller holds it for
+/// the whole database operation.
+fn open_tunnel(
+    conn: &config::Connection,
+    timeout_secs: u64,
+    db: &mut Db,
+) -> Result<Option<tunnel::Tunnel>, Failure> {
+    let Some(ssh) = &conn.ssh else {
+        return Ok(None);
+    };
+    // host/remote are guaranteed Some+valid by config parse; a None here is an
+    // internal invariant break, not agent input, so fail fast rather than
+    // silently skipping the tunnel (which would connect straight to the real
+    // host — the wrong failure mode).
+    let host = ssh
+        .host
+        .as_deref()
+        .expect("ssh host validated non-empty at config parse");
+    let remote = ssh
+        .remote
+        .as_deref()
+        .expect("ssh remote validated non-empty at config parse");
+    let control_persist = ssh.control_persist.as_deref().unwrap_or("15m");
+    let tunnel = tunnel::open(host, remote, control_persist, timeout_secs)
+        .map_err(|e| Failure::new(ErrorCode::ConnectionFailed, e.message, e.hint))?;
+    db.set_host_override(("127.0.0.1".to_string(), tunnel.local_port));
+    Ok(Some(tunnel))
+}
+
+/// The runtime is built lazily, only when an engine actually runs (Д9:
+/// config/validator failures never pay the async tax). enable_all: the time
+/// driver arms the engine's in-process connect and query deadlines, and the IO
+/// driver backs the TCP connection (SQLite needs neither but pays nothing
+/// measurable).
+fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            Failure::new(
+                ErrorCode::Internal,
+                format!("cannot start the async runtime: {e}"),
+                "this is a bug in nyet; please report it",
+            )
+        })
+}
+
+/// The single owner of the EngineError -> contract-code mapping. Both the
+/// in-process timer and a server-side statement_timeout (Postgres 57014 /
+/// MySQL 3024 / MariaDB 1969) surface as `Timeout` -> exit 8, deterministic
+/// whichever fires.
+fn engine_failure(e: engine::EngineError) -> Failure {
+    match e {
+        engine::EngineError::Connect { message, hint } => {
+            Failure::new(ErrorCode::ConnectionFailed, message, hint)
+        }
+        engine::EngineError::Db { message, hint } => {
+            Failure::new(ErrorCode::DbError, message, hint)
+        }
+        engine::EngineError::Timeout { message, hint } => {
+            Failure::new(ErrorCode::Timeout, message, hint)
+        }
+    }
+}
+
+/// Static transport check for the INSECURE_TRANSPORT warning: a direct (no ssh)
+/// server connection whose url sslmode is below require gives no
+/// encryption/verification guarantee. Computed from config + url only (no
+/// server round-trip).
+fn insecure_transport(conn: &config::Connection) -> bool {
+    conn.ssh.is_none()
+        && engine::transport_below_require(&conn.engine, conn.url.as_deref().unwrap_or(""))
+}
+
+/// Security signal (not a refusal), shared by query and schema: the transport
+/// gave no encryption guarantee. `Warning` has no hint field, so the remedy is
+/// folded into the message.
+fn insecure_transport_warning() -> output::Warning {
+    output::Warning {
+        code: "INSECURE_TRANSPORT",
+        message: "this connection's transport is not guaranteed encrypted or \
+                  verified (sslmode below require and no ssh tunnel); set \
+                  sslmode=verify-full (Postgres) or ssl-mode=VERIFY_IDENTITY \
+                  (MySQL) in the url, or route through an ssh tunnel"
+            .to_string(),
     }
 }
 

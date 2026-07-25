@@ -1,13 +1,20 @@
 //! Engines: IO adapters behind the `Engine` trait (Д2). Engines know their
-//! drivers (sqlx) and nothing about clap or output; the cli layer maps
-//! `EngineError` onto contract codes and wraps execution in a timeout.
+//! drivers (sqlx) and nothing about clap; the cli layer maps `EngineError` onto
+//! contract codes and wraps execution in a timeout. The one thing they take
+//! from `output` is the pure `schema` model (`Schema`/`SchemaTable`/... plus
+//! `build_table`, which owns the pk/unique presentation rules) — the contract
+//! shape they fill in, so the three engines cannot drift.
 
+use crate::output::{
+    build_table, KeyPart, Schema, SchemaColumn, SchemaFk, SchemaIndex, SchemaTable,
+};
 use futures_util::TryStreamExt;
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlRow, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgRow, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::{Column, ConnectOptions, Connection, Row, TypeInfo, ValueRef};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -74,6 +81,89 @@ fn client_timeout(query_timeout_ms: u64) -> EngineError {
 /// `fetch_limit` rows; the caller passes limit+1 to detect truncation.
 pub trait Engine {
     async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError>;
+
+    /// Introspect the schema through the same read-only session as a query.
+    /// `table` is the agent's `[table]` argument: `Some` selects one object
+    /// (empty result = not found, the cli turns that into DB_ERROR), `None`
+    /// lists everything — with details only while the object count stays
+    /// within `output::DETAIL_LIMIT`.
+    async fn schema(&self, table: Option<&str>) -> Result<Schema, EngineError>;
+}
+
+/// Per-object accumulator while catalog rows (one query per aspect) are
+/// grouped back together by table.
+struct TableParts {
+    kind: &'static str,
+    columns: Vec<SchemaColumn>,
+    pk: Vec<String>,
+    indexes: Vec<SchemaIndex>,
+    fks: Vec<SchemaFk>,
+    /// False when the server may have withheld columns (a column-level GRANT),
+    /// which makes `build_table` drop every key touching an invisible column.
+    full_columns: bool,
+}
+
+impl TableParts {
+    fn new(kind: &'static str, full_columns: bool) -> Self {
+        TableParts {
+            kind,
+            columns: Vec::new(),
+            pk: Vec::new(),
+            indexes: Vec::new(),
+            fks: Vec::new(),
+            full_columns,
+        }
+    }
+}
+
+/// Do we answer with names only? Past the limit an unfiltered listing would
+/// burn the agent's context; naming a table always gets full detail.
+fn over_detail_limit(table: Option<&str>, count: usize) -> bool {
+    table.is_none() && count > crate::output::DETAIL_LIMIT
+}
+
+/// The names-only answer past the detail limit.
+fn listing(objects: Vec<(String, TableParts)>) -> Schema {
+    sorted(
+        objects
+            .into_iter()
+            .map(|(name, p)| SchemaTable {
+                name,
+                kind: p.kind,
+                columns: None,
+                indexes: Vec::new(),
+                fks: Vec::new(),
+            })
+            .collect(),
+    )
+}
+
+/// The full answer: the collected parts through the shared presentation rules.
+fn assemble(objects: Vec<(String, TableParts)>) -> Schema {
+    sorted(
+        objects
+            .into_iter()
+            .map(|(name, p)| {
+                build_table(
+                    name,
+                    p.kind,
+                    p.columns,
+                    &p.pk,
+                    p.indexes,
+                    p.fks,
+                    p.full_columns,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Tables are ordered by their display name — the contract's deterministic
+/// order (snapshot-testable), which is NOT the catalog's grouping key for
+/// PostgreSQL (that one is schema-first).
+fn sorted(mut tables: Vec<SchemaTable>) -> Schema {
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    Schema { tables }
 }
 
 /// SQLite via sqlx, opened with `mode=ro` (file-level read-only — layer 2:
@@ -86,8 +176,11 @@ pub struct Sqlite {
     pub query_timeout_ms: u64,
 }
 
-impl Engine for Sqlite {
-    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError> {
+impl Sqlite {
+    /// Open the file read-only (layer 2), with the pre-check that turns
+    /// sqlite's opaque "unable to open database file" into a real reason.
+    /// Shared by `execute` and `schema`.
+    async fn open(&self) -> Result<sqlx::SqliteConnection, EngineError> {
         // Explicit pre-check: sqlite's own "unable to open database file"
         // (code 14) does not say why. Relative paths resolve against the
         // process cwd (documented in README). Off the async thread: a
@@ -120,7 +213,7 @@ impl Engine for Sqlite {
             }
             Ok(_) => {}
         }
-        let mut conn = SqliteConnectOptions::new()
+        SqliteConnectOptions::new()
             .filename(&self.path)
             .read_only(true)
             .connect()
@@ -132,7 +225,13 @@ impl Engine for Sqlite {
                     error_text(&e)
                 ),
                 hint: "check that the file is a readable SQLite database".to_string(),
-            })?;
+            })
+    }
+}
+
+impl Engine for Sqlite {
+    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError> {
+        let mut conn = self.open().await?;
         // Bound the QUERY phase (not the local file open above) on the effective
         // per-query budget: sqlite has no server-side timeout, so this in-process
         // deadline is the only query bound. On expiry the fetch future is dropped
@@ -184,6 +283,223 @@ impl Engine for Sqlite {
             Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
     }
+
+    async fn schema(&self, table: Option<&str>) -> Result<Schema, EngineError> {
+        let mut conn = self.open().await?;
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        // Same shape as execute: on expiry the future is dropped and the
+        // connection is NOT awaited (the worker may still be busy).
+        match tokio::time::timeout(deadline, sqlite_schema(&mut conn, table)).await {
+            Ok(r) => {
+                let _ = conn.close().await;
+                r
+            }
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
+        }
+    }
+}
+
+/// SQLite introspection: `sqlite_master` for the object list, then the
+/// table-valued pragmas for the details.
+///
+/// **The `[table]` argument never reaches SQL.** It is compared in Rust against
+/// the names the catalog returned, and every pragma below is called with the
+/// name that came BACK from the catalog, passed as a bound parameter — so
+/// neither `users; DROP TABLE x` nor `users'--` can be anything but a name that
+/// matches nothing. (`pragma_table_xinfo(?)` is the table-valued form of
+/// `PRAGMA table_xinfo`; unlike the statement form it takes bind parameters,
+/// which is why it is used here.)
+async fn sqlite_schema(
+    conn: &mut sqlx::SqliteConnection,
+    table: Option<&str>,
+) -> Result<Schema, EngineError> {
+    let rows = sqlx::query("SELECT name, type FROM sqlite_master WHERE type IN ('table','view')")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_error)?;
+    let mut objects: Vec<(String, TableParts)> = Vec::new();
+    for row in rows {
+        let name: String = row.try_get("name").map_err(db_error)?;
+        let kind: String = row.try_get("type").map_err(db_error)?;
+        // sqlite_sequence / sqlite_stat1 / autoindexes: engine bookkeeping.
+        if name.starts_with("sqlite_") {
+            continue;
+        }
+        // SQLite resolves identifiers ASCII-case-insensitively, so `nyet schema
+        // db USERS` must find `users` — exactly like `SELECT * FROM USERS`.
+        if table.is_some_and(|t| !t.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        objects.push((
+            name,
+            // SQLite has no privileges: the pragma always lists every column.
+            TableParts::new(if kind == "view" { "view" } else { "table" }, true),
+        ));
+    }
+    if over_detail_limit(table, objects.len()) {
+        return Ok(listing(objects));
+    }
+    for (name, parts) in &mut objects {
+        let (columns, pk) = sqlite_columns(conn, name).await?;
+        parts.columns = columns;
+        parts.pk = pk;
+        // A view has no indexes or foreign keys.
+        if parts.kind == "table" {
+            parts.indexes = sqlite_indexes(conn, name).await?;
+            parts.fks = sqlite_fks(conn, name).await?;
+        }
+    }
+    Ok(assemble(objects))
+}
+
+/// Columns in ordinal order + the primary-key column names in key order.
+/// `type` is the declared type, verbatim (empty for an untyped column).
+///
+/// `table_xinfo`, not `table_info`: the latter hides GENERATED columns, which
+/// are perfectly readable columns an agent must know about. Its `hidden` marks
+/// them (2 = VIRTUAL, 3 = STORED, 0 = ordinary); only `1` — a virtual-table
+/// hidden column, not selectable by name — is dropped.
+async fn sqlite_columns(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+) -> Result<(Vec<SchemaColumn>, Vec<String>), EngineError> {
+    let rows = sqlx::query(
+        "SELECT name, type, \"notnull\", dflt_value, pk, hidden \
+         FROM pragma_table_xinfo(?) ORDER BY cid",
+    )
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    let mut columns = Vec::new();
+    let mut pk: Vec<(i64, String)> = Vec::new();
+    for row in rows {
+        let name: String = row.try_get("name").map_err(db_error)?;
+        // Lenient on the rest: a pragma column nyet cannot decode must not
+        // fail the whole introspection (Д3 — no panics, no dead ends).
+        let ty: String = row.try_get("type").unwrap_or_default();
+        let notnull: i64 = row.try_get("notnull").unwrap_or(0);
+        let default: Option<String> = row.try_get("dflt_value").unwrap_or(None);
+        let position: i64 = row.try_get("pk").unwrap_or(0);
+        if row.try_get::<i64, _>("hidden").unwrap_or(0) == 1 {
+            continue;
+        }
+        if position > 0 {
+            pk.push((position, name.clone()));
+        }
+        columns.push(SchemaColumn {
+            name,
+            ty,
+            // As declared: SQLite's rowid-alias PRIMARY KEY (`id INTEGER
+            // PRIMARY KEY`) carries no NOT NULL, so it reads back nullable
+            // here — build_table normalizes a pk column to false so the three
+            // engines agree (see docs/DEV.md).
+            nullable: notnull == 0,
+            pk: false,
+            unique: false,
+            default,
+        });
+    }
+    pk.sort_by_key(|(position, _)| *position);
+    Ok((columns, pk.into_iter().map(|(_, name)| name).collect()))
+}
+
+async fn sqlite_indexes(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+) -> Result<Vec<SchemaIndex>, EngineError> {
+    let rows = sqlx::query(
+        "SELECT name, \"unique\", origin, \"partial\" FROM pragma_index_list(?) ORDER BY seq",
+    )
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    let mut indexes = Vec::new();
+    for row in rows {
+        let name: String = row.try_get("name").map_err(db_error)?;
+        let unique: i64 = row.try_get("unique").unwrap_or(0);
+        let origin: String = row.try_get("origin").unwrap_or_default();
+        // A partial index (`CREATE UNIQUE INDEX ... WHERE ...`) enforces
+        // uniqueness only over the rows its predicate matches, so it is
+        // reported as an ordinary index — claiming `unique` would promise the
+        // agent a key that does not hold for the whole table.
+        let partial: i64 = row.try_get("partial").unwrap_or(0);
+        // origin 'pk' backs the PRIMARY KEY: redundant with the pk flags.
+        if origin == "pk" {
+            continue;
+        }
+        let parts = sqlx::query("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+            .bind(&name)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(db_error)?;
+        // NULL for an expression key (`CREATE INDEX ... (lower(x))`): kept as an
+        // Expression part so the key arity survives (the pragma has no text for
+        // it, hence None).
+        let columns: Vec<KeyPart> = parts
+            .iter()
+            .map(|r| match r.try_get::<Option<String>, _>("name") {
+                Ok(Some(name)) => KeyPart::Named(name),
+                _ => KeyPart::Expression(None),
+            })
+            .collect();
+        if columns.is_empty() {
+            continue;
+        }
+        indexes.push(SchemaIndex {
+            name,
+            columns,
+            unique: unique != 0 && partial == 0,
+        });
+    }
+    Ok(indexes)
+}
+
+async fn sqlite_fks(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+) -> Result<Vec<SchemaFk>, EngineError> {
+    let rows = sqlx::query(
+        "SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?) ORDER BY id, seq",
+    )
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    // Rows are one column each, grouped by `id` (a composite key spans several).
+    let mut fks: Vec<(i64, SchemaFk)> = Vec::new();
+    for row in rows {
+        let id: i64 = row.try_get("id").map_err(db_error)?;
+        let ref_table: String = row.try_get("table").map_err(db_error)?;
+        let from: String = row.try_get("from").map_err(db_error)?;
+        let to: Option<String> = row.try_get("to").unwrap_or(None);
+        match fks.last_mut() {
+            Some((last, fk)) if *last == id => {
+                fk.columns.push(from);
+                fk.ref_columns.extend(to);
+            }
+            _ => fks.push((
+                id,
+                SchemaFk {
+                    columns: vec![from],
+                    ref_table,
+                    ref_columns: to.into_iter().collect(),
+                },
+            )),
+        }
+    }
+    // `REFERENCES orgs` without a column list points at the parent's primary
+    // key; SQLite reports those columns as NULL, so resolve them. A parent
+    // with no declared primary key (an implicit rowid reference, or a parent
+    // that does not exist) leaves `ref_columns` empty — reported as-is and
+    // documented, not invented.
+    for (_, fk) in &mut fks {
+        if fk.ref_columns.is_empty() {
+            fk.ref_columns = sqlite_columns(conn, &fk.ref_table).await?.1;
+        }
+    }
+    Ok(fks.into_iter().map(|(_, fk)| fk).collect())
 }
 
 /// PostgreSQL via sqlx. Layer 2 (DESIGN §3) is server-enforced: the
@@ -234,8 +550,12 @@ fn apply_host_override(
     }
 }
 
-impl Engine for Postgres {
-    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError> {
+impl Postgres {
+    /// Build the connect options (layer 2 + the tunnel override) and run the
+    /// handshake under its own generous deadline. Shared by `execute` and
+    /// `schema`, so introspection gets the same read-only, timeout-capped
+    /// session as a query.
+    async fn connect(&self) -> Result<sqlx::PgConnection, EngineError> {
         // Never echo the url on a parse error: it may embed credentials.
         let opts: PgConnectOptions = self.url.parse().map_err(|_| EngineError::Connect {
             message: "the `url` for this connection is not a valid PostgreSQL URL".to_string(),
@@ -269,18 +589,22 @@ impl Engine for Postgres {
             .connect_timeout_ms
             .map(Duration::from_millis)
             .unwrap_or_else(|| connect_deadline(self.statement_timeout_ms));
-        let mut conn = match tokio::time::timeout(deadline, opts.connect()).await {
-            Ok(r) => r.map_err(pg_connect_error)?,
-            Err(_elapsed) => {
-                return Err(EngineError::Connect {
-                    message: "the connection to the PostgreSQL database did not complete in time"
-                        .to_string(),
-                    hint: "check the host/port in `url` and that the server is reachable \
-                           (a firewall may be dropping the connection)"
-                        .to_string(),
-                })
-            }
-        };
+        match tokio::time::timeout(deadline, opts.connect()).await {
+            Ok(r) => r.map_err(pg_connect_error),
+            Err(_elapsed) => Err(EngineError::Connect {
+                message: "the connection to the PostgreSQL database did not complete in time"
+                    .to_string(),
+                hint: "check the host/port in `url` and that the server is reachable \
+                       (a firewall may be dropping the connection)"
+                    .to_string(),
+            }),
+        }
+    }
+}
+
+impl Engine for Postgres {
+    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError> {
+        let mut conn = self.connect().await?;
 
         // Bound the QUERY phase on the effective per-query budget (connect above
         // has its OWN generous deadline). Keeping the two timers separate means a
@@ -289,11 +613,9 @@ impl Engine for Postgres {
         // Complements the server statement_timeout (57014); whichever fires, 8.
         let deadline = Duration::from_millis(self.query_timeout_ms);
         match tokio::time::timeout(deadline, async move {
-            // Explicit read-only transaction (belt and suspenders over the
-            // session default): the read runs inside it, a smuggled write fails.
-            {
-                use sqlx::Executor;
-                conn.execute("BEGIN READ ONLY").await.map_err(pg_error)?;
+            if let Err(e) = Postgres::begin_read_only(&mut conn).await {
+                let _ = conn.close().await;
+                return Err(e);
             }
 
             let mut columns: Vec<String> = Vec::new();
@@ -333,12 +655,7 @@ impl Engine for Postgres {
                         .collect();
                 }
             }
-            // Read-only: nothing to persist, so rollback (cheaper than commit).
-            {
-                use sqlx::Executor;
-                let _ = conn.execute("ROLLBACK").await;
-            }
-            let _ = conn.close().await;
+            pg_close_read_only(conn).await;
             fetched?;
             Ok::<ResultSet, EngineError>(ResultSet { columns, rows })
         })
@@ -347,6 +664,309 @@ impl Engine for Postgres {
             Ok(r) => r,
             Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
+    }
+
+    async fn schema(&self, table: Option<&str>) -> Result<Schema, EngineError> {
+        let mut conn = self.connect().await?;
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, async move {
+            if let Err(e) = Postgres::begin_read_only(&mut conn).await {
+                let _ = conn.close().await;
+                return Err(e);
+            }
+            let schema = pg_schema(&mut conn, table).await;
+            pg_close_read_only(conn).await;
+            schema
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
+        }
+    }
+}
+
+impl Postgres {
+    /// Layer 2, client half: an explicit read-only transaction (belt and
+    /// suspenders over the connection's `default_transaction_read_only`) — the
+    /// read runs inside it, a smuggled write fails. Shared by execute/schema,
+    /// mirroring `Mysql::begin_read_only`.
+    async fn begin_read_only(conn: &mut sqlx::PgConnection) -> Result<(), EngineError> {
+        use sqlx::Executor;
+        conn.execute("BEGIN READ ONLY").await.map_err(pg_error)?;
+        Ok(())
+    }
+}
+
+/// Read-only: nothing to persist, so rollback (cheaper than commit) and close
+/// the connection gracefully. Best effort — the answer is already in hand.
+async fn pg_close_read_only(mut conn: sqlx::PgConnection) {
+    use sqlx::Executor;
+    let _ = conn.execute("ROLLBACK").await;
+    let _ = conn.close().await;
+}
+
+/// The shared WHERE tail of the four pg_catalog queries. No agent text: the
+/// `[table]` argument arrives as the bound `$1`/`$2` (name / schema), and the
+/// system schemas are excluded by literals. `'pg\_%'` escapes the LIKE
+/// wildcard, so it means the literal prefix `pg_` (pg_catalog, pg_toast,
+/// pg_temp_*) — user schemas cannot start with `pg_` (reserved).
+///
+/// **The privilege checks are the security half (SECURITY).** pg_catalog is
+/// world-readable, so without them `nyet schema` would hand the agent every
+/// table of every schema the role cannot even see — including DEFAULT
+/// expressions, which are literal data (secrets get parked in defaults). With
+/// them the answer matches what the role could actually SELECT, the way
+/// MySQL's information_schema already filters itself. `has_any_column_privilege`,
+/// not `has_table_privilege`: a `GRANT SELECT (col) ON t` makes `SELECT col
+/// FROM t` work, so the table must be introspectable too (the columns query
+/// then hides the columns that were not granted).
+///
+/// A bare `[table]` also matches its lowercase form: PostgreSQL folds
+/// unquoted identifiers to lowercase, so `nyet schema pg ORGS` must find
+/// `orgs` — as `SELECT * FROM ORGS` would. (If both `ORGS` and `orgs` exist,
+/// both are returned; qualify or quote to pin one down.)
+const PG_FILTER: &str = "n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' \
+     AND has_schema_privilege(n.oid, 'USAGE') AND has_any_column_privilege(c.oid, 'SELECT') \
+     AND ($1::text IS NULL OR c.relname = $1 OR c.relname = lower($1)) \
+     AND ($2::text IS NULL OR n.nspname = $2 OR n.nspname = lower($2))";
+
+/// Ordinary + partitioned + foreign tables, views and materialized views. A
+/// foreign table reads like a table (it just lives elsewhere), so a role with
+/// SELECT on one must find it here. (information_schema cannot answer this: it
+/// has no index catalog — hence pg_catalog throughout.)
+const PG_RELKINDS: &str = "c.relkind IN ('r','p','f','v','m')";
+
+/// `public` is on the default search_path, so its objects read as bare names;
+/// everything else is schema-qualified — which is also the form the `[table]`
+/// argument accepts back.
+fn pg_display(schema: &str, name: &str) -> String {
+    if schema == "public" {
+        name.to_string()
+    } else {
+        format!("{schema}.{name}")
+    }
+}
+
+/// Split the agent's `[table]` argument into `(schema, name)`. Both halves are
+/// bound as parameters, never interpolated; an unqualified name matches in
+/// every non-system schema.
+fn split_qualified(table: &str) -> (Option<&str>, &str) {
+    match table.split_once('.') {
+        Some((schema, name)) => (Some(schema), name),
+        None => (None, table),
+    }
+}
+
+/// PostgreSQL introspection: four pg_catalog queries (objects, columns,
+/// constraints, indexes) grouped back together by table. Every one of them is a
+/// constant string plus the two bound filter parameters.
+async fn pg_schema(
+    conn: &mut sqlx::PgConnection,
+    table: Option<&str>,
+) -> Result<Schema, EngineError> {
+    let (schema_filter, name_filter) = match table {
+        Some(t) => {
+            let (schema, name) = split_qualified(t);
+            (schema, Some(name))
+        }
+        None => (None, None),
+    };
+    // AssertSqlSafe: the SQL below is entirely nyet's own constant text (the
+    // agent's argument travels as bind parameters), it is dynamic only because
+    // the shared WHERE tail is composed with format!.
+    let objects = sqlx::query(sqlx::AssertSqlSafe(format!(
+        // full_sel: table-wide SELECT, so the columns query cannot have held
+        // anything back. Without it the role got in through a column-level
+        // GRANT and every key over an invisible column must be dropped.
+        "SELECT n.nspname::text AS schema, c.relname::text AS name, c.relkind::text AS kind, \
+         has_table_privilege(c.oid, 'SELECT') AS full_sel \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE {PG_RELKINDS} AND {PG_FILTER} ORDER BY 1, 2"
+    )))
+    .bind(name_filter)
+    .bind(schema_filter)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(pg_error)?;
+
+    // Keyed by (schema, name), NOT by display name: `public."a.b"` and table
+    // `b` in schema `a` share a display name and would otherwise merge into one
+    // object. The display name is applied only on the way out (pg_objects).
+    let mut parts: BTreeMap<(String, String), TableParts> = BTreeMap::new();
+    for row in &objects {
+        let kind: String = row.try_get("kind").map_err(pg_error)?;
+        let kind = if kind == "v" || kind == "m" {
+            "view"
+        } else {
+            "table"
+        };
+        let full_sel: bool = row.try_get("full_sel").unwrap_or(false);
+        parts.insert(pg_key(row)?, TableParts::new(kind, full_sel));
+    }
+    if over_detail_limit(table, parts.len()) {
+        return Ok(listing(pg_objects(parts)));
+    }
+
+    let columns = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT n.nspname::text AS schema, c.relname::text AS name, a.attname::text AS column, \
+         format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS notnull, \
+         COALESCE(pg_get_expr(d.adbin, d.adrelid), \
+                  CASE WHEN a.attidentity <> '' THEN 'generated as identity' END) AS \"default\" \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+         WHERE a.attnum > 0 AND NOT a.attisdropped \
+         AND has_column_privilege(c.oid, a.attnum, 'SELECT') \
+         AND {PG_RELKINDS} AND {PG_FILTER} \
+         ORDER BY 1, 2, a.attnum"
+    )))
+    .bind(name_filter)
+    .bind(schema_filter)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(pg_error)?;
+    for row in &columns {
+        let Some(entry) = parts.get_mut(&pg_key(row)?) else {
+            continue;
+        };
+        entry.columns.push(SchemaColumn {
+            name: row.try_get("column").map_err(pg_error)?,
+            ty: row.try_get("type").map_err(pg_error)?,
+            nullable: !row.try_get::<bool, _>("notnull").map_err(pg_error)?,
+            pk: false,
+            unique: false,
+            default: row.try_get("default").map_err(pg_error)?,
+        });
+    }
+
+    // Primary keys and foreign keys in one pass over pg_constraint; the column
+    // names come back as ordered arrays (conkey/confkey are attnum vectors).
+    let constraints = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT n.nspname::text AS schema, c.relname::text AS name, con.contype::text AS contype, \
+         (SELECT array_agg(att.attname::text ORDER BY u.ord) \
+            FROM unnest(con.conkey) WITH ORDINALITY AS u(attnum, ord) \
+            JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = u.attnum) AS cols, \
+         fns.nspname::text AS ref_schema, ft.relname::text AS ref_table, \
+         (SELECT array_agg(att.attname::text ORDER BY u.ord) \
+            FROM unnest(con.confkey) WITH ORDINALITY AS u(attnum, ord) \
+            JOIN pg_attribute att ON att.attrelid = con.confrelid AND att.attnum = u.attnum) AS ref_cols \
+         FROM pg_constraint con \
+         JOIN pg_class c ON c.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_class ft ON ft.oid = con.confrelid \
+         LEFT JOIN pg_namespace fns ON fns.oid = ft.relnamespace \
+         WHERE con.contype IN ('p','f') AND {PG_FILTER} ORDER BY 1, 2, con.conname"
+    )))
+    .bind(name_filter)
+    .bind(schema_filter)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(pg_error)?;
+    for row in &constraints {
+        let Some(entry) = parts.get_mut(&pg_key(row)?) else {
+            continue;
+        };
+        let contype: String = row.try_get("contype").map_err(pg_error)?;
+        let cols: Vec<String> = row
+            .try_get::<Option<Vec<String>>, _>("cols")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if contype == "p" {
+            entry.pk = cols;
+            continue;
+        }
+        let (Ok(ref_schema), Ok(ref_table)) = (
+            row.try_get::<String, _>("ref_schema"),
+            row.try_get::<String, _>("ref_table"),
+        ) else {
+            continue;
+        };
+        entry.fks.push(SchemaFk {
+            columns: cols,
+            ref_table: pg_display(&ref_schema, &ref_table),
+            ref_columns: row
+                .try_get::<Option<Vec<String>>, _>("ref_cols")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        });
+    }
+
+    // Indexes, one row per key column, for real tables only (a materialized
+    // view is reported as a view, and a view never carries indexes on any
+    // engine). The PRIMARY KEY index is skipped (the pk flags carry it); a
+    // unique index over a single column is folded into that column's `unique`
+    // flag by build_table. Expression keys have attnum 0, so pg_get_indexdef
+    // supplies their text. `unique` is claimed only for a valid, unconditional
+    // index: a partial one (indpred) holds for its predicate rows only, and an
+    // invalid one (a failed CREATE INDEX CONCURRENTLY) enforces nothing.
+    let indexes = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT n.nspname::text AS schema, c.relname::text AS name, i.relname::text AS idx, \
+         (ix.indisunique AND ix.indpred IS NULL AND ix.indisvalid) AS is_unique, \
+         a.attname::text AS col, \
+         pg_get_indexdef(ix.indexrelid, k.ord::int, true) AS expr \
+         FROM pg_index ix \
+         JOIN pg_class c ON c.oid = ix.indrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_class i ON i.oid = ix.indexrelid \
+         CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) \
+         LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum \
+         WHERE NOT ix.indisprimary AND k.ord <= ix.indnkeyatts \
+         AND c.relkind IN ('r','p') AND {PG_FILTER} \
+         ORDER BY 1, 2, 3, k.ord"
+    )))
+    .bind(name_filter)
+    .bind(schema_filter)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(pg_error)?;
+    for row in &indexes {
+        let Some(entry) = parts.get_mut(&pg_key(row)?) else {
+            continue;
+        };
+        let index_name: String = row.try_get("idx").map_err(pg_error)?;
+        // attnum 0 -> no column, an expression: pg_get_indexdef spells it out.
+        let part = match row.try_get::<Option<String>, _>("col").map_err(pg_error)? {
+            Some(name) => KeyPart::Named(name),
+            None => KeyPart::Expression(Some(row.try_get("expr").map_err(pg_error)?)),
+        };
+        let unique: bool = row.try_get("is_unique").map_err(pg_error)?;
+        push_index_column(&mut entry.indexes, index_name, part, unique);
+    }
+
+    Ok(assemble(pg_objects(parts)))
+}
+
+/// The catalog grouping key of a row: (schema, name).
+fn pg_key(row: &PgRow) -> Result<(String, String), EngineError> {
+    Ok((
+        row.try_get("schema").map_err(pg_error)?,
+        row.try_get("name").map_err(pg_error)?,
+    ))
+}
+
+/// Grouped parts -> the display names the contract shows.
+fn pg_objects(parts: BTreeMap<(String, String), TableParts>) -> Vec<(String, TableParts)> {
+    parts
+        .into_iter()
+        .map(|((schema, name), p)| (pg_display(&schema, &name), p))
+        .collect()
+}
+
+/// Catalog rows arrive one key column at a time, ordered by index name — so a
+/// row either extends the index being built or starts a new one. Shared by the
+/// Postgres and MySQL introspection (both group the same way).
+fn push_index_column(indexes: &mut Vec<SchemaIndex>, name: String, part: KeyPart, unique: bool) {
+    match indexes.last_mut() {
+        Some(last) if last.name == name => last.columns.push(part),
+        _ => indexes.push(SchemaIndex {
+            name,
+            columns: vec![part],
+            unique,
+        }),
     }
 }
 
@@ -582,8 +1202,10 @@ fn apply_mysql_host_override(
     }
 }
 
-impl Engine for Mysql {
-    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError> {
+impl Mysql {
+    /// Connect options (password + tunnel override) and the handshake under its
+    /// own generous deadline. Shared by `execute` and `schema`.
+    async fn connect(&self) -> Result<sqlx::MySqlConnection, EngineError> {
         // Never echo the url on a parse error: it may embed credentials.
         let opts: MySqlConnectOptions = self.url.parse().map_err(|_| EngineError::Connect {
             message: "the `url` for this connection is not a valid MySQL URL".to_string(),
@@ -603,18 +1225,61 @@ impl Engine for Mysql {
             .connect_timeout_ms
             .map(Duration::from_millis)
             .unwrap_or_else(|| connect_deadline(self.statement_timeout_ms));
-        let mut conn = match tokio::time::timeout(deadline, opts.connect()).await {
-            Ok(r) => r.map_err(mysql_connect_error)?,
-            Err(_elapsed) => {
-                return Err(EngineError::Connect {
-                    message: "the connection to the MySQL database did not complete in time"
-                        .to_string(),
-                    hint: "check the host/port in `url` and that the server is reachable \
-                           (a firewall may be dropping the connection)"
-                        .to_string(),
-                })
+        match tokio::time::timeout(deadline, opts.connect()).await {
+            Ok(r) => r.map_err(mysql_connect_error),
+            Err(_elapsed) => Err(EngineError::Connect {
+                message: "the connection to the MySQL database did not complete in time"
+                    .to_string(),
+                hint: "check the host/port in `url` and that the server is reachable \
+                       (a firewall may be dropping the connection)"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Layer 2 for MySQL/MariaDB: the server-side statement timeout plus an
+    /// explicit read-only transaction. Shared by `execute` and `schema`.
+    ///
+    /// MySQL and MariaDB use different, mutually exclusive timeout variables
+    /// (ms vs seconds), so set BOTH and swallow the wrong-flavor
+    /// ER_UNKNOWN_SYSTEM_VARIABLE (1193) on each independently — the real server
+    /// always ends up capped regardless of the config label.
+    async fn begin_read_only(&self, conn: &mut sqlx::MySqlConnection) -> Result<(), EngineError> {
+        use sqlx::Executor;
+        let secs = (self.statement_timeout_ms / 1000).max(1);
+        for stmt in [
+            // MySQL milliseconds; MariaDB seconds. (>= 1; 0 = "no limit".)
+            format!(
+                "SET SESSION max_execution_time = {}",
+                self.statement_timeout_ms.max(1)
+            ),
+            format!("SET SESSION max_statement_time = {secs}"),
+        ] {
+            if let Err(e) = conn.execute(sqlx::AssertSqlSafe(stmt)).await {
+                if !is_unknown_var(&e) {
+                    // The caller closes the connection on this path (it owns it).
+                    return Err(mysql_error(e));
+                }
             }
-        };
+        }
+        conn.execute("START TRANSACTION READ ONLY")
+            .await
+            .map_err(mysql_error)?;
+        Ok(())
+    }
+}
+
+/// Read-only: rollback (nothing to persist) and close gracefully — a proper
+/// COM_QUIT rather than a dropped socket. Best effort, like the Postgres twin.
+async fn mysql_close_read_only(mut conn: sqlx::MySqlConnection) {
+    use sqlx::Executor;
+    let _ = conn.execute("ROLLBACK").await;
+    let _ = conn.close().await;
+}
+
+impl Engine for Mysql {
+    async fn execute(&self, sql: &str, fetch_limit: u64) -> Result<ResultSet, EngineError> {
+        let mut conn = self.connect().await?;
 
         // Bound the QUERY phase (everything below, after a successful connect)
         // on the effective per-query budget; connect above has its own generous
@@ -624,38 +1289,9 @@ impl Engine for Mysql {
         // max_execution_time/max_statement_time; whichever fires, exit 8.
         let deadline = Duration::from_millis(self.query_timeout_ms);
         match tokio::time::timeout(deadline, async move {
-            // Layer 2, part 1: the server-side statement timeout. MySQL and
-            // MariaDB use different, mutually exclusive variables (ms vs seconds),
-            // so set BOTH and swallow the wrong-flavor ER_UNKNOWN_SYSTEM_VARIABLE
-            // (1193) on each independently — the real server always ends up capped
-            // regardless of the config label.
-            {
-                use sqlx::Executor;
-                let secs = (self.statement_timeout_ms / 1000).max(1);
-                for stmt in [
-                    // MySQL milliseconds; MariaDB seconds. (>= 1; 0 = "no limit".)
-                    format!(
-                        "SET SESSION max_execution_time = {}",
-                        self.statement_timeout_ms.max(1)
-                    ),
-                    format!("SET SESSION max_statement_time = {secs}"),
-                ] {
-                    if let Err(e) = conn.execute(sqlx::AssertSqlSafe(stmt)).await {
-                        if !is_unknown_var(&e) {
-                            let _ = conn.close().await;
-                            return Err(mysql_error(e));
-                        }
-                    }
-                }
-            }
-
-            // Layer 2, part 2: the explicit read-only transaction; a smuggled
-            // write is rejected by the database itself.
-            {
-                use sqlx::Executor;
-                conn.execute("START TRANSACTION READ ONLY")
-                    .await
-                    .map_err(mysql_error)?;
+            if let Err(e) = self.begin_read_only(&mut conn).await {
+                let _ = conn.close().await;
+                return Err(e);
             }
 
             // ponytail: the fetch loop / empty-columns-via-prepare / rollback+close
@@ -699,11 +1335,7 @@ impl Engine for Mysql {
                         .collect();
                 }
             }
-            {
-                use sqlx::Executor;
-                let _ = conn.execute("ROLLBACK").await;
-            }
-            let _ = conn.close().await;
+            mysql_close_read_only(conn).await;
             fetched?;
             Ok::<ResultSet, EngineError>(ResultSet { columns, rows })
         })
@@ -713,6 +1345,188 @@ impl Engine for Mysql {
             Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
     }
+
+    async fn schema(&self, table: Option<&str>) -> Result<Schema, EngineError> {
+        let mut conn = self.connect().await?;
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, async move {
+            if let Err(e) = self.begin_read_only(&mut conn).await {
+                let _ = conn.close().await;
+                return Err(e);
+            }
+            let schema = mysql_schema(&mut conn, table).await;
+            mysql_close_read_only(conn).await;
+            schema
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
+        }
+    }
+}
+
+/// MySQL/MariaDB introspection: four information_schema queries scoped to the
+/// connection's own database (`DATABASE()`), grouped back together by table.
+/// The `[table]` argument is bound (`?`), never interpolated — it is bound
+/// twice because MySQL placeholders are positional.
+async fn mysql_schema(
+    conn: &mut sqlx::MySqlConnection,
+    table: Option<&str>,
+) -> Result<Schema, EngineError> {
+    let objects = sqlx::query(
+        "SELECT TABLE_NAME AS name, TABLE_TYPE AS kind FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = DATABASE() AND (? IS NULL OR TABLE_NAME = ?) ORDER BY TABLE_NAME",
+    )
+    .bind(table)
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(mysql_error)?;
+    let mut parts: BTreeMap<String, TableParts> = BTreeMap::new();
+    for row in &objects {
+        let name: String = row.try_get("name").map_err(mysql_error)?;
+        let kind: String = row.try_get("kind").map_err(mysql_error)?;
+        let kind = match kind.as_str() {
+            "BASE TABLE" => "table",
+            "VIEW" => "view",
+            // SYSTEM VIEW / SEQUENCE / anything else: not a readable relation
+            // the agent asked about.
+            _ => continue,
+        };
+        // information_schema.COLUMNS is privilege-filtered by the server, but
+        // it never says WHETHER it withheld anything — so the key filter always
+        // runs. With full privileges every named part is visible and nothing is
+        // dropped; the cost is only paid by a column-granted account.
+        parts.insert(name, TableParts::new(kind, false));
+    }
+    if over_detail_limit(table, parts.len()) {
+        return Ok(listing(parts.into_iter().collect()));
+    }
+
+    let columns = sqlx::query(
+        "SELECT TABLE_NAME AS name, COLUMN_NAME AS col, COLUMN_TYPE AS type, \
+         IS_NULLABLE AS nullable, COLUMN_DEFAULT AS def, EXTRA AS extra \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND (? IS NULL OR TABLE_NAME = ?) \
+         ORDER BY TABLE_NAME, ORDINAL_POSITION",
+    )
+    .bind(table)
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(mysql_error)?;
+    for row in &columns {
+        let key: String = row.try_get("name").map_err(mysql_error)?;
+        let Some(entry) = parts.get_mut(&key) else {
+            continue;
+        };
+        let extra: String = row.try_get("extra").unwrap_or_default();
+        let default: Option<String> = row.try_get("def").unwrap_or(None);
+        entry.columns.push(SchemaColumn {
+            name: row.try_get("col").map_err(mysql_error)?,
+            ty: row.try_get("type").map_err(mysql_error)?,
+            nullable: row.try_get::<String, _>("nullable").unwrap_or_default() != "NO",
+            pk: false,
+            unique: false,
+            // MySQL reports auto-increment in EXTRA, not COLUMN_DEFAULT; surface
+            // it as the default so the agent sees the column is auto-assigned.
+            default: default.or_else(|| {
+                extra
+                    .to_lowercase()
+                    .contains("auto_increment")
+                    .then(|| "auto_increment".to_string())
+            }),
+        });
+    }
+
+    let indexes = sqlx::query(
+        "SELECT TABLE_NAME AS name, INDEX_NAME AS idx, NON_UNIQUE AS non_unique, \
+         COLUMN_NAME AS col FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = DATABASE() AND (? IS NULL OR TABLE_NAME = ?) \
+         ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+    )
+    .bind(table)
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(mysql_error)?;
+    for row in &indexes {
+        let key: String = row.try_get("name").map_err(mysql_error)?;
+        let Some(entry) = parts.get_mut(&key) else {
+            continue;
+        };
+        let index_name: String = row.try_get("idx").map_err(mysql_error)?;
+        // NULL for a functional key part (MySQL 8 `((lower(x)))`): kept as an
+        // Expression part so the key arity survives. STATISTICS.EXPRESSION
+        // would hold its text, but MySQL 8 has that column and MariaDB does
+        // not — no text (None) works on both.
+        let part = match row.try_get::<Option<String>, _>("col") {
+            Ok(Some(name)) => KeyPart::Named(name),
+            _ => KeyPart::Expression(None),
+        };
+        // The primary key is always named PRIMARY; its index is redundant with
+        // the pk column flags. (A pk part is always a real column.)
+        if index_name == "PRIMARY" {
+            if let KeyPart::Named(name) = part {
+                entry.pk.push(name);
+            }
+            continue;
+        }
+        let unique = row.try_get::<i64, _>("non_unique").unwrap_or(1) == 0;
+        push_index_column(&mut entry.indexes, index_name, part, unique);
+    }
+
+    let fks = sqlx::query(
+        // A foreign key may point at another database; qualify the parent then,
+        // the way PostgreSQL qualifies anything outside `public`.
+        "SELECT TABLE_NAME AS name, CONSTRAINT_NAME AS con, COLUMN_NAME AS col, \
+         IF(REFERENCED_TABLE_SCHEMA = DATABASE(), REFERENCED_TABLE_NAME, \
+            CONCAT(REFERENCED_TABLE_SCHEMA, '.', REFERENCED_TABLE_NAME)) AS ref_table, \
+         REFERENCED_COLUMN_NAME AS ref_col \
+         FROM information_schema.KEY_COLUMN_USAGE \
+         WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL \
+         AND (? IS NULL OR TABLE_NAME = ?) \
+         ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION",
+    )
+    .bind(table)
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(mysql_error)?;
+    // Rows are one key column each, ordered by table+constraint: a row either
+    // extends the fk being built or starts a new one. Grouped in a plain Vec
+    // first (like sqlite_fks), then attached — no bookkeeping across borrows.
+    let mut grouped: Vec<(String, String, SchemaFk)> = Vec::new();
+    for row in &fks {
+        let key: String = row.try_get("name").map_err(mysql_error)?;
+        let constraint: String = row.try_get("con").map_err(mysql_error)?;
+        let column: String = row.try_get("col").map_err(mysql_error)?;
+        let ref_table: String = row.try_get("ref_table").map_err(mysql_error)?;
+        let ref_column: String = row.try_get("ref_col").map_err(mysql_error)?;
+        match grouped.last_mut() {
+            Some((last_table, last_con, fk)) if *last_table == key && *last_con == constraint => {
+                fk.columns.push(column);
+                fk.ref_columns.push(ref_column);
+            }
+            _ => grouped.push((
+                key,
+                constraint,
+                SchemaFk {
+                    columns: vec![column],
+                    ref_table,
+                    ref_columns: vec![ref_column],
+                },
+            )),
+        }
+    }
+    for (key, _, fk) in grouped {
+        if let Some(entry) = parts.get_mut(&key) {
+            entry.fks.push(fk);
+        }
+    }
+
+    Ok(assemble(parts.into_iter().collect()))
 }
 
 fn decode_mysql_row(row: &MySqlRow) -> Result<Vec<Value>, EngineError> {

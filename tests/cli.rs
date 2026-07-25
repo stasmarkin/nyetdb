@@ -1191,6 +1191,436 @@ fn config_deny_functions_blocks_and_allow_functions_permits() {
     assert_ne!(v["error"]["code"], "NYET", "{v}");
 }
 
+// ---------------------------------------------------------------------------
+// nyet schema (SQLite end-to-end)
+// ---------------------------------------------------------------------------
+
+/// Build a database from raw DDL and a config pointing an alias `db` at it.
+fn schema_fixture(ddl: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("schema.db");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        use sqlx::ConnectOptions;
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .create_if_missing(true)
+            .connect()
+            .await
+            .unwrap();
+        for sql in ddl {
+            sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        sqlx::Connection::close(conn).await.unwrap();
+    });
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.db]\nengine = \"sqlite\"\npath = \"{}\"\nallowed_dirs = [\"{}\"]\n",
+            db.display(),
+            tmp.path().display()
+        ),
+    );
+    (tmp, cfg)
+}
+
+/// Tables covering every presentation rule: composite pk + composite fk,
+/// a single-column UNIQUE constraint, a multi-column unique index, a plain
+/// index, a defaulted column, an implicit `REFERENCES` and a view.
+const SCHEMA_DDL: &[&str] = &[
+    "CREATE TABLE orgs (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
+    "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, \
+     org_id INTEGER REFERENCES orgs, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE INDEX users_org_idx ON users(org_id)",
+    "CREATE TABLE memberships (org_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role TEXT, \
+     PRIMARY KEY (org_id, user_id), FOREIGN KEY (org_id, user_id) REFERENCES users(id, email))",
+    "CREATE UNIQUE INDEX memberships_role_idx ON memberships(role, org_id)",
+    "CREATE VIEW v_active AS SELECT id, email FROM users WHERE org_id IS NOT NULL",
+];
+
+#[test]
+fn schema_json_pins_the_full_shape() {
+    let (tmp, cfg) = schema_fixture(SCHEMA_DDL);
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["meta"]["table_count"], 4);
+    assert_eq!(v["meta"]["connection"], "db");
+    assert!(v["meta"]["duration_ms"].is_u64());
+    assert!(v.get("warnings").is_none(), "no warnings expected: {v}");
+    let tables = v["schema"]["tables"].as_array().unwrap();
+    // Ordered by name (deterministic), views included.
+    let names: Vec<&str> = tables.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["memberships", "orgs", "users", "v_active"]);
+
+    // Composite primary key marks every member; the composite fk keeps order;
+    // the multi-column unique index stays an index (unique: true).
+    assert_eq!(
+        tables[0],
+        serde_json::json!({
+            "name": "memberships", "kind": "table",
+            "columns": [
+                {"name": "org_id", "type": "INTEGER", "nullable": false, "pk": true},
+                {"name": "user_id", "type": "INTEGER", "nullable": false, "pk": true},
+                {"name": "role", "type": "TEXT", "nullable": true}
+            ],
+            "indexes": [{"name": "memberships_role_idx", "columns": ["role", "org_id"],
+                         "unique": true}],
+            "fks": [{"columns": ["org_id", "user_id"], "ref_table": "users",
+                     "ref_columns": ["id", "email"]}]
+        })
+    );
+    // A single-column UNIQUE becomes a column flag, its backing index is gone;
+    // `REFERENCES orgs` (no column list) resolves to the parent's primary key;
+    // a defaulted column reports the default verbatim.
+    assert_eq!(
+        tables[2],
+        serde_json::json!({
+            "name": "users", "kind": "table",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "nullable": false, "pk": true},
+                {"name": "email", "type": "TEXT", "nullable": false, "unique": true},
+                {"name": "org_id", "type": "INTEGER", "nullable": true},
+                {"name": "created_at", "type": "TEXT", "nullable": true,
+                 "default": "CURRENT_TIMESTAMP"}
+            ],
+            "indexes": [{"name": "users_org_idx", "columns": ["org_id"]}],
+            "fks": [{"columns": ["org_id"], "ref_table": "orgs", "ref_columns": ["id"]}]
+        })
+    );
+    // A view carries columns and neither indexes nor fks.
+    assert_eq!(tables[3]["kind"], "view");
+    assert!(tables[3]["columns"].is_array());
+    assert!(tables[3].get("indexes").is_none());
+    assert!(tables[3].get("fks").is_none());
+}
+
+#[test]
+fn schema_one_table_is_always_detailed() {
+    let (tmp, cfg) = schema_fixture(SCHEMA_DDL);
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["meta"]["table_count"], 1);
+    let tables = v["schema"]["tables"].as_array().unwrap();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0]["name"], "users");
+    assert!(tables[0]["columns"].is_array());
+}
+
+#[test]
+fn schema_listing_past_the_detail_limit_is_names_only_with_a_warning() {
+    // 51 objects (50 tables + a view) exceed the 50-object detail limit.
+    let mut ddl: Vec<String> = (0..50)
+        .map(|i| format!("CREATE TABLE t{i:02} (id INTEGER)"))
+        .collect();
+    ddl.push("CREATE VIEW v AS SELECT 1 AS x".to_string());
+    let refs: Vec<&str> = ddl.iter().map(String::as_str).collect();
+    let (tmp, cfg) = schema_fixture(&refs);
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["meta"]["table_count"], 51);
+    let tables = v["schema"]["tables"].as_array().unwrap();
+    assert_eq!(tables.len(), 51);
+    // Names and kinds only — nothing else.
+    assert_eq!(
+        tables[0],
+        serde_json::json!({"name": "t00", "kind": "table"})
+    );
+    assert_eq!(tables[50], serde_json::json!({"name": "v", "kind": "view"}));
+    assert_eq!(v["warnings"][0]["code"], "SCHEMA_TRUNCATED");
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    // Actionable (Д10): it names the way to the details.
+    assert!(message.contains("nyet schema db <table>"), "{message}");
+
+    // ...and asking for one of them still gives the full detail.
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "t07", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert!(v.get("warnings").is_none(), "{v}");
+    assert_eq!(v["schema"]["tables"][0]["columns"][0]["name"], "id");
+}
+
+#[test]
+fn schema_unknown_table_is_exit_7_and_sql_injection_is_just_a_missing_name() {
+    let (tmp, cfg) = schema_fixture(SCHEMA_DDL);
+    // The [table] argument is agent input: it is compared against the catalog,
+    // never interpolated — an injection attempt is only a name that matches
+    // nothing, and the fixture survives it.
+    for arg in [
+        "nope",
+        "users; DROP TABLE orgs",
+        "users'--",
+        "users' UNION SELECT 1--",
+        "') OR 1=1--",
+    ] {
+        let out = nyet(tmp.path())
+            .args(["schema", "db", arg, "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(7), "{arg}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "DB_ERROR", "{arg}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not found"),
+            "{v}"
+        );
+        assert!(
+            v["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("nyet schema db"),
+            "{v}"
+        );
+    }
+    // Every table is still there.
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["meta"]["table_count"], 4);
+}
+
+/// The cases where a naive reading of the catalog would invent a key that does
+/// not exist (or hide a column that does).
+#[test]
+fn schema_sqlite_edge_cases_are_not_faked() {
+    let (tmp, cfg) = schema_fixture(&[
+        "CREATE TABLE t (a TEXT, b TEXT, c TEXT, d TEXT UNIQUE, \
+         total INTEGER GENERATED ALWAYS AS (length(a)) STORED)",
+        // An expression key part: the index is two-part, so it must NOT look
+        // single-column (which would fold into a bogus `unique` on c).
+        "CREATE UNIQUE INDEX t_expr_idx ON t(lower(b), c)",
+        // Partial: uniqueness holds only for the predicate rows.
+        "CREATE UNIQUE INDEX t_partial_idx ON t(a) WHERE c IS NOT NULL",
+        // An inline multi-column UNIQUE — SQLite backs it with an autoindex,
+        // which survives (the column flags cannot express a composite key).
+        "CREATE TABLE u (x TEXT, y TEXT, UNIQUE (x, y))",
+        // A parent with no primary key: the reference cannot be resolved.
+        "CREATE TABLE p (a TEXT)",
+        "CREATE TABLE ch (p_id INTEGER REFERENCES p)",
+    ]);
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    let tables = v["schema"]["tables"].as_array().unwrap();
+    let table = |name: &str| {
+        tables
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing: {v}"))
+            .clone()
+    };
+
+    let t = table("t");
+    // A STORED generated column is a readable column (pragma_table_info hides
+    // it, table_xinfo does not).
+    assert_eq!(
+        t["columns"][4],
+        serde_json::json!({"name": "total", "type": "INTEGER", "nullable": true})
+    );
+    // The single-column UNIQUE constraint folded into the column flag...
+    assert_eq!(t["columns"][3]["name"], "d");
+    assert_eq!(t["columns"][3]["unique"], true);
+    // ...but neither the expression index nor the partial one may claim a key.
+    assert!(t["columns"][0].get("unique").is_none(), "a: {t}");
+    assert!(t["columns"][2].get("unique").is_none(), "c: {t}");
+    assert_eq!(
+        t["indexes"],
+        serde_json::json!([
+            {"name": "t_partial_idx", "columns": ["a"]},
+            {"name": "t_expr_idx", "columns": ["(expression)", "c"], "unique": true}
+        ])
+    );
+
+    // The inline composite UNIQUE stays an index, autoindex name and all.
+    assert_eq!(
+        table("u")["indexes"],
+        serde_json::json!([{"name": "sqlite_autoindex_u_1", "columns": ["x", "y"],
+                            "unique": true}])
+    );
+    // An unresolvable parent key is reported empty, not invented.
+    assert_eq!(
+        table("ch")["fks"],
+        serde_json::json!([{"columns": ["p_id"], "ref_table": "p", "ref_columns": []}])
+    );
+}
+
+#[test]
+fn schema_table_argument_is_case_insensitive_like_sqlite_itself() {
+    // `SELECT * FROM USERS` works against `users`, so `nyet schema db USERS`
+    // must too — the argument follows the engine's own name resolution.
+    let (tmp, cfg) = schema_fixture(SCHEMA_DDL);
+    for arg in ["users", "USERS", "Users"] {
+        let out = nyet(tmp.path())
+            .args(["schema", "db", arg, "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{arg}: {}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["schema"]["tables"][0]["name"], "users", "{arg}");
+    }
+}
+
+#[test]
+fn schema_table_format_puts_the_envelope_on_stderr() {
+    let (tmp, cfg) = schema_fixture(SCHEMA_DDL);
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "orgs", "--format", "table", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "orgs table\n  id    INTEGER  not null  pk\n  name  TEXT     not null  unique\n"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["meta"]["table_count"], 1);
+    assert!(
+        v.get("schema").is_none(),
+        "table envelope carries no schema"
+    );
+}
+
+#[test]
+fn schema_mirrors_the_list_format_conventions() {
+    // json|table only (jsonl/csv are row-stream formats -> usage error)...
+    let (tmp, cfg) = schema_fixture(SCHEMA_DDL);
+    for format in ["jsonl", "csv"] {
+        let out = nyet(tmp.path())
+            .args(["schema", "db", "--format", format, "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{format}");
+    }
+    // ...and a jsonl/csv [defaults].format degrades to json instead of failing.
+    for format in ["jsonl", "csv"] {
+        let (tmp, cfg) = schema_fixture(SCHEMA_DDL);
+        let text = format!(
+            "[defaults]\nformat = \"{format}\"\n{}",
+            fs::read_to_string(&cfg).unwrap()
+        );
+        fs::write(&cfg, text).unwrap();
+        let out = nyet(tmp.path())
+            .args(["schema", "db", "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{format}: {}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert!(v["schema"]["tables"].is_array(), "{v}");
+    }
+}
+
+#[test]
+fn schema_pipeline_order_matches_query() {
+    // alias -> scoping -> engine support, exactly like query.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(tmp.path(), &two_conn_config(tmp.path()));
+    // Unknown alias -> exit 3.
+    let out = nyet(tmp.path())
+        .args(["schema", "nope", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(error_envelope(&out)["error"]["code"], "CONFIG_INVALID");
+    // Known alias, denied from cwd -> exit 4.
+    let out = nyet(tmp.path())
+        .args(["schema", "prod", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(error_envelope(&out)["error"]["code"], "DIR_NOT_ALLOWED");
+    // Allowed, but the engine is not supported yet -> exit 1.
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.r]\nengine = \"redis\"\nurl = \"redis://h:6379\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["schema", "r", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(error_envelope(&out)["error"]["code"], "NOT_IMPLEMENTED");
+    // A missing database file is a connection failure, like query -> exit 6.
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.db]\nengine = \"sqlite\"\npath = \"{}/absent.db\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            tmp.path().display(),
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6));
+    assert_eq!(error_envelope(&out)["error"]["code"], "CONNECTION_FAILED");
+}
+
 #[cfg(unix)]
 #[test]
 fn loose_permissions_warn_on_stderr_but_do_not_fail() {

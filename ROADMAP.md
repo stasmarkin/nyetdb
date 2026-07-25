@@ -89,7 +89,7 @@ introspection, auto-guardrail через EXPLAIN). Ниша подтвержде
 
 ### v0.3 — agent UX (ключевые дифференциаторы)
 
-- [ ] `nyet schema <alias> [table]` — компактный introspection (таблицы,
+- [x] `nyet schema <alias> [table]` — компактный introspection (таблицы,
       колонки, индексы, FK), токен-оптимизированный формат
 - [ ] `nyet explain` — EXPLAIN с человекочитаемым вердиктом
 - [ ] Auto-guardrail: EXPLAIN перед тяжёлым запросом; стоимость выше порога →
