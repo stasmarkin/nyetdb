@@ -52,6 +52,24 @@ fn connect_deadline(statement_timeout_ms: u64) -> Duration {
     )
 }
 
+/// Client-side query-phase timeout: the query ran past the effective per-query
+/// budget (the in-process tokio timer that wraps the fetch loop, AFTER a
+/// successful connect). Distinct from a server-cancelled query only in wording;
+/// both are `EngineError::Timeout` (exit 8). For SQLite this is the ONLY query
+/// bound (no server timeout); for Postgres/MySQL it backstops the server-side
+/// statement_timeout so the exit code is deterministic whichever fires.
+fn client_timeout(query_timeout_ms: u64) -> EngineError {
+    EngineError::Timeout {
+        message: format!(
+            "the query did not finish within the {}s timeout",
+            query_timeout_ms / 1000
+        ),
+        hint: "narrow the query (WHERE / LIMIT), or raise --timeout or timeout_secs \
+               in the config"
+            .to_string(),
+    }
+}
+
 /// The one planned abstraction of the project (Д5). Fetches at most
 /// `fetch_limit` rows; the caller passes limit+1 to detect truncation.
 pub trait Engine {
@@ -62,6 +80,10 @@ pub trait Engine {
 /// even a write that slipped past the validator fails in the database).
 pub struct Sqlite {
     pub path: PathBuf,
+    /// The effective per-query wall budget in ms. SQLite has no server-side
+    /// timeout, so this in-process deadline (wrapping the fetch) is the only
+    /// query bound — the cli no longer wraps `execute` in an outer timeout.
+    pub query_timeout_ms: u64,
 }
 
 impl Engine for Sqlite {
@@ -111,41 +133,56 @@ impl Engine for Sqlite {
                 ),
                 hint: "check that the file is a readable SQLite database".to_string(),
             })?;
-        let mut columns: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        {
-            // AssertSqlSafe is sqlx's marker for "audited dynamic SQL":
-            // running caller-supplied SQL is nyet's whole job, and the audit
-            // is the validator + the read-only open mode.
-            let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql.to_string())).fetch(&mut conn);
-            while (rows.len() as u64) < fetch_limit {
-                match stream.try_next().await.map_err(db_error)? {
-                    Some(row) => {
-                        if columns.is_empty() {
-                            columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+        // Bound the QUERY phase (not the local file open above) on the effective
+        // per-query budget: sqlite has no server-side timeout, so this in-process
+        // deadline is the only query bound. On expiry the fetch future is dropped
+        // and we report Timeout (exit 8); the sqlite worker thread may keep
+        // grinding until the process exits (the cli calls shutdown_background),
+        // so on the timeout path we do NOT await the connection afterwards.
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, async move {
+            let mut columns: Vec<String> = Vec::new();
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            {
+                // AssertSqlSafe is sqlx's marker for "audited dynamic SQL":
+                // running caller-supplied SQL is nyet's whole job, and the audit
+                // is the validator + the read-only open mode.
+                let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql.to_string())).fetch(&mut conn);
+                while (rows.len() as u64) < fetch_limit {
+                    match stream.try_next().await.map_err(db_error)? {
+                        Some(row) => {
+                            if columns.is_empty() {
+                                columns =
+                                    row.columns().iter().map(|c| c.name().to_string()).collect();
+                            }
+                            rows.push(decode_row(&row)?);
                         }
-                        rows.push(decode_row(&row)?);
+                        None => break,
                     }
-                    None => break,
                 }
             }
-        }
-        // No rows -> no column names from the stream; ask the prepared
-        // statement so table output can still print a header. Best effort:
-        // a prepare failure leaves columns empty.
-        if rows.is_empty() && columns.is_empty() {
-            use sqlx::{Executor, SqlSafeStr, Statement};
-            let sql_str = sqlx::AssertSqlSafe(sql.to_string()).into_sql_str();
-            if let Ok(statement) = conn.prepare(sql_str).await {
-                columns = statement
-                    .columns()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect();
+            // No rows -> no column names from the stream; ask the prepared
+            // statement so table output can still print a header. Best effort:
+            // a prepare failure leaves columns empty.
+            if rows.is_empty() && columns.is_empty() {
+                use sqlx::{Executor, SqlSafeStr, Statement};
+                let sql_str = sqlx::AssertSqlSafe(sql.to_string()).into_sql_str();
+                if let Ok(statement) = conn.prepare(sql_str).await {
+                    columns = statement
+                        .columns()
+                        .iter()
+                        .map(|c| c.name().to_string())
+                        .collect();
+                }
             }
+            let _ = conn.close().await;
+            Ok::<ResultSet, EngineError>(ResultSet { columns, rows })
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
-        let _ = conn.close().await;
-        Ok(ResultSet { columns, rows })
     }
 }
 
@@ -162,6 +199,10 @@ pub struct Postgres {
     pub password: Option<String>,
     /// Server-side statement_timeout, from the effective per-query timeout.
     pub statement_timeout_ms: u64,
+    /// The effective per-query wall budget in ms: the in-process deadline that
+    /// wraps the query phase (AFTER connect), backstopping the server-side
+    /// statement_timeout so a runaway query is TIMEOUT (exit 8) whichever fires.
+    pub query_timeout_ms: u64,
     /// When an SSH tunnel is up, `(127.0.0.1, local_port)` to connect through
     /// instead of the url's host/port. User/dbname/params from the url stay.
     pub host_override: Option<(String, u16)>,
@@ -178,9 +219,11 @@ pub struct Postgres {
 /// IO — so it is unit-tested without a database.
 ///
 /// Also forces `sslmode=disable` on the tunnel leg: the hop to 127.0.0.1 is
-/// already encrypted by the ssh tunnel, and this build of sqlx has no TLS
-/// backend — a prod url carrying `sslmode=require` would otherwise fail the
-/// connect with a misleading "check host/creds" error.
+/// already encrypted by the ssh tunnel, and TLS verification against the
+/// loopback address would fail anyway (the server cert names the real host, not
+/// 127.0.0.1). The DIRECT path (`None`) is left untouched, so the `sslmode` from
+/// the url is honored by sqlx's rustls backend (prefer/require/verify-ca/
+/// verify-full all work).
 fn apply_host_override(
     opts: PgConnectOptions,
     host_override: &Option<(String, u16)>,
@@ -239,57 +282,71 @@ impl Engine for Postgres {
             }
         };
 
-        // Explicit read-only transaction (belt and suspenders over the session
-        // default): the read runs inside it, and a smuggled write is rejected.
-        {
-            use sqlx::Executor;
-            conn.execute("BEGIN READ ONLY").await.map_err(pg_error)?;
-        }
+        // Bound the QUERY phase on the effective per-query budget (connect above
+        // has its OWN generous deadline). Keeping the two timers separate means a
+        // slow/hung connect is always CONNECTION_FAILED (exit 6) and only a slow
+        // QUERY is TIMEOUT (exit 8), deterministic regardless of --timeout size.
+        // Complements the server statement_timeout (57014); whichever fires, 8.
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, async move {
+            // Explicit read-only transaction (belt and suspenders over the
+            // session default): the read runs inside it, a smuggled write fails.
+            {
+                use sqlx::Executor;
+                conn.execute("BEGIN READ ONLY").await.map_err(pg_error)?;
+            }
 
-        let mut columns: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        let fetched = {
-            let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql.to_string())).fetch(&mut conn);
-            loop {
-                if (rows.len() as u64) >= fetch_limit {
-                    break Ok(());
-                }
-                match stream.try_next().await {
-                    Ok(Some(row)) => {
-                        if columns.is_empty() {
-                            columns = row.columns().iter().map(|c| c.name().to_string()).collect();
-                        }
-                        match decode_pg_row(&row) {
-                            Ok(r) => rows.push(r),
-                            Err(e) => break Err(e),
-                        }
+            let mut columns: Vec<String> = Vec::new();
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            let fetched = {
+                let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql.to_string())).fetch(&mut conn);
+                loop {
+                    if (rows.len() as u64) >= fetch_limit {
+                        break Ok(());
                     }
-                    Ok(None) => break Ok(()),
-                    Err(e) => break Err(pg_error(e)),
+                    match stream.try_next().await {
+                        Ok(Some(row)) => {
+                            if columns.is_empty() {
+                                columns =
+                                    row.columns().iter().map(|c| c.name().to_string()).collect();
+                            }
+                            match decode_pg_row(&row) {
+                                Ok(r) => rows.push(r),
+                                Err(e) => break Err(e),
+                            }
+                        }
+                        Ok(None) => break Ok(()),
+                        Err(e) => break Err(pg_error(e)),
+                    }
+                }
+            };
+            // Empty result -> no columns from the stream; ask the prepared
+            // statement so table/csv output still has a header (best effort).
+            if fetched.is_ok() && rows.is_empty() && columns.is_empty() {
+                use sqlx::{Executor, SqlSafeStr, Statement};
+                let sql_str = sqlx::AssertSqlSafe(sql.to_string()).into_sql_str();
+                if let Ok(statement) = conn.prepare(sql_str).await {
+                    columns = statement
+                        .columns()
+                        .iter()
+                        .map(|c| c.name().to_string())
+                        .collect();
                 }
             }
-        };
-        // Empty result -> no columns from the stream; ask the prepared
-        // statement so table/csv output still has a header (best effort).
-        if fetched.is_ok() && rows.is_empty() && columns.is_empty() {
-            use sqlx::{Executor, SqlSafeStr, Statement};
-            let sql_str = sqlx::AssertSqlSafe(sql.to_string()).into_sql_str();
-            if let Ok(statement) = conn.prepare(sql_str).await {
-                columns = statement
-                    .columns()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect();
+            // Read-only: nothing to persist, so rollback (cheaper than commit).
+            {
+                use sqlx::Executor;
+                let _ = conn.execute("ROLLBACK").await;
             }
-        }
-        // Read-only: nothing to persist, so rollback (cheaper than commit).
+            let _ = conn.close().await;
+            fetched?;
+            Ok::<ResultSet, EngineError>(ResultSet { columns, rows })
+        })
+        .await
         {
-            use sqlx::Executor;
-            let _ = conn.execute("ROLLBACK").await;
+            Ok(r) => r,
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
-        let _ = conn.close().await;
-        fetched?;
-        Ok(ResultSet { columns, rows })
     }
 }
 
@@ -385,17 +442,68 @@ fn number_or_string(x: f64) -> Value {
 }
 
 /// Connection/auth failures -> CONNECTION_FAILED (exit 6). The driver's
-/// message names the failing user on auth errors but never the password.
+/// message names the failing user on auth errors but never the password. A TLS
+/// handshake/cert failure gets a TLS-specific hint (pointing at sslmode and the
+/// server certificate) instead of the misleading "check host/creds" one.
 fn pg_connect_error(e: sqlx::Error) -> EngineError {
     EngineError::Connect {
         message: format!(
             "cannot connect to the PostgreSQL database: {}",
             error_text(&e)
         ),
-        hint: "check the host/port in `url` and the credentials; set password_env to the \
-               env var holding the password for this connection"
-            .to_string(),
+        hint: if is_tls_error(&e) {
+            tls_hint()
+        } else {
+            "check the host/port in `url` and the credentials; set password_env to the \
+             env var holding the password for this connection"
+                .to_string()
+        },
     }
+}
+
+/// True when a DIRECT server connection's transport is NOT guaranteed encrypted
+/// and verified: the url's `sslmode`/`ssl-mode` is below `require`/`REQUIRED`
+/// (absent -> the sqlx default `prefer`/`preferred`, which uses TLS only if the
+/// server offers it and otherwise silently falls back to plaintext). Static —
+/// it parses the url only, no server round-trip — so over-warning against a
+/// server that happens to negotiate TLS is accepted: we report the *guarantee*,
+/// not the runtime outcome. SQLite and unparseable urls -> false (the cli gates
+/// this on a server engine, and a bad url fails later at connect anyway).
+pub fn transport_below_require(engine: &str, url: &str) -> bool {
+    match engine {
+        "postgres" => url.parse::<PgConnectOptions>().is_ok_and(|o| {
+            matches!(
+                o.get_ssl_mode(),
+                PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer
+            )
+        }),
+        "mysql" | "mariadb" => url.parse::<MySqlConnectOptions>().is_ok_and(|o| {
+            matches!(
+                o.get_ssl_mode(),
+                MySqlSslMode::Disabled | MySqlSslMode::Preferred
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// A TLS handshake / certificate-verification failure (`sqlx::Error::Tls`).
+/// Its Display describes the cert/handshake problem and never carries the url
+/// or password, so it is safe to surface via `error_text`.
+fn is_tls_error(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Tls(_))
+}
+
+/// Shared hint for a TLS failure on the direct (non-tunnelled) leg. Neutral by
+/// design: `sqlx::Error::Tls` covers BOTH "the server does not support TLS" (so
+/// require/verify-* cannot be satisfied) and "the certificate failed
+/// verification" — without reliably distinguishing them, so the hint names both
+/// causes rather than always advising to relax the mode.
+fn tls_hint() -> String {
+    "TLS could not be established: the server may not support TLS, or its certificate \
+     failed verification — check the server's TLS config and the sslmode/ssl-mode in `url` \
+     (for a private CA point sslrootcert=/ssl-ca= at its certificate)"
+        .to_string()
 }
 
 /// Query-time errors. The server's own statement_timeout (57014) maps to
@@ -446,6 +554,11 @@ pub struct Mysql {
     /// The per-query wall budget in ms (MySQL `max_execution_time`; the MariaDB
     /// `max_statement_time` is the same budget in seconds).
     pub statement_timeout_ms: u64,
+    /// The effective per-query wall budget in ms: the in-process deadline that
+    /// wraps the query phase (AFTER connect), backstopping the server-side
+    /// max_execution_time/max_statement_time so a runaway query is TIMEOUT
+    /// (exit 8) whichever fires.
+    pub query_timeout_ms: u64,
     /// When an SSH tunnel is up, `(127.0.0.1, local_port)` to connect through.
     pub host_override: Option<(String, u16)>,
     /// Test-only override for the connect handshake deadline (ms); see the same
@@ -455,7 +568,10 @@ pub struct Mysql {
 
 /// Redirect host+port to the tunnel's local end while keeping user/db/params
 /// from the url; force `ssl_mode=Disabled` on the tunnel leg (the ssh hop
-/// already encrypts and this build has no TLS backend). Pure — unit-tested.
+/// already encrypts, and TLS verification against 127.0.0.1 would fail against a
+/// cert naming the real host). The DIRECT path (`None`) is left untouched, so
+/// the `ssl-mode` from the url is honored by sqlx's rustls backend. Pure —
+/// unit-tested.
 fn apply_mysql_host_override(
     opts: MySqlConnectOptions,
     host_override: &Option<(String, u16)>,
@@ -500,86 +616,102 @@ impl Engine for Mysql {
             }
         };
 
-        // Layer 2, part 1: the server-side statement timeout. MySQL and MariaDB
-        // use different, mutually exclusive variables (ms vs seconds), so set
-        // BOTH and swallow the wrong-flavor ER_UNKNOWN_SYSTEM_VARIABLE (1193) on
-        // each independently — the real server always ends up capped regardless
-        // of the config label.
-        {
-            use sqlx::Executor;
-            let secs = (self.statement_timeout_ms / 1000).max(1);
-            for stmt in [
-                // MySQL milliseconds; MariaDB seconds. (>= 1; 0 = "no limit".)
-                format!(
-                    "SET SESSION max_execution_time = {}",
-                    self.statement_timeout_ms.max(1)
-                ),
-                format!("SET SESSION max_statement_time = {secs}"),
-            ] {
-                if let Err(e) = conn.execute(sqlx::AssertSqlSafe(stmt)).await {
-                    if !is_unknown_var(&e) {
-                        let _ = conn.close().await;
-                        return Err(mysql_error(e));
-                    }
-                }
-            }
-        }
-
-        // Layer 2, part 2: the explicit read-only transaction; a smuggled write
-        // is rejected by the database itself.
-        {
-            use sqlx::Executor;
-            conn.execute("START TRANSACTION READ ONLY")
-                .await
-                .map_err(mysql_error)?;
-        }
-
-        // ponytail: the fetch loop / empty-columns-via-prepare / rollback+close
-        // tail below is structurally the same as Postgres's (only the row-decode
-        // and error-map fns differ). Extract a shared `stream_rows` helper if a
-        // third server engine lands — two copies isn't worth a generic yet.
-        let mut columns: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        let fetched = {
-            let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql.to_string())).fetch(&mut conn);
-            loop {
-                if (rows.len() as u64) >= fetch_limit {
-                    break Ok(());
-                }
-                match stream.try_next().await {
-                    Ok(Some(row)) => {
-                        if columns.is_empty() {
-                            columns = row.columns().iter().map(|c| c.name().to_string()).collect();
-                        }
-                        match decode_mysql_row(&row) {
-                            Ok(r) => rows.push(r),
-                            Err(e) => break Err(e),
+        // Bound the QUERY phase (everything below, after a successful connect)
+        // on the effective per-query budget; connect above has its own generous
+        // deadline. Split timers => a slow/hung connect is CONNECTION_FAILED
+        // (exit 6) and only a slow QUERY is TIMEOUT (exit 8), deterministic
+        // regardless of --timeout size. Backstops the server-side
+        // max_execution_time/max_statement_time; whichever fires, exit 8.
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, async move {
+            // Layer 2, part 1: the server-side statement timeout. MySQL and
+            // MariaDB use different, mutually exclusive variables (ms vs seconds),
+            // so set BOTH and swallow the wrong-flavor ER_UNKNOWN_SYSTEM_VARIABLE
+            // (1193) on each independently — the real server always ends up capped
+            // regardless of the config label.
+            {
+                use sqlx::Executor;
+                let secs = (self.statement_timeout_ms / 1000).max(1);
+                for stmt in [
+                    // MySQL milliseconds; MariaDB seconds. (>= 1; 0 = "no limit".)
+                    format!(
+                        "SET SESSION max_execution_time = {}",
+                        self.statement_timeout_ms.max(1)
+                    ),
+                    format!("SET SESSION max_statement_time = {secs}"),
+                ] {
+                    if let Err(e) = conn.execute(sqlx::AssertSqlSafe(stmt)).await {
+                        if !is_unknown_var(&e) {
+                            let _ = conn.close().await;
+                            return Err(mysql_error(e));
                         }
                     }
-                    Ok(None) => break Ok(()),
-                    Err(e) => break Err(mysql_error(e)),
                 }
             }
-        };
-        // Empty result -> ask the prepared statement for columns (best effort).
-        if fetched.is_ok() && rows.is_empty() && columns.is_empty() {
-            use sqlx::{Executor, SqlSafeStr, Statement};
-            let sql_str = sqlx::AssertSqlSafe(sql.to_string()).into_sql_str();
-            if let Ok(statement) = conn.prepare(sql_str).await {
-                columns = statement
-                    .columns()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect();
+
+            // Layer 2, part 2: the explicit read-only transaction; a smuggled
+            // write is rejected by the database itself.
+            {
+                use sqlx::Executor;
+                conn.execute("START TRANSACTION READ ONLY")
+                    .await
+                    .map_err(mysql_error)?;
             }
-        }
+
+            // ponytail: the fetch loop / empty-columns-via-prepare / rollback+close
+            // tail below is structurally the same as Postgres's (only the
+            // row-decode and error-map fns differ). Extract a shared `stream_rows`
+            // helper if a third server engine lands — two copies isn't worth a
+            // generic yet.
+            let mut columns: Vec<String> = Vec::new();
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            let fetched = {
+                let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql.to_string())).fetch(&mut conn);
+                loop {
+                    if (rows.len() as u64) >= fetch_limit {
+                        break Ok(());
+                    }
+                    match stream.try_next().await {
+                        Ok(Some(row)) => {
+                            if columns.is_empty() {
+                                columns =
+                                    row.columns().iter().map(|c| c.name().to_string()).collect();
+                            }
+                            match decode_mysql_row(&row) {
+                                Ok(r) => rows.push(r),
+                                Err(e) => break Err(e),
+                            }
+                        }
+                        Ok(None) => break Ok(()),
+                        Err(e) => break Err(mysql_error(e)),
+                    }
+                }
+            };
+            // Empty result -> ask the prepared statement for columns (best effort).
+            if fetched.is_ok() && rows.is_empty() && columns.is_empty() {
+                use sqlx::{Executor, SqlSafeStr, Statement};
+                let sql_str = sqlx::AssertSqlSafe(sql.to_string()).into_sql_str();
+                if let Ok(statement) = conn.prepare(sql_str).await {
+                    columns = statement
+                        .columns()
+                        .iter()
+                        .map(|c| c.name().to_string())
+                        .collect();
+                }
+            }
+            {
+                use sqlx::Executor;
+                let _ = conn.execute("ROLLBACK").await;
+            }
+            let _ = conn.close().await;
+            fetched?;
+            Ok::<ResultSet, EngineError>(ResultSet { columns, rows })
+        })
+        .await
         {
-            use sqlx::Executor;
-            let _ = conn.execute("ROLLBACK").await;
+            Ok(r) => r,
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
         }
-        let _ = conn.close().await;
-        fetched?;
-        Ok(ResultSet { columns, rows })
     }
 }
 
@@ -672,9 +804,13 @@ fn decode_mysql_text_fallback(row: &MySqlRow, i: usize, ty: &str) -> Result<Valu
 fn mysql_connect_error(e: sqlx::Error) -> EngineError {
     EngineError::Connect {
         message: format!("cannot connect to the MySQL database: {}", error_text(&e)),
-        hint: "check the host/port in `url` and the credentials; set password_env to the \
-               env var holding the password for this connection"
-            .to_string(),
+        hint: if is_tls_error(&e) {
+            tls_hint()
+        } else {
+            "check the host/port in `url` and the credentials; set password_env to the \
+             env var holding the password for this connection"
+                .to_string()
+        },
     }
 }
 
@@ -815,7 +951,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("t.db");
         make_db(&db);
-        let engine = Sqlite { path: db };
+        let engine = Sqlite {
+            path: db,
+            query_timeout_ms: 30_000,
+        };
         let err = block_on(engine.execute("INSERT INTO t (id) VALUES (99)", 10)).err();
         match err {
             Some(EngineError::Db { message, .. }) => {
@@ -842,8 +981,10 @@ mod tests {
         assert_eq!(opts.get_port(), 61234);
         assert_eq!(opts.get_username(), "nyet_ro");
         assert_eq!(opts.get_database(), Some("app"));
-        // sslmode forced to disable on the tunnel leg (no TLS backend; the ssh
-        // tunnel already encrypts the loopback hop).
+        // sslmode forced to disable on the tunnel leg (the ssh tunnel already
+        // encrypts the loopback hop; TLS verification against 127.0.0.1 would
+        // fail anyway). The direct leg honors the url's sslmode — see the
+        // container tests.
         assert!(matches!(opts.get_ssl_mode(), PgSslMode::Disable));
         // None -> unchanged.
         let opts2: PgConnectOptions = "postgres://u@h:6000/d".parse().unwrap();
@@ -857,7 +998,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("t.db");
         make_db(&db);
-        let engine = Sqlite { path: db };
+        let engine = Sqlite {
+            path: db,
+            query_timeout_ms: 30_000,
+        };
         let rs = block_on(engine.execute("SELECT * FROM t ORDER BY id", 10))
             .ok()
             .unwrap();
@@ -882,7 +1026,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("t.db");
         make_db(&db);
-        let engine = Sqlite { path: db };
+        let engine = Sqlite {
+            path: db,
+            query_timeout_ms: 30_000,
+        };
         let rs = block_on(engine.execute("SELECT id FROM t", 1))
             .ok()
             .unwrap();
@@ -894,7 +1041,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("t.db");
         make_db(&db);
-        let engine = Sqlite { path: db };
+        let engine = Sqlite {
+            path: db,
+            query_timeout_ms: 30_000,
+        };
         // CAST(x'80ff' AS TEXT): a TEXT value that is not valid UTF-8 —
         // must come back with replacement chars, not fail the query.
         let rs = block_on(engine.execute("SELECT CAST(x'80ff' AS TEXT) AS t", 10))
@@ -908,7 +1058,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("t.db");
         make_db(&db);
-        let engine = Sqlite { path: db };
+        let engine = Sqlite {
+            path: db,
+            query_timeout_ms: 30_000,
+        };
         let rs = block_on(engine.execute("SELECT id, name FROM t WHERE 0 = 1", 10))
             .ok()
             .unwrap();
@@ -920,6 +1073,7 @@ mod tests {
     fn missing_file_is_connect_error() {
         let engine = Sqlite {
             path: PathBuf::from("/no/such/file.db"),
+            query_timeout_ms: 30_000,
         };
         match block_on(engine.execute("SELECT 1", 10)) {
             Err(EngineError::Connect { message, hint }) => {
@@ -928,6 +1082,73 @@ mod tests {
             }
             _ => panic!("missing file must be a Connect error"),
         }
+    }
+
+    /// The query-phase timeout now lives INSIDE `execute` (the cli no longer
+    /// wraps it in an outer timeout), and for sqlite it is the ONLY query bound
+    /// (no server-side timeout). A heavy recursive CTE with a tiny budget must
+    /// map to Timeout (exit 8). No Docker. The runtime is shut down in the
+    /// background (like the cli) so the abandoned sqlite worker — which keeps
+    /// grinding the CTE until it finishes — does not block the test.
+    #[test]
+    fn sqlite_query_timeout_maps_to_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("t.db");
+        make_db(&db);
+        let engine = Sqlite {
+            path: db,
+            query_timeout_ms: 150,
+        };
+        // Bounded-but-huge recursive CTE: far more than 150ms of work, yet
+        // finite so the background worker eventually stops on its own.
+        let sql = "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c \
+                   WHERE n < 50000000) SELECT count(*) FROM c";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(engine.execute(sql, 10));
+        rt.shutdown_background();
+        match result {
+            Err(EngineError::Timeout { .. }) => {}
+            other => {
+                panic!("a heavy query past the in-process budget must be Timeout, got {other:?}")
+            }
+        }
+    }
+
+    /// The INSECURE_TRANSPORT decision (pure, no network): a url whose
+    /// sslmode/ssl-mode is absent or below require flags true; require and
+    /// stricter flag false. The cli additionally gates it on there being no ssh
+    /// tunnel.
+    #[test]
+    fn transport_below_require_flags_weak_sslmodes() {
+        // Absent -> sqlx default (prefer/preferred) -> below require -> warn.
+        assert!(transport_below_require("mysql", "mysql://u@h:3306/db"));
+        assert!(transport_below_require("mariadb", "mysql://u@h:3306/db"));
+        assert!(transport_below_require(
+            "postgres",
+            "postgres://u@h:5432/db"
+        ));
+        // Explicitly forced at/above require -> no warn.
+        assert!(!transport_below_require(
+            "mysql",
+            "mysql://u@h:3306/db?ssl-mode=REQUIRED"
+        ));
+        assert!(!transport_below_require(
+            "mysql",
+            "mysql://u@h:3306/db?ssl-mode=VERIFY_IDENTITY"
+        ));
+        assert!(!transport_below_require(
+            "postgres",
+            "postgres://u@h:5432/db?sslmode=require"
+        ));
+        assert!(!transport_below_require(
+            "postgres",
+            "postgres://u@h:5432/db?sslmode=verify-full"
+        ));
+        // sqlite / unknown engine -> never (no network transport to warn about).
+        assert!(!transport_below_require("sqlite", ""));
     }
 
     // --- PostgreSQL: needs Docker (colima). Requires a reachable daemon;
@@ -973,6 +1194,11 @@ mod tests {
             url: format!("postgres://postgres@127.0.0.1:{port}/postgres"),
             password: Some("postgres".to_string()),
             statement_timeout_ms: 30_000,
+            // Tiny QUERY budget on purpose: it must NOT misclassify a slow/hung
+            // CONNECT as a query Timeout. The query timer is armed only after a
+            // successful connect, which never happens here — the connect deadline
+            // (500ms) fires first -> Connect (exit 6), not Timeout (exit 8).
+            query_timeout_ms: 100,
             host_override: None,
             connect_timeout_ms: Some(500), // short so the hang test finishes fast
         };
@@ -1027,6 +1253,7 @@ mod tests {
                 url: url.clone(),
                 password: Some("postgres".to_string()),
                 statement_timeout_ms: 30_000,
+                query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
             };
@@ -1127,11 +1354,14 @@ mod tests {
                 .unwrap();
             assert_eq!(rs.rows.len(), 1);
 
-            // Server statement_timeout (57014) maps to Timeout, not Db.
+            // Server statement_timeout (57014) maps to Timeout, not Db. The
+            // client query timer is left generous (30s) so the SERVER cancels
+            // first — this test still proves the 57014 path, not the client one.
             let slow = Postgres {
                 url: url.clone(),
                 password: Some("postgres".to_string()),
                 statement_timeout_ms: 300,
+                query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
             };
@@ -1144,6 +1374,30 @@ mod tests {
             {
                 Err(EngineError::Timeout { .. }) => {}
                 _ => panic!("server statement_timeout must map to EngineError::Timeout"),
+            }
+
+            // The rustls backend makes `sslmode` honored on the DIRECT leg: this
+            // alpine container runs with ssl=off, so `sslmode=require` MUST fail
+            // the connect (proof that `require` is enforced, not silently ignored
+            // / downgraded to plaintext) and carries a TLS-specific hint.
+            let tls_required = Postgres {
+                url: format!("postgres://postgres@127.0.0.1:{port}/postgres?sslmode=require"),
+                password: Some("postgres".to_string()),
+                statement_timeout_ms: 30_000,
+                query_timeout_ms: 30_000,
+                host_override: None,
+                connect_timeout_ms: None,
+            };
+            match tls_required.execute("SELECT 1", 10).await {
+                Err(EngineError::Connect { hint, .. }) => {
+                    assert!(
+                        hint.contains("TLS"),
+                        "require without server TLS wants a TLS hint: {hint}"
+                    )
+                }
+                other => panic!(
+                    "sslmode=require against a non-TLS server must fail to connect, got {other:?}"
+                ),
             }
 
             drop(container);
@@ -1161,7 +1415,8 @@ mod tests {
         assert_eq!(opts.get_port(), 61234);
         assert_eq!(opts.get_username(), "nyet_ro");
         assert_eq!(opts.get_database(), Some("app"));
-        // sslmode forced to Disabled on the tunnel leg (no TLS backend).
+        // sslmode forced to Disabled on the tunnel leg (ssh already encrypts;
+        // the direct leg honors the url's ssl-mode — see the container tests).
         assert!(matches!(opts.get_ssl_mode(), MySqlSslMode::Disabled));
         // None -> unchanged.
         let opts2: MySqlConnectOptions = "mysql://u@h:6000/d".parse().unwrap();
@@ -1190,6 +1445,10 @@ mod tests {
             url: format!("mysql://root@127.0.0.1:{port}/test"),
             password: None,
             statement_timeout_ms: 30_000,
+            // Tiny QUERY budget on purpose: a slow/hung CONNECT must stay
+            // Connect (exit 6), never a query Timeout — the query timer arms
+            // only after connect, which never completes here.
+            query_timeout_ms: 100,
             host_override: None,
             connect_timeout_ms: Some(500), // short so the hang test finishes fast
         };
@@ -1250,6 +1509,7 @@ mod tests {
                 url: url.clone(),
                 password: None,
                 statement_timeout_ms: 30_000,
+                query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
             };
@@ -1346,6 +1606,10 @@ mod tests {
                 url: url.clone(),
                 password: None,
                 statement_timeout_ms: 1000,
+                // Generous client timer so the SERVER max_execution_time /
+                // max_statement_time cancels first — preserves the server-path
+                // proof; the client timer is just the backstop.
+                query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
             };
@@ -1365,10 +1629,73 @@ mod tests {
         });
     }
 
+    /// TLS + `caching_sha2_password` + a real password — the headline win of the
+    /// rustls backend. MySQL 8 auto-generates a self-signed server cert and
+    /// enables TLS at init; a `caching_sha2_password` user (the 8.x default auth
+    /// plugin) can send its password over the encrypted channel. `ssl-mode=REQUIRED`
+    /// demands TLS but does NOT verify the CA, so the self-signed cert is accepted.
+    /// Before the TLS feature this exact connection failed at auth (the removed
+    /// "MySQL 8 password needs TLS" limitation) — this is the direct-leg proof.
+    #[test]
+    fn mysql8_caching_sha2_password_over_tls() {
+        use sqlx::Executor;
+        use testcontainers_modules::mysql::Mysql as MysqlImage;
+        use testcontainers_modules::testcontainers::runners::AsyncRunner;
+        use testcontainers_modules::testcontainers::ImageExt;
+
+        pg_block_on(async {
+            let container = MysqlImage::default()
+                .with_tag("8.4")
+                .start()
+                .await
+                .expect("start mysql:8.4 (is docker/colima running?)");
+            let port = container.get_host_port_ipv4(3306).await.unwrap();
+            let root_url = format!("mysql://root@127.0.0.1:{port}/test");
+
+            // Seed as root (empty password = fast auth, needs no TLS/RSA): create
+            // a caching_sha2_password user WITH a password and a readable table.
+            let mut w = mysql_writable(&root_url).await;
+            w.execute(
+                "CREATE USER 'nyet_tls'@'%' IDENTIFIED WITH caching_sha2_password BY 'sup3r-secret'",
+            )
+            .await
+            .unwrap();
+            w.execute("GRANT SELECT ON test.* TO 'nyet_tls'@'%'")
+                .await
+                .unwrap();
+            w.execute("CREATE TABLE tls_t (id int primary key, name text)")
+                .await
+                .unwrap();
+            w.execute("INSERT INTO tls_t VALUES (1, 'ok')")
+                .await
+                .unwrap();
+            w.close().await.unwrap();
+
+            // The password travels over the TLS channel; ssl-mode=REQUIRED (from
+            // the url, honored on the direct leg) accepts the self-signed cert.
+            let engine = Mysql {
+                url: format!("mysql://nyet_tls@127.0.0.1:{port}/test?ssl-mode=REQUIRED"),
+                password: Some("sup3r-secret".to_string()),
+                statement_timeout_ms: 30_000,
+                query_timeout_ms: 30_000,
+                host_override: None,
+                connect_timeout_ms: None,
+            };
+            let rs = engine
+                .execute("SELECT id, name FROM tls_t", 10)
+                .await
+                .unwrap();
+            assert_eq!(rs.rows, vec![vec![Value::from(1), Value::from("ok")]]);
+
+            container.rm().await.unwrap();
+        });
+    }
+
     /// MariaDB proof (mariadb:11.4): the OTHER server-timeout variable
     /// (`max_statement_time`, seconds → SQLSTATE 1969) actually caps a query.
-    /// Runs `Mysql::execute` directly — there is NO outer tokio timeout here, so
-    /// a `Timeout` result can ONLY come from the server cancelling the query.
+    /// The in-process query timer is left GENEROUS (30s) while the server cap is
+    /// 1s, so this ~1-2s query is cancelled by the SERVER, not the client timer —
+    /// a `Timeout` result here proves the 1969 path specifically.
     #[test]
     fn mariadb_server_timeout_maps_to_timeout() {
         use testcontainers_modules::mariadb::Mariadb;
@@ -1391,6 +1718,7 @@ mod tests {
                 url: url.clone(),
                 password: None,
                 statement_timeout_ms: 5000,
+                query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
             };
@@ -1404,12 +1732,17 @@ mod tests {
                 rs.rows[0]
             );
 
-            // No outer tokio timeout: a heavy read must be cancelled by the
-            // server (max_statement_time -> error 1969) and mapped to Timeout.
+            // Client query timer generous (30s) vs server cap 1s: this heavy
+            // read is cancelled by the SERVER (max_statement_time -> 1969), not
+            // the client timer, and mapped to Timeout.
             let slow = Mysql {
                 url: url.clone(),
                 password: None,
                 statement_timeout_ms: 1000,
+                // Generous client timer so the SERVER max_execution_time /
+                // max_statement_time cancels first — preserves the server-path
+                // proof; the client timer is just the backstop.
+                query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
             };

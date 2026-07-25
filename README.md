@@ -31,8 +31,12 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
 
 Redis, MongoDB and ClickHouse arrive in later releases; `nyet query` against a
 not-yet-supported engine resolves the connection and returns `NOT_IMPLEMENTED`.
-Connections over TLS are not wired up yet (this build ships without a TLS
-backend — connect to localhost, e.g. via an SSH tunnel).
+Direct connections **support TLS** (rustls): set `sslmode=require`/`verify-full`
+(Postgres) or `ssl-mode=REQUIRED`/`VERIFY_IDENTITY` (MySQL) in the `url` to force
+it — otherwise the default (`prefer`/`PREFERRED`) uses TLS only if the server
+offers it and may fall back to plaintext (a query over such a connection carries
+an `INSECURE_TRANSPORT` warning). MySQL 8's default `caching_sha2_password` works
+with a password over TLS (see the connection sections below).
 
 - [Roadmap](ROADMAP.md)
 - [Design](docs/DESIGN.md)
@@ -136,7 +140,13 @@ query is cancelled server-side → exit 8). Result types map to JSON as:
 integers/floats/bool natively, `numeric` → string (exact, no rounding),
 `uuid`/`timestamp`/`date`/`time` → string, `json`/`jsonb` → structured JSON,
 `bytea` → lowercase hex, `NULL` → null; an exotic type nyet cannot serialize
-returns a DB_ERROR asking you to `::text`-cast the column.
+returns a DB_ERROR asking you to `::text`-cast the column. **TLS:** a direct
+(non-tunnelled) connection honors the `sslmode` in the `url` —
+`disable`/`prefer` (default)/`require`/`verify-ca`/`verify-full`. For production
+use `sslmode=verify-full` so the server certificate and hostname are actually
+verified (a plain `require` encrypts but does not authenticate the server);
+point `sslrootcert=/path/to/ca.pem` in the `url` at a private CA if the cert is
+not signed by a public one.
 
 MySQL/MariaDB specifics: use `engine = "mysql"` or `engine = "mariadb"` (they
 share the driver and SQL dialect; the only difference is the server-side query
@@ -152,17 +162,14 @@ integers/floats/bool natively, `BIGINT UNSIGNED` as a number (may exceed i64),
 → structured JSON, `NULL` → null. (On MariaDB, `JSON` columns are `LONGTEXT`
 under the hood, so they come back as a JSON string, not structured.) An exotic
 type nyet cannot serialize returns a DB_ERROR asking you to `CAST(col AS CHAR)`.
-
-> **Known limitation — MySQL 8 password auth needs TLS.** MySQL 8's default
-> `caching_sha2_password` auth requires either TLS or a client-side RSA exchange
-> to send a password over a non-encrypted connection. This build ships no TLS
-> backend (and deliberately no RSA crate — the only maintained one carries an
-> unpatched timing-attack advisory, RUSTSEC-2023-0071), so a password against a
-> default MySQL 8 server over a plaintext/SSH-tunnel leg fails at connect. Work
-> around it with: a **MariaDB** server (its default `mysql_native_password`
-> works over plaintext), a MySQL user created `WITH mysql_native_password`, a
-> no-password/trust setup, or wait for the TLS-enabled build. The SSH-tunnel
-> client→bastion hop is still encrypted regardless.
+**TLS:** a direct connection honors the `ssl-mode` in the `url` —
+`DISABLED`/`PREFERRED` (default)/`REQUIRED`/`VERIFY_CA`/`VERIFY_IDENTITY`. For
+production use `ssl-mode=VERIFY_IDENTITY` (verifies the server certificate and
+hostname); point `ssl-ca=/path/to/ca.pem` at a private CA when needed.
+**MySQL 8's default `caching_sha2_password` works with a password over TLS** —
+use `ssl-mode=REQUIRED` or stricter (`REQUIRED` accepts a self-signed cert; the
+auto-generated one MySQL 8 ships is enough to get the password onto an encrypted
+channel). MariaDB's default `mysql_native_password` works with or without TLS.
 
 ### Recommended: a read-only MySQL/MariaDB user (layer 3)
 
@@ -243,11 +250,13 @@ picked automatically.
 - **TLS is disabled on the tunnel leg — and the bastion→DB hop is plaintext.**
   The `nyet`→bastion hop is encrypted by SSH, so `nyet` forces `sslmode=disable`
   for the loopback connection (any `sslmode` in the `url` is ignored when
-  tunnelled). But `ssh -L` is a raw TCP forward that **terminates at the
-  bastion**: the bastion→database hop is a separate plaintext TCP connection, and
-  this build of `nyet` has no TLS backend to protect it. So the database must be
-  in a network segment trusted relative to the bastion (or the bastion
-  co-located with the DB). See the TLS limitation note below.
+  tunnelled — TLS verification against `127.0.0.1` would fail against a
+  certificate naming the real host anyway). But `ssh -L` is a raw TCP forward
+  that **terminates at the bastion**: the bastion→database hop is a separate
+  plaintext TCP connection. So the database must be in a network segment trusted
+  relative to the bastion (or the bastion co-located with the DB). To encrypt
+  the DB link end to end, use a **direct** connection with `sslmode`/`ssl-mode`
+  instead of a tunnel.
 - **A tunnel failure is `CONNECTION_FAILED` (exit 6)** with a hint: `ssh` missing
   from `PATH`, the bastion unreachable, auth rejected, an unknown host key, or
   the forward refused (`ExitOnForwardFailure=yes`). Try the same `ssh -N -L ...`
@@ -261,20 +270,18 @@ picked automatically.
 - **SQLite + `[ssh]` is rejected** (exit 3): a tunnel forwards a TCP port, but
   SQLite is a local file, so ssh does not apply.
 
-> **Known limitation — no TLS backend (traffic to the DB is unencrypted).** This
-> build of `nyet` ships without a TLS backend, which has three consequences:
-> (1) a *direct*, non-tunnelled connection to a server that **requires** TLS
-> (`sslmode=require` / MySQL `REQUIRED` and stricter) is not supported and fails
-> at connect; (2) a *direct* connection to a server that merely **allows** TLS
-> (the common default — Postgres `prefer`, MySQL `PREFERRED`) **silently connects
-> in plaintext**: your queries and results travel unencrypted over the network,
-> with no warning; (3) over an SSH tunnel the client→bastion hop is encrypted by
-> SSH, but the bastion→database hop is a separate plaintext TCP connection (see
-> the TLS bullet above). **So: without an SSH tunnel, treat the `nyet`→database
-> link as cleartext — use it only over localhost or a trusted network segment,
-> or put an SSH tunnel in front.** Reach a TLS-only server through a tunnel, keep
-> the DB close to the bastion, or wait for the TLS-enabled build. This is a
-> separate, tracked decision, not a bug.
+> **TLS behavior — encrypt direct connections; the tunnel leg is plaintext by
+> design.** Direct (non-tunnelled) connections use `nyet`'s TLS backend (rustls)
+> and honor the `sslmode`/`ssl-mode` in the `url`. Two things to know: (1) the
+> **default** (`prefer`/`PREFERRED`) uses TLS *when the server offers it* but
+> silently falls back to plaintext if it does not — set `require`/`REQUIRED` to
+> force encryption, and `verify-full`/`VERIFY_IDENTITY` to also authenticate the
+> server (recommended for production; a bare `require` encrypts but does not
+> verify the certificate, so it does not stop a MITM); (2) over an **SSH tunnel**
+> the client→bastion hop is encrypted by SSH but the bastion→database hop is a
+> separate plaintext TCP connection (`nyet` forces `sslmode=disable` on the
+> loopback leg — see the TLS bullet above), so for an end-to-end-encrypted DB
+> link prefer a direct `verify-full` connection over a tunnel.
 
 Rules:
 
@@ -480,7 +487,10 @@ runs with the database user's privileges even in a read-only session.
 
 `warnings[].code` is a closed list: `TRUNCATED` (row limit cut the result),
 `DUPLICATE_COLUMNS` (json rows would collapse same-named keys),
-`UNICODE_STRIPPED` (invisible characters removed from the query).
+`UNICODE_STRIPPED` (invisible characters removed from the query),
+`INSECURE_TRANSPORT` (a direct server connection whose url `sslmode`/`ssl-mode`
+is below `require` and has no ssh tunnel — the transport is not guaranteed
+encrypted or verified; the message says how to force TLS).
 
 The full allow/deny specification is the public test corpus in
 [`tests/corpus/`](tests/corpus/): every validator rule exists there as at
@@ -502,7 +512,8 @@ otherwise human-readable diagnostics. Errors:
 Every error carries an actionable `hint`. Error codes today:
 `CONFIG_INVALID`, `DIR_NOT_ALLOWED`, `NOT_IMPLEMENTED`, `INTERNAL`, `NYET`
 (with `reason`, see above), `CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
-Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`.
+Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
+`INSECURE_TRANSPORT`.
 
 Exit codes:
 

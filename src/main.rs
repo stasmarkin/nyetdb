@@ -15,7 +15,7 @@ use engine::Engine;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(
@@ -402,6 +402,11 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     (
                         Db::Sqlite(engine::Sqlite {
                             path: PathBuf::from(path),
+                            // sqlite has no server-side timeout, so this in-process
+                            // budget (bounding the fetch inside execute) is the
+                            // ONLY query timeout — the cli no longer wraps execute
+                            // in an outer timeout.
+                            query_timeout_ms: timeout_secs.saturating_mul(1000),
                         }),
                         validator::Policy::sqlite(v_allow, v_deny),
                     )
@@ -422,11 +427,14 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                             password,
                             // Postgres rejects statement_timeout > INT_MAX ms
                             // at connect; clamp so a huge timeout_secs still
-                            // connects (the external tokio timeout still caps
-                            // the wall clock). i32::MAX ms is ~24.8 days.
+                            // connects. i32::MAX ms is ~24.8 days.
                             statement_timeout_ms: timeout_secs
                                 .saturating_mul(1000)
                                 .min(i32::MAX as u64),
+                            // The in-process query-phase deadline (unclamped): the
+                            // full per-query wall budget, backstopping the server
+                            // statement_timeout above.
+                            query_timeout_ms: timeout_secs.saturating_mul(1000),
                             // Filled in below once the SSH tunnel (if any) is up.
                             host_override: None,
                             // Production: the generous connect_deadline floor.
@@ -457,11 +465,14 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                             url: url.clone(),
                             password,
                             // Clamp to u32::MAX ms so a huge timeout_secs stays
-                            // within MySQL's max_execution_time range; the outer
-                            // tokio timeout still caps the wall clock.
+                            // within MySQL's max_execution_time range.
                             statement_timeout_ms: timeout_secs
                                 .saturating_mul(1000)
                                 .min(u32::MAX as u64),
+                            // The in-process query-phase deadline (unclamped): the
+                            // full per-query wall budget, backstopping the server
+                            // max_execution_time/max_statement_time above.
+                            query_timeout_ms: timeout_secs.saturating_mul(1000),
                             // Filled in below once the SSH tunnel (if any) is up.
                             host_override: None,
                             // Production: the generous connect_deadline floor.
@@ -479,6 +490,13 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     ))
                 }
             };
+
+            // Static transport check for the INSECURE_TRANSPORT warning: a
+            // direct (no ssh) server connection whose url sslmode is below
+            // require gives no encryption/verification guarantee. Computed from
+            // config + url only (no server round-trip); pushed on success below.
+            let insecure_transport = conn.ssh.is_none()
+                && engine::transport_below_require(&conn.engine, conn.url.as_deref().unwrap_or(""));
 
             // Layer 1: the validator. Any deny -> code NYET + reason, exit 5.
             let (query, mut warnings) = match validator::validate(&query, &policy) {
@@ -539,9 +557,9 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
 
             // The runtime is built lazily, only when an engine actually runs
             // (Д9: config/validator failures never pay the async tax).
-            // enable_all: the time driver arms the query timeout and the IO
-            // driver backs the Postgres TCP connection (SQLite needs neither
-            // but pays nothing measurable for them).
+            // enable_all: the time driver arms the engine's in-process connect
+            // and query deadlines, and the IO driver backs the Postgres TCP
+            // connection (SQLite needs neither but pays nothing measurable).
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -553,45 +571,34 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     )
                 })?;
             let started = Instant::now();
-            // Fetch limit+1 to detect truncation without reading everything.
-            // timeout() must be created inside the runtime (it arms a timer).
-            let result = rt.block_on(async {
-                tokio::time::timeout(
-                    Duration::from_secs(timeout_secs),
-                    db.execute(&query, limit.saturating_add(1)),
-                )
-                .await
-            });
-            // After a timeout the sqlite worker may still be grinding; a
+            // The engine owns BOTH deadlines internally: a hung/slow CONNECT is
+            // bounded by its own generous deadline (-> Connect, exit 6) and only
+            // the QUERY phase is bounded by the effective per-query timeout (->
+            // Timeout, exit 8). Keeping them inside execute (not one outer tokio
+            // timeout over connect+query) makes the exit code deterministic even
+            // when --timeout is smaller than a legitimate connect. Fetch limit+1
+            // to detect truncation without reading everything.
+            let result = rt.block_on(db.execute(&query, limit.saturating_add(1)));
+            // After a query timeout the sqlite worker may still be grinding; a
             // background shutdown lets the process exit instead of joining it.
             rt.shutdown_background();
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             let mut rs = match result {
-                // Honest wording: the future is dropped, but the sqlite
-                // worker thread may keep grinding until the process exits.
-                Err(_elapsed) => {
-                    return Err(Failure::new(
-                        ErrorCode::Timeout,
-                        format!(
-                            "query on '{alias}' did not finish within the {timeout_secs}s timeout"
-                        ),
-                        "narrow the query (WHERE / LIMIT), or raise --timeout or \
-                         timeout_secs in the config",
-                    ))
-                }
-                Ok(Err(engine::EngineError::Connect { message, hint })) => {
+                Err(engine::EngineError::Connect { message, hint }) => {
                     return Err(Failure::new(ErrorCode::ConnectionFailed, message, hint))
                 }
-                Ok(Err(engine::EngineError::Db { message, hint })) => {
+                Err(engine::EngineError::Db { message, hint }) => {
                     return Err(Failure::new(ErrorCode::DbError, message, hint))
                 }
-                // Server-side statement_timeout (Postgres 57014): same exit 8
-                // as the tokio timeout above, so the code is deterministic.
-                Ok(Err(engine::EngineError::Timeout { message, hint })) => {
+                // Both the in-process query-phase timer and a server-side
+                // statement_timeout (Postgres 57014 / MySQL 3024 / MariaDB 1969)
+                // surface as EngineError::Timeout -> exit 8, deterministic
+                // whichever fires.
+                Err(engine::EngineError::Timeout { message, hint }) => {
                     return Err(Failure::new(ErrorCode::Timeout, message, hint))
                 }
-                Ok(Ok(rs)) => rs,
+                Ok(rs) => rs,
             };
 
             let truncated = rs.rows.len() as u64 > limit;
@@ -619,6 +626,19 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                          in JSON/JSONL output duplicates collapse to the last value",
                         duplicates.join(", ")
                     ),
+                });
+            }
+            // Security signal (not a refusal): the transport gave no encryption
+            // guarantee. Static from config/url (Warning has no hint field, so
+            // the remedy is folded into the message).
+            if insecure_transport {
+                warnings.push(output::Warning {
+                    code: "INSECURE_TRANSPORT",
+                    message: "this connection's transport is not guaranteed encrypted or \
+                              verified (sslmode below require and no ssh tunnel); set \
+                              sslmode=verify-full (Postgres) or ssl-mode=VERIFY_IDENTITY \
+                              (MySQL) in the url, or route through an ssh tunnel"
+                        .to_string(),
                 });
             }
             let meta = output::QueryMeta {

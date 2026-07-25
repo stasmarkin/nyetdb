@@ -23,13 +23,16 @@ daemon, on purpose:
   `tests/postgres.rs` e2e via the binary).
 - MySQL — `mysql:8.4` (`src/engine.rs` `mysql_layer2_types_and_timeout`: real
   `JSON` type, `max_execution_time`/SQLSTATE 3024, `BIGINT UNSIGNED`, `BIT`,
-  full-range `TIME`).
+  full-range `TIME`; `mysql8_caching_sha2_password_over_tls`: a passworded
+  `caching_sha2_password` user connecting over `ssl-mode=REQUIRED` — the TLS
+  proof, since MySQL 8 auto-generates a self-signed cert and enables TLS at
+  init).
 - MariaDB — `mariadb:11.4`: `src/engine.rs` `mariadb_server_timeout_maps_to_timeout`
   proves the `max_statement_time`/SQLSTATE 1969 path directly (no outer tokio
   timeout — a `Timeout` can only come from the server), and `tests/mysql.rs` is
   the e2e via the binary on the `engine = "mariadb"` path with a
-  `mysql_native_password` user so a **password** works over the plaintext loopback
-  without a TLS/RSA backend (see the MySQL note below).
+  `mysql_native_password` user, whose **password** works over the plaintext
+  loopback without needing TLS (see the MySQL/TLS note below).
 
 To run locally:
 
@@ -45,7 +48,7 @@ cargo test                                 # containers come up and are reaped p
 
 The SQLite and validator/config/resolver tests need no Docker.
 
-### MySQL vs MariaDB, and the missing TLS/RSA backend
+### MySQL vs MariaDB, and the TLS backend (rustls)
 
 The engine treats MySQL and MariaDB as one driver + one SQL dialect; the only
 runtime difference is the **server-side query-timeout variable**, mutually
@@ -60,17 +63,42 @@ map to `EngineError::Timeout` so the exit code is deterministic (like Postgres
 
 Two flavors are tested on purpose to cover both timeout variables and both
 `JSON` behaviors (MySQL has a real `JSON` type → structured; MariaDB stores
-`JSON` as `LONGTEXT` → returned as a string). We deliberately do **not** enable
-sqlx's `mysql-rsa` feature: MySQL 8's default `caching_sha2_password` needs TLS
-or client-side RSA to send a password over a non-encrypted leg, but the only
-maintained `rsa` crate carries an unpatched timing-attack advisory
-(RUSTSEC-2023-0071) that `cargo-deny`/`cargo-audit` reject — pulling it into a
-credential-handling tool is the wrong trade (Д8). Consequences (documented in
-the README): a password against a default MySQL 8 server over plaintext fails at
-connect; use MariaDB, a `mysql_native_password` MySQL user, no password, or the
-future TLS build. An **empty-password** MySQL 8 connection needs no RSA (fast
-auth), which is why the `mysql:8.4` engine test connects as root with no
-password.
+`JSON` as `LONGTEXT` → returned as a string).
+
+**TLS is provided by rustls, not native-tls/OpenSSL.** The sqlx feature is
+`tls-rustls-ring-webpki` (chosen over the alternatives per Д8):
+
+- **rustls, not `tls-native-tls`** — native-tls means system OpenSSL (a C
+  dependency, per-platform build/audit surface) or SChannel/Secure Transport;
+  rustls is memory-safe Rust and self-contained, which suits a static,
+  cross-compiled release binary. It also keeps the supply chain off the OpenSSL
+  advisory stream.
+- **`ring` provider, not `aws-lc-rs`** — `sqlx/tls-rustls` (= `tls-rustls-ring`
+  = `tls-rustls-ring-webpki`) uses `ring`, which builds with just a C compiler;
+  `aws-lc-rs` additionally wants CMake and bindgen (heavier, more fragile
+  cross-compiles) for no benefit we need here.
+- **`webpki` roots, not native roots** — the bundled Mozilla CA set
+  (`webpki-roots`) gives identical `verify-full` behavior on every platform with
+  no dependency on the OS trust store; a private CA is passed per-connection via
+  the url (`sslrootcert=`/`ssl-ca=`), so we do not need `rustls-native-certs`.
+
+This still does **not** enable sqlx's `mysql-rsa` feature: that pulls the `rsa`
+crate flagged by RUSTSEC-2023-0071 (unpatched timing attack), which
+`cargo-deny`/`cargo-audit` reject — the wrong dependency for a
+credential-handling tool (Д8). It is unnecessary now: MySQL 8's default
+`caching_sha2_password` sends the password over the TLS channel instead of a
+client-side RSA exchange. The rustls stack adds five crates to the runtime tree
+(`rustls`, `ring`, `rustls-webpki`, `webpki-roots`, `subtle`) and their licenses
+to `deny.toml` — `ISC`/`BSD-3-Clause` globally (ubiquitous permissive code
+licenses) and `CDLA-Permissive-2.0` scoped to `webpki-roots` (a data license for
+the CA bundle, not general code) — no `rsa`, no `openssl` (verified with
+`cargo tree -e normal`).
+
+Consequence (now positive, documented in the README): **a password against a
+default MySQL 8 server works over TLS** — connect with `ssl-mode=REQUIRED` (or
+stricter). The `mysql:8.4` engine timeout/type test still connects as root with
+an **empty** password (fast auth, needs neither TLS nor RSA); the dedicated
+`mysql8_caching_sha2_password_over_tls` test proves the passworded TLS path.
 
 ### The SSH tunnel stand (`tests/ssh.rs`)
 
@@ -201,11 +229,14 @@ ssh) and *before* the engine connects. The split follows Д1/Д2:
   it drops after the query executes.
 - **url → localhost**: rather than string-rewriting the url, `engine.rs`
   overrides `PgConnectOptions.host()/port()` and forces `ssl_mode(Disable)` on
-  the tunnel leg (`apply_host_override`) — the ssh hop already encrypts, and this
-  build has no TLS backend — while user/dbname/params and the password stay
-  intact. **Known limitation (out of this step's scope):** a *direct*
-  (non-tunnelled) Postgres requiring TLS is unsupported without a TLS backend; it
-  fails at connect. Documented in the README for the user to decide.
+  the tunnel leg (`apply_host_override`) — the ssh hop already encrypts, and TLS
+  verification against `127.0.0.1` would fail against a cert naming the real host
+  — while user/dbname/params and the password stay intact. The **direct** leg
+  (`host_override == None`) is left untouched, so the `sslmode`/`ssl-mode` from
+  the url is honored by the rustls backend (`prefer`/`require`/`verify-ca`/
+  `verify-full` all work); a TLS handshake/cert failure there is
+  `CONNECTION_FAILED` (exit 6) with a TLS-specific hint (`is_tls_error` →
+  `tls_hint`), never a silent plaintext fallback for `require`+.
 - **Fail mode**: config validation guarantees `host`/`remote` are present and
   valid, so the cli `expect()`s them (internal invariant) rather than silently
   skipping the tunnel — a skipped tunnel would connect straight to the real host,
@@ -239,8 +270,9 @@ Runtime:
   wants the real table. Chosen over alternatives per Д8: unicode-rs org (the
   maintainers of the ecosystem's core unicode crates), zero dependencies, no_std,
   tiny generated tables.
-- `sqlx` (runtime-tokio; `sqlite-bundled`, `postgres`, `mysql`, `bigdecimal`, `uuid`,
-  `chrono`, `json`) — the SQLite, PostgreSQL and MySQL/MariaDB drivers.
+- `sqlx` (runtime-tokio; `tls-rustls-ring-webpki`, `sqlite-bundled`, `postgres`,
+  `mysql`, `bigdecimal`, `uuid`, `chrono`, `json`) — the SQLite, PostgreSQL and
+  MySQL/MariaDB drivers.
   `sqlite-bundled` (not the `sqlite` meta-feature) keeps `load-extension` and friends
   out of a security tool. `postgres` and `mysql` are built-in drivers — one shared
   driver crate for MySQL and MariaDB, no new top-level dependency. The four type
@@ -248,10 +280,10 @@ Runtime:
   `numeric`/`DECIMAL` losslessly to a string (f64 would round money/ids), `uuid`,
   `chrono` (timestamp/date/time) and `json` (jsonb / MySQL `JSON` straight into the
   envelope) cover the types prod tables are full of; without them a normal `SELECT`
-  would DB_ERROR on decode. **No TLS and no `mysql-rsa` feature** (testcontainers and
-  SSH-tunnelled prod are plaintext to localhost; `mysql-rsa` would pull the `rsa`
-  crate flagged by RUSTSEC-2023-0071 — see the MySQL note above); TLS lands with a
-  later step. Postgres layer 2 is server-enforced (connect options
+  would DB_ERROR on decode. **TLS via `tls-rustls-ring-webpki`** (rustls + `ring`
+  + bundled webpki roots — rationale and the deliberate absence of the
+  `mysql-rsa` feature / `rsa` crate are in the MySQL/TLS note above). Postgres
+  layer 2 is server-enforced (connect options
   `-c default_transaction_read_only=on -c statement_timeout=<ms>` plus an explicit
   `BEGIN READ ONLY`); MySQL/MariaDB layer 2 is an explicit `START TRANSACTION READ
   ONLY` plus a `SET SESSION max_execution_time`/`max_statement_time`.
@@ -292,8 +324,10 @@ Dev:
   The container runs inside `block_on` so its async `Drop` (which removes the
   container) always has a runtime — even when an assertion unwinds.
 - `tests/mysql.rs` is the same for MySQL/MariaDB against a testcontainers
-  `mariadb:11.4` (a passworded `mysql_native_password` user, so the password path
-  and leak guard are covered without a TLS/RSA backend): success (json/table),
+  `mariadb:11.4` (a passworded `mysql_native_password` user over plaintext
+  loopback, covering the password path and leak guard; the passworded-over-TLS
+  path is proven separately by the `src/engine.rs` MySQL-8 TLS test): success
+  (json/table),
   row-limit truncation, DB_ERROR (exit 7), timeout (exit 8), CONNECTION_FAILED
   (exit 6). The `engine = "mariadb"` path (`max_statement_time`) is exercised
   here; the MySQL `max_execution_time` path is in the `src/engine.rs` engine test.
@@ -306,7 +340,14 @@ Dev:
   `JSON`, `BIT`, full-range `TIME` (`-838:59:59`..`838:59:59` via `MySqlTime`), and
   `max_execution_time` → SQLSTATE 3024 → Timeout. `mariadb_server_timeout_maps_to_timeout`
   (`mariadb:11.4`) proves the sibling `max_statement_time` → SQLSTATE 1969 → Timeout
-  directly, with no outer tokio timeout in play.
+  directly, with no outer tokio timeout in play. **TLS is proven on both server
+  engines:** `mysql8_caching_sha2_password_over_tls` (`mysql:8.4`) connects a
+  passworded `caching_sha2_password` user over `ssl-mode=REQUIRED` and reads a
+  row (the plaintext-only "MySQL 8 password needs TLS" limitation is gone); the
+  Postgres test additionally asserts that `sslmode=require` against the (ssl=off)
+  `postgres:16-alpine` container fails with a TLS-hinted `CONNECTION_FAILED` —
+  proof that `require` is enforced by the rustls backend, not silently
+  downgraded to plaintext.
 
 ## Validator corpus (Д6)
 
@@ -616,7 +657,11 @@ config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
 | `INTERNAL` | 1 | nyet's own failure (e.g. cwd cannot be resolved) |
 
 Warning codes (`warnings[].code`, also closed and append-only): `TRUNCATED`,
-`DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`.
+`DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`, `INSECURE_TRANSPORT` (direct server
+connection with url `sslmode`/`ssl-mode` below `require` and no ssh tunnel —
+transport not guaranteed encrypted/verified; static from config+url, so it
+over-warns against a server that happens to negotiate TLS — we report the
+guarantee, not the runtime outcome).
 
 Codes are append-only; renaming/removing one is a breaking change (bump `v`).
 Every error must carry an actionable `hint` (Д10) — tests enforce it.

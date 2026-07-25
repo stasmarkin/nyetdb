@@ -20,7 +20,7 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
 sqlparser = { version = "0.62", default-features = false, features = ["std", "visitor"] }
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "postgres", "mysql", "bigdecimal", "uuid", "chrono", "json"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite-bundled", "postgres", "mysql", "bigdecimal", "uuid", "chrono", "json"] }
 tokio = { version = "1.53", default-features = false, features = ["rt", "time", "net"] }
 toml = "1.1.3"
 unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
