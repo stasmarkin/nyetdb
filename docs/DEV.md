@@ -15,20 +15,62 @@ Stable Rust; no nightly features. `#![forbid(unsafe_code)]` on the whole crate.
 
 ### Integration tests need Docker
 
-The PostgreSQL tests (`src/engine.rs` layer-2/decoding, `tests/postgres.rs` e2e via
-the binary) spin a real `postgres:16-alpine` container through testcontainers. They
-are **not** `#[ignore]`d — CI runs them, and they *fail* (not skip) without a Docker
-daemon, on purpose. To run locally:
+The server-engine tests spin real containers through testcontainers. They are
+**not** `#[ignore]`d — CI runs them, and they *fail* (not skip) without a Docker
+daemon, on purpose:
+
+- PostgreSQL — `postgres:16-alpine` (`src/engine.rs` layer-2/decoding,
+  `tests/postgres.rs` e2e via the binary).
+- MySQL — `mysql:8.4` (`src/engine.rs` `mysql_layer2_types_and_timeout`: real
+  `JSON` type, `max_execution_time`/SQLSTATE 3024, `BIGINT UNSIGNED`, `BIT`,
+  full-range `TIME`).
+- MariaDB — `mariadb:11.4`: `src/engine.rs` `mariadb_server_timeout_maps_to_timeout`
+  proves the `max_statement_time`/SQLSTATE 1969 path directly (no outer tokio
+  timeout — a `Timeout` can only come from the server), and `tests/mysql.rs` is
+  the e2e via the binary on the `engine = "mariadb"` path with a
+  `mysql_native_password` user so a **password** works over the plaintext loopback
+  without a TLS/RSA backend (see the MySQL note below).
+
+To run locally:
 
 ```sh
 colima start                               # or Docker Desktop — any Docker daemon
 docker pull postgres:16-alpine             # first run only; cached after
+docker pull mysql:8.4
+docker pull mariadb:11.4
 docker pull linuxserver/openssh-server@sha256:9c5e178975fcc3917853f5e37cbf135ad7deb11de504ab0f460cc81a2e1eb539  # SSH tunnel stand (digest-pinned in tests/ssh.rs)
 echo $DOCKER_HOST                           # testcontainers reads this (colima socket)
 cargo test                                 # containers come up and are reaped per test
 ```
 
 The SQLite and validator/config/resolver tests need no Docker.
+
+### MySQL vs MariaDB, and the missing TLS/RSA backend
+
+The engine treats MySQL and MariaDB as one driver + one SQL dialect; the only
+runtime difference is the **server-side query-timeout variable**, mutually
+exclusive between the two (each server rejects the other's name with
+ER_UNKNOWN_SYSTEM_VARIABLE, 1193): MySQL uses `max_execution_time` (ms), MariaDB
+`max_statement_time` (seconds). The engine picks by the config `engine` value
+(`mariadb` → the seconds form) and **swallows a 1193** if the label is wrong —
+the cli's outer tokio timeout is the backstop, so a mislabelled server degrades
+to timeout-only rather than a broken query. Both timeout SQLSTATEs (3024 / 1969)
+map to `EngineError::Timeout` so the exit code is deterministic (like Postgres
+57014).
+
+Two flavors are tested on purpose to cover both timeout variables and both
+`JSON` behaviors (MySQL has a real `JSON` type → structured; MariaDB stores
+`JSON` as `LONGTEXT` → returned as a string). We deliberately do **not** enable
+sqlx's `mysql-rsa` feature: MySQL 8's default `caching_sha2_password` needs TLS
+or client-side RSA to send a password over a non-encrypted leg, but the only
+maintained `rsa` crate carries an unpatched timing-attack advisory
+(RUSTSEC-2023-0071) that `cargo-deny`/`cargo-audit` reject — pulling it into a
+credential-handling tool is the wrong trade (Д8). Consequences (documented in
+the README): a password against a default MySQL 8 server over plaintext fails at
+connect; use MariaDB, a `mysql_native_password` MySQL user, no password, or the
+future TLS build. An **empty-password** MySQL 8 connection needs no RSA (fast
+auth), which is why the `mysql:8.4` engine test connects as root with no
+password.
 
 ### The SSH tunnel stand (`tests/ssh.rs`)
 
@@ -197,18 +239,22 @@ Runtime:
   wants the real table. Chosen over alternatives per Д8: unicode-rs org (the
   maintainers of the ecosystem's core unicode crates), zero dependencies, no_std,
   tiny generated tables.
-- `sqlx` (runtime-tokio; `sqlite-bundled`, `postgres`, `bigdecimal`, `uuid`, `chrono`,
-  `json`) — the SQLite and PostgreSQL drivers. `sqlite-bundled` (not the `sqlite`
-  meta-feature) keeps `load-extension` and friends out of a security tool. The
-  `postgres` feature is the built-in driver — no new top-level dependency. The four
-  type features are the price of reading a real Postgres table: `bigdecimal` decodes
-  `numeric` losslessly to a string (f64 would round money/ids), `uuid`, `chrono`
-  (timestamp/date/time) and `json` (jsonb straight into the envelope) cover the types
-  prod tables are full of; without them a normal `SELECT` would DB_ERROR on decode.
-  No TLS feature yet (testcontainers and SSH-tunnelled prod are plaintext to
-  localhost); TLS lands with a later step. Postgres layer 2 is server-enforced:
-  connect options `-c default_transaction_read_only=on -c statement_timeout=<ms>`
-  plus an explicit `BEGIN READ ONLY` around the read.
+- `sqlx` (runtime-tokio; `sqlite-bundled`, `postgres`, `mysql`, `bigdecimal`, `uuid`,
+  `chrono`, `json`) — the SQLite, PostgreSQL and MySQL/MariaDB drivers.
+  `sqlite-bundled` (not the `sqlite` meta-feature) keeps `load-extension` and friends
+  out of a security tool. `postgres` and `mysql` are built-in drivers — one shared
+  driver crate for MySQL and MariaDB, no new top-level dependency. The four type
+  features are the price of reading a real table: `bigdecimal` decodes
+  `numeric`/`DECIMAL` losslessly to a string (f64 would round money/ids), `uuid`,
+  `chrono` (timestamp/date/time) and `json` (jsonb / MySQL `JSON` straight into the
+  envelope) cover the types prod tables are full of; without them a normal `SELECT`
+  would DB_ERROR on decode. **No TLS and no `mysql-rsa` feature** (testcontainers and
+  SSH-tunnelled prod are plaintext to localhost; `mysql-rsa` would pull the `rsa`
+  crate flagged by RUSTSEC-2023-0071 — see the MySQL note above); TLS lands with a
+  later step. Postgres layer 2 is server-enforced (connect options
+  `-c default_transaction_read_only=on -c statement_timeout=<ms>` plus an explicit
+  `BEGIN READ ONLY`); MySQL/MariaDB layer 2 is an explicit `START TRANSACTION READ
+  ONLY` plus a `SET SESSION max_execution_time`/`max_statement_time`.
 - `tokio` (rt, time, net) — sqlx requires an async runtime; `time` gives the query
   timeout, `net` the Postgres TCP connection. The per-query runtime uses
   `enable_all` (io + time). Single-threaded, built per query.
@@ -219,12 +265,12 @@ Dev:
 
 - `tempfile` — per-test isolated dirs with cleanup; symlink/permission fixtures
   without touching the real `~/.config`.
-- `testcontainers-modules` (`postgres` feature) — the PostgreSQL integration and
-  e2e tests need a real server; this spins a throwaway `postgres:16-alpine`
-  container per test and tears it down. Chosen over a hand-rolled `docker run`
-  wrapper (Д8): it owns image pull, readiness wait and cleanup (the ryuk reaper),
-  and the `postgres` module ships the ready image config. Dev-only — it never
-  reaches a release binary. Its (large) transitive tree passes `cargo deny`
+- `testcontainers-modules` (`postgres`, `mysql`, `mariadb` features) — the
+  server-engine integration and e2e tests need a real server; this spins a
+  throwaway container per test (`postgres:16-alpine`, `mysql:8.4`, `mariadb:11.4`)
+  and tears it down. Chosen over a hand-rolled `docker run` wrapper (Д8): it owns
+  image pull, readiness wait and cleanup (the ryuk reaper), and each module ships
+  the ready image config. Dev-only — it never reaches a release binary. Its (large) transitive tree passes `cargo deny`
   (licenses/advisories/bans/sources) as of this step. The SSH tunnel stand
   (`tests/ssh.rs`) reuses this crate's re-exported `testcontainers` (`GenericImage`,
   networks, `container.exec`) for the `linuxserver/openssh-server` bastion — no
@@ -245,11 +291,22 @@ Dev:
   password-leak guard (a distinctive password must never appear in stdout/stderr).
   The container runs inside `block_on` so its async `Drop` (which removes the
   container) always has a runtime — even when an assertion unwinds.
-- `src/engine.rs` holds the layer-2 proof for Postgres: a write issued *directly*
-  to the engine (bypassing the validator) is refused by the read-only transaction
-  (`EngineError::Db`), the table stays intact, common types decode as documented,
-  and a server `statement_timeout` maps to `EngineError::Timeout` (not `Db`, so
-  exit 8 is deterministic).
+- `tests/mysql.rs` is the same for MySQL/MariaDB against a testcontainers
+  `mariadb:11.4` (a passworded `mysql_native_password` user, so the password path
+  and leak guard are covered without a TLS/RSA backend): success (json/table),
+  row-limit truncation, DB_ERROR (exit 7), timeout (exit 8), CONNECTION_FAILED
+  (exit 6). The `engine = "mariadb"` path (`max_statement_time`) is exercised
+  here; the MySQL `max_execution_time` path is in the `src/engine.rs` engine test.
+- `src/engine.rs` holds the layer-2 proof for Postgres and MySQL: a write issued
+  *directly* to the engine (bypassing the validator) is refused by the read-only
+  transaction (`EngineError::Db`), the table stays intact, common types decode as
+  documented, and a server timeout maps to `EngineError::Timeout` (not `Db`, so
+  exit 8 is deterministic). The MySQL test (`mysql_layer2_types_and_timeout`,
+  `mysql:8.4`) additionally covers `BIGINT UNSIGNED` at the u64 ceiling, structured
+  `JSON`, `BIT`, full-range `TIME` (`-838:59:59`..`838:59:59` via `MySqlTime`), and
+  `max_execution_time` → SQLSTATE 3024 → Timeout. `mariadb_server_timeout_maps_to_timeout`
+  (`mariadb:11.4`) proves the sibling `max_statement_time` → SQLSTATE 1969 → Timeout
+  directly, with no outer tokio timeout in play.
 
 ## Validator corpus (Д6)
 
@@ -274,13 +331,15 @@ for this, Д8):
 Rules: one case per `- query:` line (single-line queries only — semicolons
 are fine, block scalars are not supported); `verdict` is `allow` or `deny`;
 `deny` requires `reason` (one of `PARSE_FAILED`, `MULTI_STATEMENT`,
-`WRITE_OPERATION`, `TXN_CONTROL`, `LOCKING_CLAUSE`, `DENIED_FUNCTION`);
+`WRITE_OPERATION`, `TXN_CONTROL`, `LOCKING_CLAUSE`, `DENIED_FUNCTION`,
+`EXECUTABLE_COMMENT`);
 optional `warnings` on an allow case is the comma-joined list of expected
 warning codes (currently only `UNICODE_STRIPPED`) — allow cases without it
 must produce none, deny cases never carry warnings; optional `dialect`
 defaults from the **filename prefix** — `postgres_*.yaml` runs the PostgreSQL
-dialect + `Policy::postgres`, everything else SQLite + `Policy::sqlite` — and a
-per-case `dialect: postgres|sqlite` still overrides. Unknown lines fail the run
+dialect + `Policy::postgres`, `mysql_*.yaml` the MySQL dialect + `Policy::mysql`
+(MariaDB is dialect-identical), everything else SQLite + `Policy::sqlite` — and a
+per-case `dialect: postgres|mysql|sqlite` still overrides. Unknown lines fail the run
 loudly. The runner (`validator::tests::golden_corpus`) reads every `*.yaml` in
 the directory, so adding a case is: append it to a fitting file (or add a new
 file), run `cargo test golden_corpus`. The corpus runs with the default policy
@@ -360,6 +419,84 @@ Deliberately *not* included: `pg_advisory_*` locks (session-scoped, released on
 disconnect — low severity, and `pg_try_advisory_*` wouldn't share the prefix
 cleanly). Add with a failing corpus case first (Д6) if it ever matters.
 
+## Function denylist rationale (MySQL/MariaDB)
+
+Like Postgres, these act *outside* the read-only transaction (filesystem, a
+tied-up connection, or process execution via a UDF), so layer 2 does not stop
+them — the validator (layer 1) is the only guard. All enumerated by exact name
+(no clean shared prefix), all `DENIED_FUNCTION`, all config-tunable via
+`allow_functions` / `deny_functions`:
+
+- `load_file` — reads any server file into a string (needs the FILE privilege
+  and `secure_file_priv`, but denied regardless: defense in depth, the
+  MySQL analogue of `pg_read_file`).
+- `sleep` — `SLEEP(seconds)`: silent DoS that ties up a pooled connection
+  (the `pg_sleep` analogue).
+- `benchmark` — `BENCHMARK(count, expr)`: a CPU busy-loop, DoS.
+- `sys_exec` / `sys_eval` — the `lib_mysqludf_sys` UDFs: run a shell command
+  (RCE) if that extension is installed. Non-standard, but denied so a
+  compromised/legacy server with the UDF present is not a foothold.
+- `get_lock` / `release_lock` / `release_all_locks` — the named-lock family.
+  `GET_LOCK(name, -1)` blocks the connection **forever** waiting for a lock: a
+  silent DoS, the same class as `SLEEP`. `release_*` are non-blocking but denied
+  for completeness (an agent read never needs any of them). Note this differs
+  from the Postgres `pg_advisory_*` decision — there the wait variants aren't the
+  default and the family is noisier to enumerate; MySQL's blocking form is the
+  common one and the family is tiny. (`is_used_lock` / `is_free_lock` are pure
+  non-blocking reads and stay **allowed**.)
+- `master_pos_wait` / `source_pos_wait` / `master_gtid_wait` /
+  `wait_for_executed_gtid_set` / `wait_until_sql_thread_after_gtids` — the
+  replication-wait family: each blocks until a replica reaches a binlog/GTID
+  position (unbounded DoS). `master_gtid_wait` is MariaDB-specific.
+
+`INTO OUTFILE` / `INTO DUMPFILE` (writing a server file from a `SELECT` — the
+sharpest MySQL vector, and the validator is the only guard) is not a function —
+it is caught structurally: sqlparser's `MySqlDialect` fails to parse them under
+the read allowlist, so they fail closed as `PARSE_FAILED` (pinned in the corpus).
+
+**Executable comments are the sharpest MySQL bypass** and are handled *before*
+parsing, not by the denylist. MySQL runs the body of `/*! ... */`, `/*M! ... */`
+(MariaDB) and optimizer-hint `/*+ ... */` comments, but sqlparser discards them
+as ordinary comments — so `SELECT 1 /*! SLEEP(10) */` reaches the AST as
+`SELECT 1` while the server runs `SLEEP`, and `/*! ... INTO OUTFILE ... */` writes
+a file: the entire layer-1 policy (denylist, INTO OUTFILE, locking) is bypassed.
+`has_mysql_executable_comment` (pure, string-aware — a `/*!` inside a `'…'`/`"…"`
+string or a `` `…` `` identifier is data, not a comment) flags these openers
+outside literals and the validator denies with `EXECUTABLE_COMMENT`. MySQL-only:
+Postgres/SQLite do not execute comment bodies.
+
+**Why two scan passes.** The validator runs before connecting, so it does not
+know the server's `sql_mode`, which changes where a string *ends*: under
+`NO_BACKSLASH_ESCAPES` a `\` is literal (`'x\'` closes the string), and under
+`ANSI_QUOTES` `"` is an identifier with no `\` escape (`"x\"` closes). A single
+default-mode pass **under-denies** — it thinks the string runs past a `/*!` the
+server actually executes (e.g. `… name='x\' AND 1=1 /*! OR SLEEP(5) */ …`). So
+`scan_executable_comment` is parameterized by `backslash_escapes` and run twice
+(`true` and `false`); the validator denies if EITHER pass finds an opener outside
+a literal. The real server matches exactly one pass on the backslash question
+(and the escape-free pass also models `ANSI_QUOTES` `"`-identifiers), so any
+executed opener is caught by at least one pass — fail closed under every
+`sql_mode`. Doubling (`''`/`""`/`` `` ``) is mode-independent and applied in both.
+The acceptable cost is over-denial of a benign string that contains a backslash
+right before a `/*!` (both corpus attack cases are pinned in `mysql_deny.yaml`).
+
+Deliberately *not* included: `is_used_lock` / `is_free_lock` (pure reads).
+`SLEEP`/`BENCHMARK`/`GET_LOCK` being denied means the timeout integration tests
+use a heavy `information_schema` cross join instead. Add a new entry with a
+failing corpus case first (Д6).
+
+**Known representation choices (documented, not bugs):** `TIMESTAMP` decodes to
+the value in the connection's session time zone rendered as a naive string
+(no offset) — nyet does not pin a session `time_zone`, so a `TIMESTAMP` reads
+back in the server default; use `DATETIME` or `CONVERT_TZ`/`UNIX_TIMESTAMP` if
+you need an unambiguous value. `TIME` decodes via `sqlx::mysql::types::MySqlTime`
+(not `chrono::NaiveTime`) and stringifies as `[-]H:MM:SS[.ffffff]`, covering
+MySQL's full duration range (`-838:59:59`..`838:59:59`, negative / over 24h) that
+`NaiveTime` cannot hold — a normal such column would otherwise DB_ERROR. `BIT`
+decodes to a lossless integer (sqlx reads it big-endian into a `u64`); a hex
+string would need the raw bytes (sqlx keeps them `pub(crate)`) and the bit-width
+(dropped from the type name).
+
 **Matching is on the terminal name component.** `check_function_name` compares
 the denylist against the LAST component of a (maybe qualified) function name —
 that component is the function name. So `pg_catalog.pg_read_file(...)` is caught
@@ -390,13 +527,80 @@ Three jobs on push/PR, stable toolchain:
 
 - **check** — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (with `Swatinem/rust-cache`). Runs on `ubuntu-latest`, which ships
-  a working Docker daemon, so the testcontainers Postgres tests run for real (they
-  pull `postgres:16-alpine` over the runner's network). Nothing is weakened — the
-  same suite CI runs is the one you run locally with Docker up.
+  a working Docker daemon, so the testcontainers Postgres/MySQL/MariaDB tests run
+  for real (they pull `postgres:16-alpine`, `mysql:8.4`, `mariadb:11.4` and the
+  SSH bastion image over the runner's network). Nothing is weakened — the same
+  suite CI runs is the one you run locally with Docker up.
 - **deny** — `EmbarkStudios/cargo-deny-action` with `deny.toml`
   (advisories, license allowlist, bans, sources).
 - **audit** — `cargo audit` against the RustSec advisory DB
   (installed via `taiki-e/install-action`).
+
+## Release process (`dist` + `.github/workflows/release.yml`)
+
+Releases are built by [`dist`](https://github.com/astral-sh/cargo-dist) (the
+Astral fork of cargo-dist). Config lives in `dist-workspace.toml` (`[dist]`
+table) and the generated pipeline in `.github/workflows/release.yml`.
+
+- **Crate `nyetdb`, binary `nyet`** (`[[bin]] name = "nyet"`).
+- **Trigger: a `v*` version tag only** (`pr-run-mode = "skip"` — no PR/branch
+  runs, so the release workflow never interferes with the main CI or publishes
+  before a tag). Pattern: `**[0-9]+.[0-9]+.[0-9]+*`, e.g. `v0.1.0`.
+- **Artifacts** (`dist plan` to preview): per-target `.tar.xz` for
+  `{aarch64,x86_64}-{apple-darwin,unknown-linux-gnu}` (each with the `nyet`
+  binary + `LICENSE-*` + `README.md` + a checksum), a shell installer
+  (`nyetdb-installer.sh`, `curl | sh`), and a Homebrew formula (`nyetdb.rb`).
+  Windows is intentionally not released (SSH tunnels / some tests are unix-only).
+- **Homebrew tap:** `tap = "stasmarkin/homebrew-tap"`, `publish-jobs = ["homebrew"]`.
+  The tap repo is **not** created or pushed by this step (a release act); the
+  publish job needs a `HOMEBREW_TAP_TOKEN` repo secret with write access to the tap.
+- **npm wrapper:** placeholders live in `packaging/npm/` but are **not** wired
+  into `dist` yet (backlog; ROADMAP v0.3 item 12) — connecting dist's npm
+  installer would generate its own package and needs an npm scope/token.
+
+Regenerate the workflow after editing `[dist]` config: `dist init --yes` (writes
+config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
+
+> **`dist generate` overwrites `release.yml` — re-apply three hardenings after it
+> (Д8), dist does not emit them:** (1) pin every `uses:` to a full commit SHA
+> (dist writes floating `@v4` tags); (2) drop the workflow-level `permissions`
+> to `contents: read` and give only the `host` job `contents: write` (dist writes
+> `contents: write` at the workflow level, so every job — including the
+> unprivileged build jobs — would get write); (3) tighten the tag trigger to
+> `v[0-9]+.[0-9]+.[0-9]+*` (dist's default `**[0-9]+.[0-9]+.[0-9]+*` also matches
+> bare `0.0.1` / `releases/0.0.1` tags — require the `v` prefix). The release job
+> is privileged (`contents: write` + `HOMEBREW_TAP_TOKEN`), so the current
+> `release.yml` already carries all three; a regenerate reverts them. dist 0.28
+> has no option to emit SHA pins, per-job permissions or a custom tag regex, so
+> this is a manual post-step. Because the hand-edits make `release.yml` differ
+> from dist's own output, `[dist] allow-dirty = ["ci"]` is set in
+> `dist-workspace.toml` — otherwise the release pipeline's own `dist plan` job
+> would fail its "CI out of date" check and abort every release.
+>
+> One thing NOT to add: keep `persist-credentials: false` off the
+> `publish-homebrew-formula` checkout (it `git push`es to the tap and needs its
+> credentials); it belongs only on the read-only build/host/announce checkouts.
+>
+> **Accepted risk (dist bootstrap):** the release jobs install the `dist` binary
+> with `curl … | sh` over HTTPS from dist's GitHub releases, without an
+> independent SHA-256 of the installer. dist 0.28 offers no installer checksum
+> verification; the mitigation is the pinned `cargo-dist-version = "0.28.7"` (the
+> version, hence the artifact set, is fixed) plus HTTPS/TLS transport. Revisit if
+> dist adds installer attestation, or vendor a pinned `dist` binary. Flagged for
+> the maintainer to accept vs. harden.
+
+**What a human does to cut a release (not automated, on purpose):**
+
+1. **Bump `version` in `Cargo.toml` to the release version (e.g. `0.1.0`)
+   *before* tagging** and update `Cargo.lock`; commit. dist requires the package
+   version to equal the tag version — a tag `v0.1.0` on a `0.0.1` `Cargo.toml`
+   fails the `plan` job. *(nyet ships at `0.0.1`; the `0.1.0` bump is the release
+   act — do not bump it ahead of time.)*
+2. `git tag v0.1.0 && git push origin v0.1.0`.
+3. The `release.yml` pipeline builds the artifacts, creates the GitHub Release,
+   and (with `HOMEBREW_TAP_TOKEN` set) opens/updates the formula in the tap.
+4. First release only: create the `stasmarkin/homebrew-tap` repo and add the
+   `HOMEBREW_TAP_TOKEN` secret; publish crates.io / npm separately if desired.
 
 ## Error codes (closed list, part of the contract)
 
@@ -404,10 +608,10 @@ Three jobs on push/PR, stable toolchain:
 |---|---|---|
 | `CONFIG_INVALID` | 3 | config not found / unreadable / bad TOML / unknown key / missing `${VAR}` / unknown alias / sqlite without `path` / unsupported `[defaults].format` / zero `row_limit`/`timeout_secs`. One code for the whole class — deliberate; details live in `message`. |
 | `DIR_NOT_ALLOWED` | 4 | alias exists but cwd is outside its `allowed_dirs` |
-| `NYET` | 5 | query refused by the validator; `error.reason` from the closed list `PARSE_FAILED` / `MULTI_STATEMENT` / `WRITE_OPERATION` / `TXN_CONTROL` / `LOCKING_CLAUSE` / `DENIED_FUNCTION` (owner: `src/validator.rs`) |
-| `CONNECTION_FAILED` | 6 | database unreachable (sqlite: file missing / unreadable / a directory; postgres: refused, auth failure, or a hung TCP handshake that exceeds the connect deadline — bounded separately inside the engine so a blackholed connect is 6, not 8) |
+| `NYET` | 5 | query refused by the validator; `error.reason` from the closed list `PARSE_FAILED` / `MULTI_STATEMENT` / `WRITE_OPERATION` / `TXN_CONTROL` / `LOCKING_CLAUSE` / `DENIED_FUNCTION` / `EXECUTABLE_COMMENT` (owner: `src/validator.rs`) |
+| `CONNECTION_FAILED` | 6 | database unreachable (sqlite: file missing / unreadable / a directory; postgres/mysql: refused, auth failure, or a hung TCP handshake that exceeds the connect deadline — bounded separately inside each engine so a blackholed connect is 6, not 8) |
 | `DB_ERROR` | 7 | the database accepted the connection but rejected the query |
-| `TIMEOUT` | 8 | query did not finish within the per-query timeout (the future is dropped; a stuck sqlite worker may run until process exit). Postgres: the server `statement_timeout` (SQLSTATE 57014) maps here too, so the exit code is deterministic whichever timer fires; 57014 is `query_canceled` generally, so a manual `pg_cancel_backend` from another session also lands as TIMEOUT (rare, acceptable) |
+| `TIMEOUT` | 8 | query did not finish within the per-query timeout (the future is dropped; a stuck sqlite worker may run until process exit). Postgres: the server `statement_timeout` (SQLSTATE 57014) maps here too, so the exit code is deterministic whichever timer fires; 57014 is `query_canceled` generally, so a manual `pg_cancel_backend` from another session also lands as TIMEOUT (rare, acceptable). MySQL/MariaDB: the server `max_execution_time`/`max_statement_time` (error 3024 / 1969) maps here too |
 | `NOT_IMPLEMENTED` | 1 | resolved connection uses an engine this version does not ship |
 | `INTERNAL` | 1 | nyet's own failure (e.g. cwd cannot be resolved) |
 

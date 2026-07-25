@@ -1,0 +1,34 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist': the release pipeline (GitHub Releases + shell installer +
+# Homebrew tap). Triggered by a `v*` tag; see docs/DEV.md (release process).
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.28.7"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# The Homebrew tap to publish the formula to (repo NOT created/pushed here — a
+# release act; needs a HOMEBREW_TAP_TOKEN secret with write access to the tap).
+tap = "stasmarkin/homebrew-tap"
+publish-jobs = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax). Unix only for
+# v0.1: SSH tunnels and several tests are unix-only, so Windows is not released
+# yet (documented in the README install section).
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
+# Do not run on pull requests (no plan job on PRs): the release workflow fires
+# only on a `v` tag, so it never interferes with the main CI or publishes
+# anything before a tag.
+pr-run-mode = "skip"
+# The generated release.yml is hand-hardened AFTER `dist generate` (SHA-pinned
+# actions, least-privilege per-job permissions, `v`-prefixed tag trigger — see
+# docs/DEV.md), so it intentionally differs from dist's output. Without this,
+# the release pipeline's own `dist plan` job would fail its out-of-date check.
+allow-dirty = ["ci"]

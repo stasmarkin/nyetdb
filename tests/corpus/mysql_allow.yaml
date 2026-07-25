@@ -1,0 +1,75 @@
+# Golden corpus — legitimate reads that must pass (MySQL/MariaDB dialect).
+# Dialect defaults to `mysql` from the filename prefix (see docs/DEV.md).
+# Format: one case per `- query:` line.
+
+- query: SELECT 1
+  verdict: allow
+- query: SELECT * FROM users WHERE id = 1
+  verdict: allow
+- query: SELECT u.id, o.total FROM users u JOIN orders o ON o.user_id = u.id
+  verdict: allow
+
+# MySQL-specific syntax that must not be mistaken for something dangerous
+- query: SELECT `id`, `email` FROM `users` LIMIT 10
+  verdict: allow
+- query: SELECT id FROM users ORDER BY id LIMIT 5 OFFSET 10
+  verdict: allow
+- query: SELECT id FROM users WHERE name = "double-quoted-is-a-string"
+  verdict: allow
+- query: SELECT JSON_EXTRACT(doc, '$.k') AS k FROM events
+  verdict: allow
+- query: SELECT doc->'$.a' AS a, doc->>'$.b' AS b FROM events
+  verdict: allow
+- query: SELECT GROUP_CONCAT(email SEPARATOR ',') AS emails FROM users
+  verdict: allow
+- query: SELECT id, name COLLATE utf8mb4_bin AS n FROM users
+  verdict: allow
+
+# CTE, window functions, aggregates (MySQL 8 / MariaDB 10.2+)
+- query: WITH top AS (SELECT user_id, sum(total) s FROM orders GROUP BY user_id) SELECT * FROM top WHERE s > 100
+  verdict: allow
+- query: WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 5) SELECT x FROM cnt
+  verdict: allow
+- query: SELECT id, row_number() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn FROM orders
+  verdict: allow
+- query: SELECT count(*), avg(total) FROM orders GROUP BY user_id HAVING count(*) > 2
+  verdict: allow
+
+# EXPLAIN (read), SHOW, DESCRIBE and set operations
+- query: EXPLAIN SELECT * FROM users
+  verdict: allow
+- query: SHOW TABLES
+  verdict: allow
+- query: SHOW DATABASES
+  verdict: allow
+- query: SHOW COLUMNS FROM users
+  verdict: allow
+- query: DESCRIBE users
+  verdict: allow
+- query: SELECT id FROM a UNION SELECT id FROM b
+  verdict: allow
+
+# a column / table merely NAMED like a denied function is not a call
+- query: SELECT sleep FROM settings
+  verdict: allow
+- query: SELECT benchmark.col FROM t
+  verdict: allow
+- query: SELECT get_lock FROM t
+  verdict: allow
+- query: SELECT master_pos_wait FROM t
+  verdict: allow
+- query: SELECT master_gtid_wait FROM t
+  verdict: allow
+- query: SELECT load_file FROM t
+  verdict: allow
+- query: SELECT release_lock FROM t
+  verdict: allow
+# a string literal that merely CONTAINS an executable-comment opener is data,
+# not a comment (pins the scanner's string-awareness — no false deny)
+- query: SELECT '/*! not a comment */' AS s
+  verdict: allow
+- query: SELECT id FROM t WHERE note = '/*+ hint-like text */'
+  verdict: allow
+# derived table (subquery in FROM) with a plain read -> allowed
+- query: SELECT * FROM (SELECT id FROM users) d
+  verdict: allow

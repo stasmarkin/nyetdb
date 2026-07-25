@@ -17,19 +17,22 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
 - config: parsing, validation (unknown keys are hard errors), `${VAR}`
   substitution, `password_env`, file permission warnings;
 - directory scoping (`allowed_dirs`) and `nyet list`;
-- `nyet query` for **SQLite** and **PostgreSQL**: the full SQL validator
-  (read-only allowlist, recursive AST walk, Unicode stripping, locking clauses,
-  per-engine function denylist with per-connection policy), session read-only
-  enforcement (SQLite `mode=ro`; PostgreSQL `default_transaction_read_only` +
-  server `statement_timeout` + an explicit `BEGIN READ ONLY`), row limit,
-  timeout, json / jsonl / csv / table output;
-- **SSH tunnels** for PostgreSQL: reach a database behind a bastion by shelling
-  out to the system `ssh` (see the SSH tunnels section below);
+- `nyet query` for **SQLite**, **PostgreSQL** and **MySQL/MariaDB**: the full
+  SQL validator (read-only allowlist, recursive AST walk, Unicode stripping,
+  locking clauses, per-engine function denylist with per-connection policy),
+  session read-only enforcement (SQLite `mode=ro`; PostgreSQL
+  `default_transaction_read_only` + server `statement_timeout` + an explicit
+  `BEGIN READ ONLY`; MySQL/MariaDB an explicit `START TRANSACTION READ ONLY` +
+  a server-side `max_execution_time`/`max_statement_time`), row limit, timeout,
+  json / jsonl / csv / table output;
+- **SSH tunnels** for PostgreSQL and MySQL/MariaDB: reach a database behind a
+  bastion by shelling out to the system `ssh` (see the SSH tunnels section below);
 - the stable JSON envelope and exit-code contract.
 
-MySQL/MariaDB arrive in a later release; `nyet query` against a not-yet-supported
-engine resolves the connection and returns `NOT_IMPLEMENTED`. PostgreSQL over TLS
-is not wired up yet (connect to localhost, e.g. via an SSH tunnel).
+Redis, MongoDB and ClickHouse arrive in later releases; `nyet query` against a
+not-yet-supported engine resolves the connection and returns `NOT_IMPLEMENTED`.
+Connections over TLS are not wired up yet (this build ships without a TLS
+backend — connect to localhost, e.g. via an SSH tunnel).
 
 - [Roadmap](ROADMAP.md)
 - [Design](docs/DESIGN.md)
@@ -37,11 +40,27 @@ is not wired up yet (connect to localhost, e.g. via an SSH tunnel).
 
 ## Install
 
+Once a `v*` release is published, install a prebuilt binary with the shell
+installer or Homebrew (both produced by the release pipeline — see
+[docs/DEV.md](docs/DEV.md)):
+
+```sh
+# shell installer (macOS/Linux, x86_64 and aarch64)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/stasmarkin/nyetdb/releases/latest/download/nyetdb-installer.sh | sh
+
+# or Homebrew
+brew install stasmarkin/tap/nyetdb
+```
+
+Or build from source (any platform with a Rust toolchain):
+
 ```sh
 cargo install --path .
 ```
 
-(Prebuilt binaries, installer and Homebrew come with v0.1.)
+Prebuilt binaries cover macOS and Linux (x86_64 + aarch64). Windows is not
+released yet — SSH tunnels and some tests are unix-only; build from source if
+you need it.
 
 ## Configuration
 
@@ -87,6 +106,12 @@ host = "deploy@bastion.corp:22"     # [user@]bastion[:port]
 remote = "db.internal:5432"         # host:port to forward to, as seen from the bastion
 control_persist = "15m"             # optional; default 15m
 
+[connections.analytics]
+engine = "mariadb"                     # or "mysql" — same driver/dialect
+url = "mysql://nyet_ro@db.internal:3306/shop"
+password_env = "ANALYTICS_DB_PASSWORD"
+allowed_dirs = ["~/Workspace/shop"]
+
 [connections.localdev]
 engine = "sqlite"
 path = "./dev.db"                      # sqlite uses path instead of url
@@ -113,6 +138,46 @@ integers/floats/bool natively, `numeric` → string (exact, no rounding),
 `bytea` → lowercase hex, `NULL` → null; an exotic type nyet cannot serialize
 returns a DB_ERROR asking you to `::text`-cast the column.
 
+MySQL/MariaDB specifics: use `engine = "mysql"` or `engine = "mariadb"` (they
+share the driver and SQL dialect; the only difference is the server-side query
+timeout variable — MySQL's `max_execution_time` in milliseconds vs MariaDB's
+`max_statement_time` in seconds — which nyet sets for you). `url` is required
+(`mysql://user@host:port/dbname`); the password goes in `password_env`, never in
+the file or url. Every query runs inside an explicit `START TRANSACTION READ
+ONLY`, so a write that slipped past the validator is refused by the server, and
+a runaway query is cancelled server-side → exit 8. Result types map to JSON as:
+integers/floats/bool natively, `BIGINT UNSIGNED` as a number (may exceed i64),
+`DECIMAL` → string (exact), `DATE`/`DATETIME`/`TIMESTAMP`/`TIME` → string,
+`VARCHAR`/`TEXT`/`ENUM` → string, `BINARY`/`BLOB` → lowercase hex, MySQL `JSON`
+→ structured JSON, `NULL` → null. (On MariaDB, `JSON` columns are `LONGTEXT`
+under the hood, so they come back as a JSON string, not structured.) An exotic
+type nyet cannot serialize returns a DB_ERROR asking you to `CAST(col AS CHAR)`.
+
+> **Known limitation — MySQL 8 password auth needs TLS.** MySQL 8's default
+> `caching_sha2_password` auth requires either TLS or a client-side RSA exchange
+> to send a password over a non-encrypted connection. This build ships no TLS
+> backend (and deliberately no RSA crate — the only maintained one carries an
+> unpatched timing-attack advisory, RUSTSEC-2023-0071), so a password against a
+> default MySQL 8 server over a plaintext/SSH-tunnel leg fails at connect. Work
+> around it with: a **MariaDB** server (its default `mysql_native_password`
+> works over plaintext), a MySQL user created `WITH mysql_native_password`, a
+> no-password/trust setup, or wait for the TLS-enabled build. The SSH-tunnel
+> client→bastion hop is still encrypted regardless.
+
+### Recommended: a read-only MySQL/MariaDB user (layer 3)
+
+Same idea as the PostgreSQL role: a `SELECT`-only user makes even a direct
+connection (bypassing nyet) read-only.
+
+```sql
+CREATE USER 'nyet_ro'@'%' IDENTIFIED BY 'set-a-strong-one';
+GRANT SELECT ON app.* TO 'nyet_ro'@'%';
+FLUSH PRIVILEGES;
+```
+
+Then `url = "mysql://nyet_ro@db.internal:3306/app"` and
+`password_env = "NYET_RO_PASSWORD"`.
+
 ### Recommended: a read-only PostgreSQL role (layer 3)
 
 `nyet` is read-only, but an agent with shell access could bypass it and reach
@@ -131,10 +196,11 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO nyet_ro;
 Then `url = "postgres://nyet_ro@db.internal:5432/app"` and
 `password_env = "NYET_RO_PASSWORD"`.
 
-### SSH tunnels (PostgreSQL behind a bastion)
+### SSH tunnels (a database behind a bastion)
 
 The common production setup — the database is only reachable from a jump host —
-works by adding an `[ssh]` section to the connection:
+works for PostgreSQL and MySQL/MariaDB by adding an `[ssh]` section to the
+connection:
 
 ```toml
 [connections.prod.ssh]
@@ -145,7 +211,7 @@ control_persist = "15m"             # optional (default 15m); see reuse below
 
 When a query runs, `nyet` shells out to the **system `ssh`** to open a local
 port forward (`ssh -f -N -L 127.0.0.1:<random>:db.internal:5432 deploy@bastion.corp -p 22`),
-then connects the Postgres engine to `127.0.0.1:<random>`. The `url`'s host and
+then connects the database engine to `127.0.0.1:<random>`. The `url`'s host and
 port are replaced by the tunnel; its user, database and query parameters are
 kept, and the password still comes from `password_env`. A free local port is
 picked automatically.
@@ -195,14 +261,20 @@ picked automatically.
 - **SQLite + `[ssh]` is rejected** (exit 3): a tunnel forwards a TCP port, but
   SQLite is a local file, so ssh does not apply.
 
-> **Known limitation — no TLS backend.** This build of `nyet` ships without a TLS
-> backend, which has two consequences: (1) a *direct*, non-tunnelled connection
-> to a server that requires TLS (`sslmode=require` and stricter) is not supported
-> and fails at connect; (2) over an SSH tunnel, the bastion→database hop is
-> plaintext (see the TLS bullet above), so that hop relies on a trusted network
-> segment. Reach a TLS-only server through a tunnel (the client→bastion hop is
-> encrypted), keep the DB close to the bastion, or wait for the TLS-enabled
-> build. This is a separate, tracked decision, not an SSH-tunnel bug.
+> **Known limitation — no TLS backend (traffic to the DB is unencrypted).** This
+> build of `nyet` ships without a TLS backend, which has three consequences:
+> (1) a *direct*, non-tunnelled connection to a server that **requires** TLS
+> (`sslmode=require` / MySQL `REQUIRED` and stricter) is not supported and fails
+> at connect; (2) a *direct* connection to a server that merely **allows** TLS
+> (the common default — Postgres `prefer`, MySQL `PREFERRED`) **silently connects
+> in plaintext**: your queries and results travel unencrypted over the network,
+> with no warning; (3) over an SSH tunnel the client→bastion hop is encrypted by
+> SSH, but the bastion→database hop is a separate plaintext TCP connection (see
+> the TLS bullet above). **So: without an SSH tunnel, treat the `nyet`→database
+> link as cleartext — use it only over localhost or a trusted network segment,
+> or put an SSH tunnel in front.** Reach a TLS-only server through a tunnel, keep
+> the DB close to the bastion, or wait for the TLS-enabled build. This is a
+> separate, tracked decision, not a bug.
 
 Rules:
 
@@ -309,12 +381,22 @@ agent (see the threat model in [docs/DESIGN.md](docs/DESIGN.md)):
 3. **Read-only database roles** — recommended; makes even direct access
    (bypassing nyet) read-only. See the PostgreSQL role recipe above.
 
-The validator pipeline: strip invisible Unicode (Cf/Cc) characters → parse
-(the engine's SQL dialect — SQLite or PostgreSQL) → exactly one statement →
-recursive AST walk. The walk denies write/DDL statements anywhere in the tree
-(CTE bodies including data-modifying CTEs like `WITH x AS (DELETE ... RETURNING)`,
-derived tables, subqueries), locking clauses (`FOR UPDATE`/`FOR SHARE`),
-`COPY`, `SET`, and denylisted functions.
+The validator pipeline: strip invisible Unicode (Cf/Cc) characters → (MySQL/
+MariaDB only) reject executable comments / optimizer hints → parse (the engine's
+SQL dialect — SQLite, PostgreSQL or MySQL) → exactly one statement → recursive
+AST walk. The walk denies write/DDL statements anywhere in the tree (CTE bodies
+including data-modifying CTEs like `WITH x AS (DELETE ... RETURNING)`, derived
+tables, subqueries), locking clauses (`FOR UPDATE`/`FOR SHARE`), `COPY`, `SET`,
+and denylisted functions.
+
+**MySQL/MariaDB executable comments.** MySQL runs the body of `/*! ... */`,
+`/*M! ... */` (MariaDB) and optimizer-hint `/*+ ... */` comments, but a SQL
+parser drops them as ordinary comments — so `SELECT 1 /*! SLEEP(10) */` would
+look like `SELECT 1` to the AST while the server executes `SLEEP`. Before
+parsing, nyet scans MySQL queries (string-aware, so a `/*!` inside a quoted
+literal is data, not a comment) and denies any such opener outside a literal
+(`EXECUTABLE_COMMENT`). This is MySQL-only — PostgreSQL and SQLite do not
+execute comment bodies.
 
 ### How to read a refusal
 
@@ -335,6 +417,7 @@ to do:
 | `TXN_CONTROL` | transaction or session control (BEGIN/COMMIT/ROLLBACK/SET) |
 | `LOCKING_CLAUSE` | `SELECT ... FOR UPDATE` / `FOR SHARE` — takes row locks, not a plain read |
 | `DENIED_FUNCTION` | a function on the denylist for this connection (the message names it) |
+| `EXECUTABLE_COMMENT` | a MySQL/MariaDB executable comment or optimizer hint (`/*! … */`, `/*M! … */`, `/*+ … */`) — the server runs its body but a SQL parser drops it, so nyet cannot see what it does; remove the comment |
 
 PRAGMA is refused with a pointer instead of a dead end: schema questions
 have a SELECT answer (`SELECT name, sql FROM sqlite_master WHERE type = 'table'`).
@@ -353,6 +436,15 @@ Some functions are dangerous even inside a read-only query. The built-in
 lists (per engine; rationale in [docs/DEV.md](docs/DEV.md)):
 
 - **SQLite:** `load_extension`, `fts3_tokenizer`, `readfile`, `writefile`, `edit`.
+- **MySQL/MariaDB:** `load_file` (reads a server file), `sleep` and `benchmark`
+  (connection-tie-up / CPU DoS), `sys_exec`/`sys_eval` (the `lib_mysqludf_sys`
+  UDFs — shell/command execution if installed), the named-lock family
+  `get_lock`/`release_lock`/`release_all_locks` (`GET_LOCK(name, -1)` blocks the
+  connection forever — DoS), and the replication-wait family `master_pos_wait`/
+  `source_pos_wait`/`master_gtid_wait`/`wait_for_executed_gtid_set`/
+  `wait_until_sql_thread_after_gtids` (block until a replica position — DoS).
+  `SELECT ... INTO OUTFILE`/`INTO DUMPFILE` (writing a server file) is refused too
+  (it fails to parse — fail closed).
 - **PostgreSQL:** `pg_terminate_backend`, `pg_cancel_backend`, `pg_reload_conf`,
   `pg_promote`, the `pg_sleep` family (`pg_sleep`/`pg_sleep_for`/`pg_sleep_until`),
   `nextval`/`setval`/`pg_logical_emit_message` (sequence mutation and

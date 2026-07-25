@@ -8,7 +8,7 @@
 //! locking clauses, function denylist).
 
 use sqlparser::ast::{Expr, ObjectName, Query, Select, Statement, TableFactor, Visit, Visitor};
-use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -25,6 +25,7 @@ pub enum DenyReason {
     TxnControl,
     LockingClause,
     DeniedFunction,
+    ExecutableComment,
 }
 
 impl DenyReason {
@@ -36,6 +37,7 @@ impl DenyReason {
             DenyReason::TxnControl => "TXN_CONTROL",
             DenyReason::LockingClause => "LOCKING_CLAUSE",
             DenyReason::DeniedFunction => "DENIED_FUNCTION",
+            DenyReason::ExecutableComment => "EXECUTABLE_COMMENT",
         }
     }
 }
@@ -66,6 +68,7 @@ pub enum Verdict {
 enum Dialect {
     Sqlite,
     Postgres,
+    Mysql,
 }
 
 /// Per-engine validation policy: the SQL dialect plus the function denylist
@@ -128,6 +131,32 @@ const POSTGRES_DENIED_FUNCTIONS: &[&str] = &[
 /// - `pg_ls_*` — pg_ls_dir, pg_ls_logdir, pg_ls_waldir, ...: server-dir listing.
 const POSTGRES_DENIED_PREFIXES: &[&str] = &["dblink", "pg_read_", "pg_ls_"];
 
+/// Built-in MySQL/MariaDB denylist (rationale in docs/DEV.md): functions that
+/// act OUTSIDE the read-only transaction (filesystem, connection-tie-up DoS,
+/// UDF code execution), so layer 2 does not stop them — the validator is the
+/// only guard. Config-tunable via `allow_functions` / `deny_functions`.
+const MYSQL_DENIED_FUNCTIONS: &[&str] = &[
+    "load_file", // reads any server file into a string (needs FILE priv; deny anyway)
+    "sleep",     // silent DoS: ties up a pooled connection (like pg_sleep)
+    "benchmark", // BENCHMARK(count, expr): CPU DoS loop
+    "sys_exec",  // lib_mysqludf_sys UDF: runs a shell command (RCE) if installed
+    "sys_eval",  // lib_mysqludf_sys UDF: runs a command and returns output (RCE)
+    // Named-lock family: GET_LOCK(name, -1) blocks the connection forever
+    // (DoS, the SLEEP class). release_* are non-blocking but denied for
+    // completeness — an agent read never needs any of them. (is_used_lock /
+    // is_free_lock are pure reads, left allowed.)
+    "get_lock",
+    "release_lock",
+    "release_all_locks",
+    // Replication-wait family: each blocks until a replica/GTID position
+    // (unbounded DoS).
+    "master_pos_wait",
+    "source_pos_wait",
+    "master_gtid_wait", // MariaDB: blocks until a GTID position is reached
+    "wait_for_executed_gtid_set",
+    "wait_until_sql_thread_after_gtids",
+];
+
 impl Policy {
     /// Effective SQLite policy: built-in list minus `allow_functions` plus
     /// `deny_functions`. Deny wins when a name appears in both (fail closed).
@@ -154,6 +183,22 @@ impl Policy {
                 deny_functions,
             ),
             denied_prefixes: POSTGRES_DENIED_PREFIXES,
+        }
+    }
+
+    /// Effective MySQL/MariaDB policy. MariaDB is dialect-identical to MySQL in
+    /// sqlparser, so both engines share this. Tuned by config like sqlite().
+    /// No prefix families (MySQL's dangerous functions have no clean shared
+    /// prefix; enumerated by exact name so `allow_functions` can reach them).
+    pub fn mysql(allow_functions: &[String], deny_functions: &[String]) -> Policy {
+        Policy {
+            dialect: Dialect::Mysql,
+            denied_functions: merge_denylist(
+                MYSQL_DENIED_FUNCTIONS,
+                allow_functions,
+                deny_functions,
+            ),
+            denied_prefixes: &[],
         }
     }
 }
@@ -199,6 +244,122 @@ pub fn strip_control(sql: &str) -> (Cow<'_, str>, usize) {
     }
 }
 
+/// True if `sql` contains a MySQL/MariaDB *executable* comment opener — `/*!`,
+/// `/*M!` (case-insensitive) or an optimizer hint `/*+` — OUTSIDE any string or
+/// identifier literal and outside an ordinary comment. String-aware so a literal
+/// that merely contains the text (`'/*! not a comment */'`) is data, not a hit.
+///
+/// The validator is pure and runs BEFORE connecting, so it does not know the
+/// server's `sql_mode` — which changes where a string ENDS: under
+/// `NO_BACKSLASH_ESCAPES` a `\` is a literal (so `'x\'` closes the string), and
+/// under `ANSI_QUOTES` `"` is an identifier without `\` escapes (so `"x\"`
+/// closes). A single default-mode pass under-denies both: it would think the
+/// string runs past a `/*!` the server actually executes. Fail-closed fix: scan
+/// TWICE and deny if EITHER pass finds an opener outside a literal —
+/// `backslash_escapes = true` (default `'`/`"` strings) and `= false`
+/// (`NO_BACKSLASH_ESCAPES`, which also models `ANSI_QUOTES` `"`-identifiers,
+/// escape-free). The real server matches exactly one pass on the backslash
+/// question, so an executed opener is flagged by at least one. Doubling
+/// (`''`/`""`/`` `` ``) is mode-independent and applied in both. Over-denial of a
+/// benign string containing a backslash is the acceptable failure direction.
+/// Pure (Д1); scans bytes (ASCII delimiters never collide with UTF-8 >= 0x80).
+fn has_mysql_executable_comment(sql: &str) -> bool {
+    scan_executable_comment(sql, true) || scan_executable_comment(sql, false)
+}
+
+fn scan_executable_comment(sql: &str, backslash_escapes: bool) -> bool {
+    #[derive(PartialEq)]
+    enum S {
+        Normal,
+        Single,
+        Double,
+        Backtick,
+        Block,
+        Line,
+    }
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    let mut state = S::Normal;
+    while i < n {
+        let c = b[i];
+        match state {
+            S::Normal => match c {
+                b'\'' => state = S::Single,
+                b'"' => state = S::Double,
+                b'`' => state = S::Backtick,
+                b'#' => state = S::Line,
+                // MySQL `-- ` comment: the `--` must be followed by whitespace
+                // (or EOL). `--x` is NOT a comment, so don't enter Line there
+                // (that would skip a later `/*!` on the "line" — a bypass).
+                b'-' if b.get(i + 1) == Some(&b'-')
+                    && b.get(i + 2).is_none_or(|&x| x.is_ascii_whitespace()) =>
+                {
+                    state = S::Line;
+                    i += 1;
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    let after = b.get(i + 2).copied();
+                    let executable = matches!(after, Some(b'!') | Some(b'+'))
+                        || (matches!(after, Some(b'M') | Some(b'm'))
+                            && b.get(i + 3) == Some(&b'!'));
+                    if executable {
+                        return true;
+                    }
+                    state = S::Block;
+                    i += 1; // consume the '*' so `/*/` isn't read as opener+closer
+                }
+                _ => {}
+            },
+            S::Single => {
+                if backslash_escapes && c == b'\\' {
+                    i += 1; // skip the escaped byte
+                } else if c == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 1; // doubled '' is a literal quote (mode-independent)
+                    } else {
+                        state = S::Normal;
+                    }
+                }
+            }
+            S::Double => {
+                if backslash_escapes && c == b'\\' {
+                    i += 1;
+                } else if c == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        i += 1;
+                    } else {
+                        state = S::Normal;
+                    }
+                }
+            }
+            S::Backtick => {
+                // Identifiers never take `\` escapes; only `` `` `` doubling.
+                if c == b'`' {
+                    if b.get(i + 1) == Some(&b'`') {
+                        i += 1;
+                    } else {
+                        state = S::Normal;
+                    }
+                }
+            }
+            S::Block => {
+                if c == b'*' && b.get(i + 1) == Some(&b'/') {
+                    state = S::Normal;
+                    i += 1;
+                }
+            }
+            S::Line => {
+                if c == b'\n' {
+                    state = S::Normal;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Classify one query under the engine's policy (which carries the dialect).
 pub fn validate(sql: &str, policy: &Policy) -> Verdict {
     let (sql, removed) = strip_control(sql);
@@ -217,9 +378,28 @@ pub fn validate(sql: &str, policy: &Policy) -> Verdict {
             return pragma_deny();
         }
     }
+    // MySQL/MariaDB only: reject executable comments and optimizer hints BEFORE
+    // parsing. sqlparser drops `/*! ... */`, `/*M! ... */` and `/*+ ... */` as
+    // ordinary comments, so their payload never reaches the AST — but the SERVER
+    // executes it. `SELECT 1 /*! SLEEP(10) */` would validate as `SELECT 1` yet
+    // run SLEEP (and `/*! ... INTO OUTFILE ... */` would write a file), bypassing
+    // the whole layer-1 policy. Fail closed. Postgres/SQLite do not execute
+    // comment bodies, so this is MySQL-only.
+    if matches!(policy.dialect, Dialect::Mysql) && has_mysql_executable_comment(&sql) {
+        return deny(
+            DenyReason::ExecutableComment,
+            "the query contains a MySQL executable comment or optimizer hint \
+             (/*! ... */, /*M! ... */ or /*+ ... */), whose body the server runs \
+             but a SQL parser ignores"
+                .to_string(),
+            "remove the /*! ... */, /*M! ... */ or /*+ ... */ comment; write the \
+             statement as plain SQL so nyet can see everything it will execute",
+        );
+    }
     let parsed = match policy.dialect {
         Dialect::Sqlite => Parser::parse_sql(&SQLiteDialect {}, &sql),
         Dialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, &sql),
+        Dialect::Mysql => Parser::parse_sql(&MySqlDialect {}, &sql),
     };
     let statements = match parsed {
         Ok(s) => s,
@@ -527,6 +707,8 @@ mod tests {
         // `dialect:` still overrides.
         let default_dialect = if name.starts_with("postgres") {
             "postgres"
+        } else if name.starts_with("mysql") {
+            "mysql"
         } else {
             "sqlite"
         };
@@ -585,6 +767,7 @@ mod tests {
                 let verdict = match case.dialect.as_str() {
                     "sqlite" => validate(&case.query, &Policy::sqlite(&[], &[])),
                     "postgres" => validate(&case.query, &Policy::postgres(&[], &[])),
+                    "mysql" => validate(&case.query, &Policy::mysql(&[], &[])),
                     other => panic!("{at}: unknown dialect {other:?}"),
                 };
                 match verdict {
@@ -624,7 +807,7 @@ mod tests {
         }
         // Tripwire against accidental corpus loss (a whole file or a large
         // chunk vanishing must fail loudly). Raise as the corpus grows.
-        assert!(total >= 150, "corpus suspiciously small: {total} cases");
+        assert!(total >= 200, "corpus suspiciously small: {total} cases");
     }
 
     #[test]
@@ -752,6 +935,100 @@ mod tests {
                 "{sql} must stay denied despite allow_functions"
             );
         }
+    }
+
+    #[test]
+    fn mysql_denylist_and_dialect() {
+        let my = Policy::mysql(&[], &[]);
+        // Built-in MySQL denials.
+        for sql in [
+            "SELECT sleep(5)",
+            "SELECT benchmark(1000000, md5('x'))",
+            "SELECT load_file('/etc/passwd')",
+            "SELECT sys_exec('rm -rf /')",
+            "SELECT SLEEP(1)", // case-insensitive
+        ] {
+            assert!(
+                matches!(
+                    validate(sql, &my),
+                    Verdict::Deny {
+                        reason: DenyReason::DeniedFunction,
+                        ..
+                    }
+                ),
+                "{sql} must be denied"
+            );
+        }
+        // MySQL-specific syntax that must parse and pass under MySqlDialect.
+        for sql in [
+            "SELECT `id`, `email` FROM `users` LIMIT 10",
+            "SELECT JSON_EXTRACT(doc, '$.k') AS k FROM events",
+            "SELECT id FROM users WHERE name = \"quoted\"", // MySQL double-quoted string
+        ] {
+            assert!(
+                matches!(validate(sql, &my), Verdict::Allow { .. }),
+                "{sql} must be allowed"
+            );
+        }
+        // allow_functions un-denies (documented escape hatch).
+        let relaxed = Policy::mysql(&["sleep".to_string()], &[]);
+        assert!(matches!(
+            validate("SELECT sleep(1)", &relaxed),
+            Verdict::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn executable_comment_scanner_is_string_aware() {
+        // Hits: executable comments / optimizer hint in normal code.
+        for sql in [
+            "SELECT 1 /*! SLEEP(1) */",
+            "SELECT 1 /*!50000 SLEEP(1) */",
+            "SELECT 1 /*M! SLEEP(1) */",
+            "SELECT /*+ MAX_EXECUTION_TIME(1000) */ 1",
+            "SELECT 1/*!*/",
+            // sql_mode bypasses (fail closed via the no-backslash-escapes pass):
+            // NO_BACKSLASH_ESCAPES makes 'x\' close the string, exposing /*!.
+            "SELECT id FROM t WHERE name='x\\' AND 1=1 /*! OR SLEEP(5) */ AND note='y'",
+            // ANSI_QUOTES makes "x\" a closed identifier, likewise exposing /*!.
+            "SELECT id FROM t WHERE name=\"x\\\" AND 1=1 /*! OR SLEEP(5) */ AND id=\"y\"",
+        ] {
+            assert!(has_mysql_executable_comment(sql), "must flag: {sql}");
+        }
+        // Misses: the opener sits inside a clean literal or an ordinary comment
+        // (no backslash trick) — data, not an executable comment. Both passes
+        // agree the opener is inside a string/identifier.
+        for sql in [
+            "SELECT '/*! not a comment */' AS s",
+            "SELECT \"/*! nope */\" AS s",
+            "SELECT `/*!col` FROM t",         // backtick identifier
+            "SELECT 1 /* plain comment */",   // ordinary block comment
+            "SELECT 1 # tail /*! hidden */",  // inside a # line comment
+            "SELECT 1 -- tail /*! hidden */", // inside a -- line comment
+            "SELECT 'a''b /*! ok */' AS s",   // doubled-quote escape (mode-independent)
+        ] {
+            assert!(!has_mysql_executable_comment(sql), "must not flag: {sql}");
+        }
+        // End-to-end: the validator denies with EXECUTABLE_COMMENT, and the
+        // string-literal twin is allowed (only under the MySQL dialect).
+        let my = Policy::mysql(&[], &[]);
+        assert!(matches!(
+            validate("SELECT 1 /*! SLEEP(1) */", &my),
+            Verdict::Deny {
+                reason: DenyReason::ExecutableComment,
+                ..
+            }
+        ));
+        assert!(matches!(
+            validate("SELECT '/*! not a comment */' AS s", &my),
+            Verdict::Allow { .. }
+        ));
+        // Postgres/SQLite do not execute comment bodies -> not scanned here:
+        // the same text that MySQL denies is an ordinary comment elsewhere.
+        assert!(matches!(
+            validate("SELECT 1 /*! */", &Policy::postgres(&[], &[])),
+            Verdict::Allow { .. }
+        ));
     }
 
     #[test]

@@ -157,6 +157,7 @@ impl Failure {
 enum Db {
     Sqlite(engine::Sqlite),
     Postgres(engine::Postgres),
+    Mysql(engine::Mysql),
 }
 
 impl Db {
@@ -168,6 +169,19 @@ impl Db {
         match self {
             Db::Sqlite(e) => e.execute(sql, fetch_limit).await,
             Db::Postgres(e) => e.execute(sql, fetch_limit).await,
+            Db::Mysql(e) => e.execute(sql, fetch_limit).await,
+        }
+    }
+
+    /// Point a server engine at the tunnel's local end. Exhaustive match so a
+    /// future engine that forgot to wire the tunnel fails to compile rather than
+    /// silently connecting straight to the real host (a bastion bypass). SQLite
+    /// has no host (sqlite + `[ssh]` is rejected at config parse).
+    fn set_host_override(&mut self, over: (String, u16)) {
+        match self {
+            Db::Postgres(pg) => pg.host_override = Some(over),
+            Db::Mysql(my) => my.host_override = Some(over),
+            Db::Sqlite(_) => {}
         }
     }
 }
@@ -401,28 +415,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                              in the config",
                         ));
                     };
-                    // password_env holds the NAME of an env var; its value is
-                    // read here and never printed. A named-but-unset var is a
-                    // hard config error (like a missing ${VAR}).
-                    let password = match &conn.password_env {
-                        Some(var) => match std::env::var(var) {
-                            Ok(v) => Some(v),
-                            Err(_) => {
-                                return Err(Failure::new(
-                                    ErrorCode::ConfigInvalid,
-                                    format!(
-                                        "connection '{alias}' sets password_env = \"{var}\" but \
-                                         that environment variable is not set"
-                                    ),
-                                    format!(
-                                        "export {var}=... before running nyet, or remove \
-                                         password_env to connect without a password"
-                                    ),
-                                ))
-                            }
-                        },
-                        None => None,
-                    };
+                    let password = read_password_env(&alias, conn)?;
                     (
                         Db::Postgres(engine::Postgres {
                             url: url.clone(),
@@ -436,15 +429,53 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                                 .min(i32::MAX as u64),
                             // Filled in below once the SSH tunnel (if any) is up.
                             host_override: None,
+                            // Production: the generous connect_deadline floor.
+                            connect_timeout_ms: None,
                         }),
                         validator::Policy::postgres(v_allow, v_deny),
+                    )
+                }
+                // MariaDB is dialect- and protocol-identical to MySQL here; the
+                // engine sets both server-timeout variables (MySQL's and
+                // MariaDB's) and swallows the wrong-flavor error, so the label
+                // needs no special handling.
+                "mysql" | "mariadb" => {
+                    let Some(url) = &conn.url else {
+                        return Err(Failure::new(
+                            ErrorCode::ConfigInvalid,
+                            format!(
+                                "connection '{alias}' has engine = \"{}\" but no `url`",
+                                conn.engine
+                            ),
+                            "add url = \"mysql://user@host:port/dbname\" to this connection \
+                             in the config",
+                        ));
+                    };
+                    let password = read_password_env(&alias, conn)?;
+                    (
+                        Db::Mysql(engine::Mysql {
+                            url: url.clone(),
+                            password,
+                            // Clamp to u32::MAX ms so a huge timeout_secs stays
+                            // within MySQL's max_execution_time range; the outer
+                            // tokio timeout still caps the wall clock.
+                            statement_timeout_ms: timeout_secs
+                                .saturating_mul(1000)
+                                .min(u32::MAX as u64),
+                            // Filled in below once the SSH tunnel (if any) is up.
+                            host_override: None,
+                            // Production: the generous connect_deadline floor.
+                            connect_timeout_ms: None,
+                        }),
+                        validator::Policy::mysql(v_allow, v_deny),
                     )
                 }
                 other => {
                     return Err(Failure::new(
                         ErrorCode::NotImplemented,
                         format!("engine \"{other}\" of connection '{alias}' is not supported yet"),
-                        "supported engines: sqlite, postgres; others arrive in later releases",
+                        "supported engines: sqlite, postgres, mysql, mariadb; others arrive in \
+                         later releases",
                     ))
                 }
             };
@@ -480,12 +511,13 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // Layer 2.5: an SSH tunnel to a bastion, opened AFTER the validator
             // (a refused query exits 5 without paying for ssh) and BEFORE the
             // engine connects. A tunnel failure is CONNECTION_FAILED (exit 6).
-            // sqlite + ssh was already rejected at config parse, so only
-            // Postgres reaches here; host/remote are config-validated non-empty.
-            // The guard is held for the whole query and torn down on drop (the
-            // master, if any, stays for reuse) so forwards never accumulate.
+            // sqlite + ssh was already rejected at config parse, so only the
+            // server engines (Postgres, MySQL/MariaDB) reach here; host/remote
+            // are config-validated non-empty. The guard is held for the whole
+            // query and torn down on drop (the master, if any, stays for reuse)
+            // so forwards never accumulate.
             let mut _tunnel = None;
-            if let (Db::Postgres(pg), Some(ssh)) = (&mut db, &conn.ssh) {
+            if let Some(ssh) = &conn.ssh {
                 // host/remote are guaranteed Some+valid by config parse; a None
                 // here is an internal invariant break, not agent input, so fail
                 // fast rather than silently skipping the tunnel (which would
@@ -501,7 +533,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 let control_persist = ssh.control_persist.as_deref().unwrap_or("15m");
                 let tunnel = tunnel::open(host, remote, control_persist, timeout_secs)
                     .map_err(|e| Failure::new(ErrorCode::ConnectionFailed, e.message, e.hint))?;
-                pg.host_override = Some(("127.0.0.1".to_string(), tunnel.local_port));
+                db.set_host_override(("127.0.0.1".to_string(), tunnel.local_port));
                 _tunnel = Some(tunnel);
             }
 
@@ -616,6 +648,30 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             emit(format, &data, &envelope).map_err(output_write_failure)?;
             Ok(())
         }
+    }
+}
+
+/// Read the password for a server connection. `password_env` holds the NAME of
+/// an env var; its value is read here and never printed. A named-but-unset var
+/// is a hard config error (like a missing `${VAR}`). Shared by the postgres and
+/// mysql/mariadb engines.
+fn read_password_env(alias: &str, conn: &config::Connection) -> Result<Option<String>, Failure> {
+    match &conn.password_env {
+        Some(var) => match std::env::var(var) {
+            Ok(v) => Ok(Some(v)),
+            Err(_) => Err(Failure::new(
+                ErrorCode::ConfigInvalid,
+                format!(
+                    "connection '{alias}' sets password_env = \"{var}\" but that environment \
+                     variable is not set"
+                ),
+                format!(
+                    "export {var}=... before running nyet, or remove password_env to connect \
+                     without a password"
+                ),
+            )),
+        },
+        None => Ok(None),
     }
 }
 
