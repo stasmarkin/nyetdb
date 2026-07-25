@@ -7,6 +7,7 @@ mod config;
 mod engine;
 mod output;
 mod resolver;
+mod tunnel;
 mod validator;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -375,7 +376,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             };
             // Engine dispatch: the concrete engine, its SQL dialect and its
             // built-in policy are chosen together by `engine`.
-            let (db, policy) = match conn.engine.as_str() {
+            let (mut db, policy) = match conn.engine.as_str() {
                 "sqlite" => {
                     let Some(path) = &conn.path else {
                         return Err(Failure::new(
@@ -433,6 +434,8 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                             statement_timeout_ms: timeout_secs
                                 .saturating_mul(1000)
                                 .min(i32::MAX as u64),
+                            // Filled in below once the SSH tunnel (if any) is up.
+                            host_override: None,
                         }),
                         validator::Policy::postgres(v_allow, v_deny),
                     )
@@ -473,6 +476,34 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                         .collect::<Vec<_>>(),
                 ),
             };
+
+            // Layer 2.5: an SSH tunnel to a bastion, opened AFTER the validator
+            // (a refused query exits 5 without paying for ssh) and BEFORE the
+            // engine connects. A tunnel failure is CONNECTION_FAILED (exit 6).
+            // sqlite + ssh was already rejected at config parse, so only
+            // Postgres reaches here; host/remote are config-validated non-empty.
+            // The guard is held for the whole query and torn down on drop (the
+            // master, if any, stays for reuse) so forwards never accumulate.
+            let mut _tunnel = None;
+            if let (Db::Postgres(pg), Some(ssh)) = (&mut db, &conn.ssh) {
+                // host/remote are guaranteed Some+valid by config parse; a None
+                // here is an internal invariant break, not agent input, so fail
+                // fast rather than silently skipping the tunnel (which would
+                // connect straight to the real host — the wrong failure mode).
+                let host = ssh
+                    .host
+                    .as_deref()
+                    .expect("ssh host validated non-empty at config parse");
+                let remote = ssh
+                    .remote
+                    .as_deref()
+                    .expect("ssh remote validated non-empty at config parse");
+                let control_persist = ssh.control_persist.as_deref().unwrap_or("15m");
+                let tunnel = tunnel::open(host, remote, control_persist, timeout_secs)
+                    .map_err(|e| Failure::new(ErrorCode::ConnectionFailed, e.message, e.hint))?;
+                pg.host_override = Some(("127.0.0.1".to_string(), tunnel.local_port));
+                _tunnel = Some(tunnel);
+            }
 
             // The runtime is built lazily, only when an engine actually runs
             // (Д9: config/validator failures never pay the async tax).
@@ -667,6 +698,32 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
             format!("config file {}: {key} is 0", path.display()),
             "row_limit and timeout_secs must be at least 1; to use the built-in \
              default, omit the key"
+                .to_string(),
+        ),
+        config::ConfigError::SshMissingField { alias, field } => (
+            format!(
+                "config file {}: connection '{alias}' has an [ssh] section but no {field}",
+                path.display()
+            ),
+            format!(
+                "set {field} in [connections.{alias}.ssh]: host = \"[user@]bastion[:port]\", \
+                 remote = \"db-host:5432\" — both are required for a tunnel"
+            ),
+        ),
+        config::ConfigError::SshWithSqlite { alias } => (
+            format!(
+                "config file {}: connection '{alias}' is engine = \"sqlite\" but has an [ssh] section",
+                path.display()
+            ),
+            "SSH tunnels forward a TCP port; SQLite is a local file, so ssh does not \
+             apply — remove the [ssh] section, or use a server engine (postgres)"
+                .to_string(),
+        ),
+        config::ConfigError::SshInvalid { alias, message } => (
+            format!("config file {}: connection '{alias}' has an invalid [ssh] value: {message}", path.display()),
+            "fix the [ssh] host/remote/control_persist; host is [user@]hostname[:port] and \
+             remote is host:port with safe characters — values that could be read as ssh \
+             options (a leading '-', or a ${VAR} that expands to one) are rejected"
                 .to_string(),
         ),
     };

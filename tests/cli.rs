@@ -685,6 +685,53 @@ fn sqlite_connection_without_path_is_exit_3() {
 }
 
 #[test]
+fn ssh_without_host_or_remote_is_exit_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.db]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+             allowed_dirs = [\"{}\"]\n[connections.db.ssh]\nremote = \"db:5432\"\n",
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+    assert!(v["error"]["message"].as_str().unwrap().contains("host"));
+}
+
+#[test]
+fn sqlite_with_ssh_is_exit_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.db]\nengine = \"sqlite\"\npath = \"./x.db\"\n\
+             allowed_dirs = [\"{}\"]\n[connections.db.ssh]\n\
+             host = \"deploy@bastion:22\"\nremote = \"db:5432\"\n",
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+    assert!(v["error"]["hint"].as_str().unwrap().contains("SQLite"));
+}
+
+#[test]
 fn defaults_format_applies_to_query_and_list_flag_wins() {
     let (tmp, cfg) = sqlite_fixture("[defaults]\nformat = \"table\"\n");
     // query without --format: table on stdout, envelope on stderr.

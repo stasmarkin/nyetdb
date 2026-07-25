@@ -23,12 +23,13 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
   enforcement (SQLite `mode=ro`; PostgreSQL `default_transaction_read_only` +
   server `statement_timeout` + an explicit `BEGIN READ ONLY`), row limit,
   timeout, json / jsonl / csv / table output;
+- **SSH tunnels** for PostgreSQL: reach a database behind a bastion by shelling
+  out to the system `ssh` (see the SSH tunnels section below);
 - the stable JSON envelope and exit-code contract.
 
-MySQL/MariaDB and SSH tunnels arrive in later releases; `nyet query` against a
-not-yet-supported engine resolves the connection and returns `NOT_IMPLEMENTED`.
-PostgreSQL over TLS is not wired up yet (connect to localhost, e.g. via the
-coming SSH tunnel).
+MySQL/MariaDB arrive in a later release; `nyet query` against a not-yet-supported
+engine resolves the connection and returns `NOT_IMPLEMENTED`. PostgreSQL over TLS
+is not wired up yet (connect to localhost, e.g. via an SSH tunnel).
 
 - [Roadmap](ROADMAP.md)
 - [Design](docs/DESIGN.md)
@@ -80,11 +81,11 @@ timeout_secs = 10
 allow_functions = ["pg_sleep"]         # remove from the built-in denylist
 deny_functions = ["my_scary_fn"]       # add your own bans
 
-# SSH tunnel (takes effect when tunnels land).
+# SSH tunnel to reach the database through a bastion (see the section below).
 [connections.prod.ssh]
-host = "deploy@bastion.corp:22"
-remote = "db.internal:5432"
-control_persist = "15m"
+host = "deploy@bastion.corp:22"     # [user@]bastion[:port]
+remote = "db.internal:5432"         # host:port to forward to, as seen from the bastion
+control_persist = "15m"             # optional; default 15m
 
 [connections.localdev]
 engine = "sqlite"
@@ -129,6 +130,79 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO nyet_ro;
 
 Then `url = "postgres://nyet_ro@db.internal:5432/app"` and
 `password_env = "NYET_RO_PASSWORD"`.
+
+### SSH tunnels (PostgreSQL behind a bastion)
+
+The common production setup — the database is only reachable from a jump host —
+works by adding an `[ssh]` section to the connection:
+
+```toml
+[connections.prod.ssh]
+host = "deploy@bastion.corp:22"     # [user@]bastion[:port]; port defaults to 22
+remote = "db.internal:5432"         # the db host:port as resolved from the bastion
+control_persist = "15m"             # optional (default 15m); see reuse below
+```
+
+When a query runs, `nyet` shells out to the **system `ssh`** to open a local
+port forward (`ssh -f -N -L 127.0.0.1:<random>:db.internal:5432 deploy@bastion.corp -p 22`),
+then connects the Postgres engine to `127.0.0.1:<random>`. The `url`'s host and
+port are replaced by the tunnel; its user, database and query parameters are
+kept, and the password still comes from `password_env`. A free local port is
+picked automatically.
+
+- **The forward lives only for the query; the master is reused.** The port
+  forward is opened for the query and **torn down when the query finishes** (so
+  forwards do not pile up across a session). What persists between runs is the
+  `ssh` *master* connection: opened with `ControlMaster=auto
+  ControlPersist=<control_persist>` over a per-destination `ControlPath`, it stays
+  in the background so the *next* `nyet` call reuses it with no new handshake.
+  (`control_persist` accepts `yes`/`no` or a time like `15m`/`1h`/`900`; an
+  invalid value is a config error, exit 3. On systems where the `ControlPath`
+  socket would exceed the OS length limit, `nyet` skips reuse — the tunnel still
+  works, each run just pays a fresh handshake.)
+- **`~/.ssh/config` is inherited.** `nyet` runs your system `ssh`, so host
+  aliases, `IdentityFile`, `ProxyJump`, `User`, known-hosts and everything else
+  from `~/.ssh/config` apply — put a `Host` block there and set
+  `host = "myalias"` in the config if you like.
+- **Key/agent auth only — no interactive password.** The tunnel runs with
+  `BatchMode=yes`, so `ssh` never prompts: authentication must be non-interactive
+  (an SSH key, `ssh-agent`, or `ProxyJump`). A password-only bastion is not
+  supported. If auth fails, `nyet` fails fast with `CONNECTION_FAILED` (exit 6)
+  and a hint — it never hangs waiting for input. An unreachable bastion is
+  bounded by `ConnectTimeout` (derived from the query timeout, capped at 10s), so
+  a blackholed host also fails fast.
+- **First connection needs a known host key.** With `BatchMode`, `ssh` will not
+  interactively accept an unknown bastion key — connect once by hand (or add the
+  key to `~/.ssh/known_hosts`) so the host is trusted; the failure hint says so.
+- **TLS is disabled on the tunnel leg — and the bastion→DB hop is plaintext.**
+  The `nyet`→bastion hop is encrypted by SSH, so `nyet` forces `sslmode=disable`
+  for the loopback connection (any `sslmode` in the `url` is ignored when
+  tunnelled). But `ssh -L` is a raw TCP forward that **terminates at the
+  bastion**: the bastion→database hop is a separate plaintext TCP connection, and
+  this build of `nyet` has no TLS backend to protect it. So the database must be
+  in a network segment trusted relative to the bastion (or the bastion
+  co-located with the DB). See the TLS limitation note below.
+- **A tunnel failure is `CONNECTION_FAILED` (exit 6)** with a hint: `ssh` missing
+  from `PATH`, the bastion unreachable, auth rejected, an unknown host key, or
+  the forward refused (`ExitOnForwardFailure=yes`). Try the same `ssh -N -L ...`
+  by hand to debug.
+- **`host`/`remote` are strictly validated** (exit 3): `[user@]hostname[:port]` /
+  `host:port` with safe characters (`A–Z a–z 0–9 . - _`) only. A value that could
+  be read as an `ssh` option — a leading `-`, or a `${VAR}` that expands to
+  `-oProxyCommand=...` — is rejected at config parse, since the environment is
+  agent-controlled (threat model) and would otherwise be an option-injection
+  foothold. **IPv6 address literals are not supported** — use a named host.
+- **SQLite + `[ssh]` is rejected** (exit 3): a tunnel forwards a TCP port, but
+  SQLite is a local file, so ssh does not apply.
+
+> **Known limitation — no TLS backend.** This build of `nyet` ships without a TLS
+> backend, which has two consequences: (1) a *direct*, non-tunnelled connection
+> to a server that requires TLS (`sslmode=require` and stricter) is not supported
+> and fails at connect; (2) over an SSH tunnel, the bastion→database hop is
+> plaintext (see the TLS bullet above), so that hop relies on a trusted network
+> segment. Reach a TLS-only server through a tunnel (the client→bastion hop is
+> encrypted), keep the DB close to the bastion, or wait for the TLS-enabled
+> build. This is a separate, tracked decision, not an SSH-tunnel bug.
 
 Rules:
 
@@ -348,7 +422,7 @@ Exit codes:
 | 3 | config error (not found, invalid, unknown alias) |
 | 4 | connection not allowed from the current directory |
 | 5 | query refused by the validator (`error.code = "NYET"`) |
-| 6 | connection failed (file missing/unreadable, network, auth) |
+| 6 | connection failed (file missing/unreadable, network, auth, ssh tunnel) |
 | 7 | the database returned an execution error |
 | 8 | timeout |
 

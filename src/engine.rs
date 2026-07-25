@@ -4,7 +4,7 @@
 
 use futures_util::TryStreamExt;
 use serde_json::Value;
-use sqlx::postgres::{PgConnectOptions, PgRow};
+use sqlx::postgres::{PgConnectOptions, PgRow, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::{Column, ConnectOptions, Connection, Row, TypeInfo, ValueRef};
 use std::path::PathBuf;
@@ -141,6 +141,28 @@ pub struct Postgres {
     pub password: Option<String>,
     /// Server-side statement_timeout, from the effective per-query timeout.
     pub statement_timeout_ms: u64,
+    /// When an SSH tunnel is up, `(127.0.0.1, local_port)` to connect through
+    /// instead of the url's host/port. User/dbname/params from the url stay.
+    pub host_override: Option<(String, u16)>,
+}
+
+/// Redirect host+port to the tunnel's local end while keeping every other
+/// connect option (user, dbname, params, password) from the url. Overriding
+/// `PgConnectOptions` is more robust than rewriting the url string. Pure — no
+/// IO — so it is unit-tested without a database.
+///
+/// Also forces `sslmode=disable` on the tunnel leg: the hop to 127.0.0.1 is
+/// already encrypted by the ssh tunnel, and this build of sqlx has no TLS
+/// backend — a prod url carrying `sslmode=require` would otherwise fail the
+/// connect with a misleading "check host/creds" error.
+fn apply_host_override(
+    opts: PgConnectOptions,
+    host_override: &Option<(String, u16)>,
+) -> PgConnectOptions {
+    match host_override {
+        Some((host, port)) => opts.host(host).port(*port).ssl_mode(PgSslMode::Disable),
+        None => opts,
+    }
 }
 
 impl Engine for Postgres {
@@ -167,6 +189,9 @@ impl Engine for Postgres {
             // failure surfaces as CONNECTION_FAILED with a hint below.
             None => opts,
         };
+        // If a tunnel is up, connect to its local end (127.0.0.1:<port>)
+        // instead of the url's host — everything else from the url is kept.
+        let opts = apply_host_override(opts, &self.host_override);
         // Bound connect on its OWN deadline so a hung TCP handshake
         // (firewall blackhole: SYN accepted, handshake never completes)
         // is CONNECTION_FAILED (exit 6), not TIMEOUT (exit 8). Set a hair
@@ -488,6 +513,28 @@ mod tests {
         assert_eq!(rs.rows, vec![vec![Value::from(2)]]);
     }
 
+    /// The tunnel override swaps host+port to the local forward but keeps the
+    /// user, database and query params (and the password stays separate).
+    #[test]
+    fn host_override_swaps_host_port_keeps_user_db_params() {
+        let opts: PgConnectOptions = "postgres://nyet_ro@db.internal:5432/app?application_name=x"
+            .parse()
+            .unwrap();
+        let opts = apply_host_override(opts, &Some(("127.0.0.1".to_string(), 61234)));
+        assert_eq!(opts.get_host(), "127.0.0.1");
+        assert_eq!(opts.get_port(), 61234);
+        assert_eq!(opts.get_username(), "nyet_ro");
+        assert_eq!(opts.get_database(), Some("app"));
+        // sslmode forced to disable on the tunnel leg (no TLS backend; the ssh
+        // tunnel already encrypts the loopback hop).
+        assert!(matches!(opts.get_ssl_mode(), PgSslMode::Disable));
+        // None -> unchanged.
+        let opts2: PgConnectOptions = "postgres://u@h:6000/d".parse().unwrap();
+        let opts2 = apply_host_override(opts2, &None);
+        assert_eq!(opts2.get_host(), "h");
+        assert_eq!(opts2.get_port(), 6000);
+    }
+
     #[test]
     fn decodes_all_storage_classes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -608,6 +655,7 @@ mod tests {
             url: format!("postgres://postgres@127.0.0.1:{port}/postgres"),
             password: Some("postgres".to_string()),
             statement_timeout_ms: 750, // connect deadline = 500ms
+            host_override: None,
         };
         match pg_block_on(engine.execute("SELECT 1", 10)) {
             Err(EngineError::Connect { hint, .. }) => {
@@ -660,6 +708,7 @@ mod tests {
                 url: url.clone(),
                 password: Some("postgres".to_string()),
                 statement_timeout_ms: 30_000,
+                host_override: None,
             };
 
             // Layer 2: a write bypassing the validator fails at the database
@@ -763,6 +812,7 @@ mod tests {
                 url: url.clone(),
                 password: Some("postgres".to_string()),
                 statement_timeout_ms: 300,
+                host_override: None,
             };
             match slow
                 .execute(
