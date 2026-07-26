@@ -259,10 +259,17 @@ ssh) and *before* the engine connects. The split follows Д1/Д2:
   between runs (Д9). The `Option<Tunnel>` guard is kept in the cli `Query` arm so
   it drops after the query executes.
 - **url → localhost**: rather than string-rewriting the url, `engine.rs`
-  overrides `PgConnectOptions.host()/port()` and forces `ssl_mode(Disable)` on
-  the tunnel leg (`apply_host_override`) — the ssh hop already encrypts, and TLS
-  verification against `127.0.0.1` would fail against a cert naming the real host
-  — while user/dbname/params and the password stay intact. The **direct** leg
+  overrides `PgConnectOptions.host()/port()` and rewrites `ssl_mode` for the
+  tunnel leg (`apply_host_override`) — while user/dbname/params and the password
+  stay intact. The rewrite: everything below `require` (`disable`/`allow`/
+  `prefer`, the last one being sqlx's default and therefore also "the url said
+  nothing") becomes `Disable`, since the ssh hop already encrypts; `require`
+  survives, because a managed server behind a pooler refuses plaintext outright
+  (Yandex MDB's odyssey answers `SSL is required`, which a forced `Disable` made
+  unreachable); `verify-ca` survives too — sqlx sets `accept_invalid_hostnames`
+  for everything except `verify-full`, so chain authentication still works
+  against `127.0.0.1`; only `verify-full` is downgraded, to `verify-ca`, as the
+  cert names the real host. The **direct** leg
   (`host_override == None`) is left untouched, so the `sslmode`/`ssl-mode` from
   the url is honored by the rustls backend (`prefer`/`require`/`verify-ca`/
   `verify-full` all work); a TLS handshake/cert failure there is
@@ -757,6 +764,21 @@ the guardrail left clean: the threshold refusal, the executed query, and the
 `schema` path that never plans anything. That claim was false for one review
 round — the query paths still closed politely on `TooSlow`, which is exactly the
 race this section exists to close.
+
+**And even a polite close is bounded, and happens after the deadline.** The
+goodbye on a clean connection is not fire-and-forget: on a TLS connection sqlx's
+rustls socket runs `complete_io` during shutdown, which READS, waiting for the
+peer's `close_notify` — and a pooler may never send one (Yandex MDB's odyssey
+neither answers nor closes the socket), so `close()` hangs forever. The
+`ROLLBACK` before it waits on the server too. Hence two rules, both in
+`pg_close_read_only` / `mysql_close_read_only` and their `*_finish` callers:
+the whole goodbye runs under `CLOSE_GRACE`, and it runs **outside** the query
+deadline — the query phase hands the connection back (`Option<Conn>`; `None` for
+one it deliberately dropped) and the close happens after. A bound alone would not
+be enough: inside the deadline the grace is only `min(remaining, CLOSE_GRACE)`,
+so a `timeout_secs` of 1-2 would still let the outer timer discard an answer
+already in hand. This was a real bug against a Yandex MDB PostgreSQL behind
+odyssey: the rows arrived in 1.4 s and the caller still got `TIMEOUT` at 60 s.
 
 Two more things worth knowing:
 

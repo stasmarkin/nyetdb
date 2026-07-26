@@ -478,16 +478,24 @@ picked automatically.
 - **First connection needs a known host key.** With `BatchMode`, `ssh` will not
   interactively accept an unknown bastion key — connect once by hand (or add the
   key to `~/.ssh/known_hosts`) so the host is trusted; the failure hint says so.
-- **TLS is disabled on the tunnel leg — and the bastion→DB hop is plaintext.**
-  The `nyet`→bastion hop is encrypted by SSH, so `nyet` forces `sslmode=disable`
-  for the loopback connection (any `sslmode` in the `url` is ignored when
-  tunnelled — TLS verification against `127.0.0.1` would fail against a
-  certificate naming the real host anyway). But `ssh -L` is a raw TCP forward
-  that **terminates at the bastion**: the bastion→database hop is a separate
-  plaintext TCP connection. So the database must be in a network segment trusted
-  relative to the bastion (or the bastion co-located with the DB). To encrypt
-  the DB link end to end, use a **direct** connection with `sslmode`/`ssl-mode`
-  instead of a tunnel.
+- **TLS on the tunnel leg is off by default — and the bastion→DB hop is
+  plaintext.** The `nyet`→bastion hop is already encrypted by SSH, so a `url`
+  that says nothing about `sslmode`/`ssl-mode` (or asks for `prefer`/`disable`)
+  connects to the loopback forward in plaintext and skips a pointless TLS
+  handshake. An **explicit `require` or stricter survives the tunnel**, because
+  some servers refuse plaintext outright — a managed PostgreSQL behind a pooler
+  (Yandex MDB's odyssey answers `SSL is required`) is only reachable that way, so
+  put `?sslmode=require` in the `url`. `verify-ca` survives as it is — it
+  authenticates the certificate chain without looking at the hostname. Only
+  `verify-full` is downgraded, to `verify-ca`: it is the one mode that checks the
+  hostname, and the certificate names the real host while the connection goes to
+  `127.0.0.1`, so that single step could not succeed anyway. But
+  `ssh -L` is a raw TCP forward that **terminates at the bastion**: the
+  bastion→database hop is a separate connection. So the database must be in a
+  network segment trusted relative to the bastion (or the bastion co-located
+  with the DB). To verify the server's identity end to end, use a **direct**
+  connection with `sslmode=verify-full`/`ssl-mode=VERIFY_IDENTITY` instead of a
+  tunnel.
 - **A tunnel failure is `CONNECTION_FAILED` (exit 6)** with a hint: `ssh` missing
   from `PATH`, the bastion unreachable, auth rejected, an unknown host key, or
   the forward refused (`ExitOnForwardFailure=yes`). Try the same `ssh -N -L ...`
@@ -501,18 +509,22 @@ picked automatically.
 - **SQLite + `[ssh]` is rejected** (exit 3): a tunnel forwards a TCP port, but
   SQLite is a local file, so ssh does not apply.
 
-> **TLS behavior — encrypt direct connections; the tunnel leg is plaintext by
-> design.** Direct (non-tunnelled) connections use `nyet`'s TLS backend (rustls)
-> and honor the `sslmode`/`ssl-mode` in the `url`. Two things to know: (1) the
-> **default** (`prefer`/`PREFERRED`) uses TLS *when the server offers it* but
-> silently falls back to plaintext if it does not — set `require`/`REQUIRED` to
-> force encryption, and `verify-full`/`VERIFY_IDENTITY` to also authenticate the
-> server (recommended for production; a bare `require` encrypts but does not
-> verify the certificate, so it does not stop a MITM); (2) over an **SSH tunnel**
-> the client→bastion hop is encrypted by SSH but the bastion→database hop is a
-> separate plaintext TCP connection (`nyet` forces `sslmode=disable` on the
-> loopback leg — see the TLS bullet above), so for an end-to-end-encrypted DB
-> link prefer a direct `verify-full` connection over a tunnel.
+> **TLS behavior — encrypt direct connections; the tunnel leg is plaintext
+> unless the url asks otherwise.** Direct (non-tunnelled) connections use
+> `nyet`'s TLS backend (rustls) and honor the `sslmode`/`ssl-mode` in the `url`.
+> Three things to know: (1) the **default** (`prefer`/`PREFERRED`) uses TLS *when
+> the server offers it* but silently falls back to plaintext if it does not — set
+> `require`/`REQUIRED` to force encryption, and `verify-full`/`VERIFY_IDENTITY`
+> to also authenticate the server (recommended for production; a bare `require`
+> encrypts but does not verify the certificate, so it does not stop a MITM);
+> (2) over an **SSH tunnel** with no `sslmode` in the url, the client→bastion hop
+> is encrypted by SSH but the bastion→database hop is a separate plaintext TCP
+> connection, so for an end-to-end-encrypted DB link prefer a direct
+> `verify-full` connection over a tunnel; (3) an explicit `require` or stricter
+> **is kept on the tunnel leg** (see the TLS bullet above) — TLS then runs
+> end to end through the forward, and only `verify-full`/`VERIFY_IDENTITY` is
+> downgraded, to `verify-ca`/`VERIFY_CA`, because the hostname cannot match
+> `127.0.0.1`.
 
 Rules:
 

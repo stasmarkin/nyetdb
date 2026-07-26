@@ -240,6 +240,12 @@ const EXPLAIN_GRACE_MS: u64 = 500;
 /// wins the race and the answer is a bare TIMEOUT instead of the refusal.
 const EXPLAIN_RESERVE_MS: u64 = 200;
 
+/// How long a graceful close may wait for the server to close the socket after
+/// Terminate/COM_QUIT before the socket is simply dropped. Generous for a real
+/// server (which closes in one round trip) and short enough that a pooler which
+/// never closes it cannot cost the caller an answer already in hand.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
+
 /// Run the guardrail's EXPLAIN under its budget. The SERVER is capped at
 /// `budget_ms` by the caller, so the usual outcome is a clean server-side error
 /// rather than an abandoned future — an abandoned one keeps burning the backend
@@ -944,18 +950,37 @@ pub struct Postgres {
 /// `PgConnectOptions` is more robust than rewriting the url string. Pure — no
 /// IO — so it is unit-tested without a database.
 ///
-/// Also forces `sslmode=disable` on the tunnel leg: the hop to 127.0.0.1 is
-/// already encrypted by the ssh tunnel, and TLS verification against the
-/// loopback address would fail anyway (the server cert names the real host, not
-/// 127.0.0.1). The DIRECT path (`None`) is left untouched, so the `sslmode` from
-/// the url is honored by sqlx's rustls backend (prefer/require/verify-ca/
-/// verify-full all work).
+/// Also rewrites `sslmode` for the tunnel leg, because the url's mode describes
+/// a hop that no longer exists — the connection now goes to 127.0.0.1:
+///
+/// - everything below `require` (`disable`, `allow`, `prefer` — the last one is
+///   sqlx's default, so this is also "the url said nothing") becomes `disable`:
+///   the ssh hop already encrypts, so the TLS round trip would buy nothing.
+/// - `verify-full` is downgraded to `verify-ca`, the ONLY step it must lose:
+///   sqlx checks the hostname for `verify-full` alone (`accept_invalid_hostnames
+///   = !VerifyFull`), and the certificate names the real host while the socket
+///   goes to 127.0.0.1. `verify-ca` itself is KEPT — it authenticates the chain
+///   without looking at the hostname, so it survives the tunnel intact.
+/// - `require` stays `require`: it encrypts without authenticating, which is
+///   what the url asked for, and some servers refuse plaintext outright, so
+///   forcing `disable` on them made the connection impossible (Yandex MDB's
+///   odyssey answers `SSL is required`).
+///
+/// The DIRECT path (`None`) is left untouched, so the `sslmode` from the url is
+/// honored by sqlx's rustls backend (prefer/require/verify-ca/verify-full).
 fn apply_host_override(
     opts: PgConnectOptions,
     host_override: &Option<(String, u16)>,
 ) -> PgConnectOptions {
     match host_override {
-        Some((host, port)) => opts.host(host).port(*port).ssl_mode(PgSslMode::Disable),
+        Some((host, port)) => {
+            let mode = match opts.get_ssl_mode() {
+                PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer => PgSslMode::Disable,
+                PgSslMode::VerifyCa | PgSslMode::VerifyFull => PgSslMode::VerifyCa,
+                _ => PgSslMode::Require,
+            };
+            opts.host(host).port(*port).ssl_mode(mode)
+        }
         None => opts,
     }
 }
@@ -1063,10 +1088,9 @@ impl Engine for Postgres {
         // QUERY is TIMEOUT (exit 8), deterministic regardless of --timeout size.
         // Complements the server statement_timeout (57014); whichever fires, 8.
         let deadline = Duration::from_millis(self.query_timeout_ms);
-        match tokio::time::timeout(deadline, async move {
+        let phase = tokio::time::timeout(deadline, async move {
             if let Err(e) = Postgres::begin_read_only(&mut conn).await {
-                let _ = conn.close().await;
-                return Err(e);
+                return (Err(e), Some(conn));
             }
 
             // The guardrail's EXPLAIN runs HERE: same read-only session (no
@@ -1090,11 +1114,14 @@ impl Engine for Postgres {
                     // refusal into a bare TIMEOUT.
                     if plan.discard() {
                         drop(conn);
-                        return match plan {
-                            Plan::Broken(e) => Err(e),
-                            // TooSlow is the only other discarding verdict.
-                            _ => Ok(QueryOutcome::PlanTooSlow { budget_ms }),
-                        };
+                        return (
+                            match plan {
+                                Plan::Broken(e) => Err(e),
+                                // TooSlow is the only other discarding verdict.
+                                _ => Ok(QueryOutcome::PlanTooSlow { budget_ms }),
+                            },
+                            None,
+                        );
                     }
                     match plan {
                         Plan::Got(estimate) => Some(estimate),
@@ -1105,12 +1132,14 @@ impl Engine for Postgres {
                 }
             };
             if let Some(value) = estimate.as_ref().and_then(|e| guardrail.refuses(e)) {
-                pg_close_read_only(conn).await;
-                return Ok(QueryOutcome::Refused {
-                    // Some by construction: refuses() answered about this one.
-                    estimate: estimate.expect("the refused estimate"),
-                    value,
-                });
+                return (
+                    Ok(QueryOutcome::Refused {
+                        // Some by construction: refuses() answered about this one.
+                        estimate: estimate.expect("the refused estimate"),
+                        value,
+                    }),
+                    Some(conn),
+                );
             }
 
             // Net B needs the column origins the fetch path does not resolve;
@@ -1163,31 +1192,26 @@ impl Engine for Postgres {
                     origins = origins_of(statement.columns());
                 }
             }
-            pg_close_read_only(conn).await;
-            fetched?;
-            Ok::<QueryOutcome, EngineError>(QueryOutcome::Ran {
+            let answer = fetched.map(|()| QueryOutcome::Ran {
                 result: ResultSet {
                     columns,
                     rows,
                     origins,
                 },
                 estimate,
-            })
+            });
+            (answer, Some(conn))
         })
-        .await
-        {
-            Ok(r) => r,
-            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
-        }
+        .await;
+        pg_finish(phase, self.query_timeout_ms).await
     }
 
     async fn estimate(&self, sql: &str) -> Result<Option<CostEstimate>, EngineError> {
         let mut conn = self.connect().await?;
         let deadline = Duration::from_millis(self.query_timeout_ms);
-        match tokio::time::timeout(deadline, async move {
+        let phase = tokio::time::timeout(deadline, async move {
             if let Err(e) = Postgres::begin_read_only(&mut conn).await {
-                let _ = conn.close().await;
-                return Err(e);
+                return (Err(e), Some(conn));
             }
             // The guarded path, exactly as `query` runs it — so a statement
             // whose planning `query` refuses is not blessed with an "ok" here.
@@ -1198,37 +1222,33 @@ impl Engine for Postgres {
                 self.statement_timeout_ms,
             )
             .await;
-            if plan.discard() {
-                drop(conn);
-            } else {
-                pg_close_read_only(conn).await;
-            }
-            plan.into_answer()
+            // A connection the guardrail could not leave clean is dropped, never
+            // chatted with (`Plan::discard` — see DEV.md).
+            let keep = match plan.discard() {
+                true => {
+                    drop(conn);
+                    None
+                }
+                false => Some(conn),
+            };
+            (plan.into_answer(), keep)
         })
-        .await
-        {
-            Ok(r) => r,
-            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
-        }
+        .await;
+        pg_finish(phase, self.query_timeout_ms).await
     }
 
     async fn schema(&self, table: Option<&str>) -> Result<Schema, EngineError> {
         let mut conn = self.connect().await?;
         let deadline = Duration::from_millis(self.query_timeout_ms);
-        match tokio::time::timeout(deadline, async move {
+        let phase = tokio::time::timeout(deadline, async move {
             if let Err(e) = Postgres::begin_read_only(&mut conn).await {
-                let _ = conn.close().await;
-                return Err(e);
+                return (Err(e), Some(conn));
             }
             let schema = pg_schema(&mut conn, table).await;
-            pg_close_read_only(conn).await;
-            schema
+            (schema, Some(conn))
         })
-        .await
-        {
-            Ok(r) => r,
-            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
-        }
+        .await;
+        pg_finish(phase, self.query_timeout_ms).await
     }
 
     async fn diagnose(&self) -> Diagnosis {
@@ -1474,10 +1494,50 @@ async fn pg_guarded_plan(
 
 /// Read-only: nothing to persist, so rollback (cheaper than commit) and close
 /// the connection gracefully. Best effort — the answer is already in hand.
-async fn pg_close_read_only(mut conn: sqlx::PgConnection) {
-    use sqlx::Executor;
-    let _ = conn.execute("ROLLBACK").await;
-    let _ = conn.close().await;
+///
+/// TWO rules make this safe, and both are load-bearing:
+///
+/// 1. The whole goodbye is BOUNDED. On a TLS connection `close()` is not the
+///    fire-and-forget half-close it looks like: sqlx's rustls socket runs
+///    `complete_io` on shutdown, which READS, waiting for the peer's
+///    `close_notify` — and a pooler may never send one (Yandex MDB's odyssey
+///    neither answers nor closes the socket). The `ROLLBACK` above waits on the
+///    server too. Either can stall forever.
+/// 2. Callers run this OUTSIDE the query deadline (see `pg_finish`). A bound
+///    alone is not enough: inside the deadline the grace is only
+///    `min(remaining, CLOSE_GRACE)`, so a small `timeout_secs` would still let
+///    the outer timer discard an answer we already have.
+async fn pg_close_read_only(conn: sqlx::PgConnection) {
+    let _ = tokio::time::timeout(CLOSE_GRACE, async move {
+        use sqlx::Executor;
+        let mut conn = conn;
+        let _ = conn.execute("ROLLBACK").await;
+        let _ = conn.close().await;
+    })
+    .await;
+}
+
+/// Unwrap a bounded query phase, then say goodbye to its connection AFTER the
+/// deadline. The phase hands back the connection it wants closed politely
+/// (`None` for one it deliberately dropped — see `Plan::discard`), and the
+/// close cannot cost the caller the answer, because the deadline is already
+/// spent by then. `Elapsed` stays TIMEOUT, exactly as before.
+async fn pg_finish<T>(
+    phase: Result<
+        (Result<T, EngineError>, Option<sqlx::PgConnection>),
+        tokio::time::error::Elapsed,
+    >,
+    query_timeout_ms: u64,
+) -> Result<T, EngineError> {
+    match phase {
+        Ok((answer, conn)) => {
+            if let Some(conn) = conn {
+                pg_close_read_only(conn).await;
+            }
+            answer
+        }
+        Err(_elapsed) => Err(client_timeout(query_timeout_ms)),
+    }
 }
 
 /// The shared WHERE tail of the four pg_catalog queries. No agent text: the
@@ -1888,15 +1948,19 @@ fn is_tls_error(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Tls(_))
 }
 
-/// Shared hint for a TLS failure on the direct (non-tunnelled) leg. Neutral by
-/// design: `sqlx::Error::Tls` covers BOTH "the server does not support TLS" (so
-/// require/verify-* cannot be satisfied) and "the certificate failed
-/// verification" — without reliably distinguishing them, so the hint names both
-/// causes rather than always advising to relax the mode.
+/// Shared hint for a TLS failure. Reachable from the TUNNEL leg too since an
+/// explicit `require`+ survives it (`apply_host_override`), which is why the
+/// text also names dropping the mode: over ssh the hop is already encrypted, so
+/// that is a real fix there rather than a downgrade of the only protection.
+/// Neutral by design otherwise: `sqlx::Error::Tls` covers BOTH "the server does
+/// not support TLS" (so require/verify-* cannot be satisfied) and "the
+/// certificate failed verification" — without reliably distinguishing them, so
+/// the hint names both causes rather than always advising to relax the mode.
 fn tls_hint() -> String {
     "TLS could not be established: the server may not support TLS, or its certificate \
      failed verification — check the server's TLS config and the sslmode/ssl-mode in `url` \
-     (for a private CA point sslrootcert=/ssl-ca= at its certificate)"
+     (for a private CA point sslrootcert=/ssl-ca= at its certificate; over an ssh tunnel \
+     the hop is already encrypted, so dropping sslmode/ssl-mode from the url is also an option)"
         .to_string()
 }
 
@@ -1961,17 +2025,28 @@ pub struct Mysql {
 }
 
 /// Redirect host+port to the tunnel's local end while keeping user/db/params
-/// from the url; force `ssl_mode=Disabled` on the tunnel leg (the ssh hop
-/// already encrypts, and TLS verification against 127.0.0.1 would fail against a
-/// cert naming the real host). The DIRECT path (`None`) is left untouched, so
-/// the `ssl-mode` from the url is honored by sqlx's rustls backend. Pure —
-/// unit-tested.
+/// from the url, and rewrite `ssl-mode` for the tunnel leg exactly like the
+/// Postgres twin: `PREFERRED` (sqlx's default) and `DISABLED` stay disabled (the
+/// ssh hop already encrypts); `VERIFY_IDENTITY` drops to `VERIFY_CA` because it
+/// is the only mode that checks the hostname (`accept_invalid_hostnames =
+/// !VerifyIdentity`) and the cert names the real host, not 127.0.0.1; `VERIFY_CA`
+/// is kept as is (chain authentication survives the tunnel); `REQUIRED` stays,
+/// so a server that refuses plaintext is still reachable. The DIRECT path
+/// (`None`) is left untouched, so the `ssl-mode` from the url is honored by
+/// sqlx's rustls backend. Pure — unit-tested.
 fn apply_mysql_host_override(
     opts: MySqlConnectOptions,
     host_override: &Option<(String, u16)>,
 ) -> MySqlConnectOptions {
     match host_override {
-        Some((host, port)) => opts.host(host).port(*port).ssl_mode(MySqlSslMode::Disabled),
+        Some((host, port)) => {
+            let mode = match opts.get_ssl_mode() {
+                MySqlSslMode::Disabled | MySqlSslMode::Preferred => MySqlSslMode::Disabled,
+                MySqlSslMode::VerifyCa | MySqlSslMode::VerifyIdentity => MySqlSslMode::VerifyCa,
+                _ => MySqlSslMode::Required,
+            };
+            opts.host(host).port(*port).ssl_mode(mode)
+        }
         None => opts,
     }
 }
@@ -2122,11 +2197,37 @@ impl Mysql {
 }
 
 /// Read-only: rollback (nothing to persist) and close gracefully — a proper
-/// COM_QUIT rather than a dropped socket. Best effort, like the Postgres twin.
-async fn mysql_close_read_only(mut conn: sqlx::MySqlConnection) {
-    use sqlx::Executor;
-    let _ = conn.execute("ROLLBACK").await;
-    let _ = conn.close().await;
+/// COM_QUIT rather than a dropped socket. Best effort, like the Postgres twin,
+/// bounded and run outside the query deadline for exactly the same two reasons
+/// (see `pg_close_read_only` and `mysql_finish`).
+async fn mysql_close_read_only(conn: sqlx::MySqlConnection) {
+    let _ = tokio::time::timeout(CLOSE_GRACE, async move {
+        use sqlx::Executor;
+        let mut conn = conn;
+        let _ = conn.execute("ROLLBACK").await;
+        let _ = conn.close().await;
+    })
+    .await;
+}
+
+/// The MySQL twin of `pg_finish`: unwrap the bounded query phase, then close its
+/// connection once the deadline can no longer take the answer away.
+async fn mysql_finish<T>(
+    phase: Result<
+        (Result<T, EngineError>, Option<sqlx::MySqlConnection>),
+        tokio::time::error::Elapsed,
+    >,
+    query_timeout_ms: u64,
+) -> Result<T, EngineError> {
+    match phase {
+        Ok((answer, conn)) => {
+            if let Some(conn) = conn {
+                mysql_close_read_only(conn).await;
+            }
+            answer
+        }
+        Err(_elapsed) => Err(client_timeout(query_timeout_ms)),
+    }
 }
 
 impl Engine for Mysql {
@@ -2145,10 +2246,9 @@ impl Engine for Mysql {
         // regardless of --timeout size. Backstops the server-side
         // max_execution_time/max_statement_time; whichever fires, exit 8.
         let deadline = Duration::from_millis(self.query_timeout_ms);
-        match tokio::time::timeout(deadline, async move {
+        let phase = tokio::time::timeout(deadline, async move {
             if let Err(e) = self.begin_read_only(&mut conn).await {
-                let _ = conn.close().await;
-                return Err(e);
+                return (Err(e), Some(conn));
             }
 
             // Guardrail: same read-only session, before the real query runs
@@ -2163,10 +2263,13 @@ impl Engine for Mysql {
                     // The same single decision as the Postgres twin.
                     if plan.discard() {
                         drop(conn);
-                        return match plan {
-                            Plan::Broken(e) => Err(e),
-                            _ => Ok(QueryOutcome::PlanTooSlow { budget_ms }),
-                        };
+                        return (
+                            match plan {
+                                Plan::Broken(e) => Err(e),
+                                _ => Ok(QueryOutcome::PlanTooSlow { budget_ms }),
+                            },
+                            None,
+                        );
                     }
                     match plan {
                         Plan::Got(estimate) => Some(estimate),
@@ -2175,11 +2278,13 @@ impl Engine for Mysql {
                 }
             };
             if let Some(value) = estimate.as_ref().and_then(|e| guardrail.refuses(e)) {
-                mysql_close_read_only(conn).await;
-                return Ok(QueryOutcome::Refused {
-                    estimate: estimate.expect("the refused estimate"),
-                    value,
-                });
+                return (
+                    Ok(QueryOutcome::Refused {
+                        estimate: estimate.expect("the refused estimate"),
+                        value,
+                    }),
+                    Some(conn),
+                );
             }
 
             // ponytail: the fetch loop / empty-columns-via-prepare / rollback+close
@@ -2226,67 +2331,57 @@ impl Engine for Mysql {
                     origins = origins_of(statement.columns());
                 }
             }
-            mysql_close_read_only(conn).await;
-            fetched?;
-            Ok::<QueryOutcome, EngineError>(QueryOutcome::Ran {
+            let answer = fetched.map(|()| QueryOutcome::Ran {
                 result: ResultSet {
                     columns,
                     rows,
                     origins,
                 },
                 estimate,
-            })
+            });
+            (answer, Some(conn))
         })
-        .await
-        {
-            Ok(r) => r,
-            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
-        }
+        .await;
+        mysql_finish(phase, self.query_timeout_ms).await
     }
 
     async fn estimate(&self, sql: &str) -> Result<Option<CostEstimate>, EngineError> {
         let mut conn = self.connect().await?;
         let deadline = Duration::from_millis(self.query_timeout_ms);
-        match tokio::time::timeout(deadline, async move {
+        let phase = tokio::time::timeout(deadline, async move {
             if let Err(e) = self.begin_read_only(&mut conn).await {
-                let _ = conn.close().await;
-                return Err(e);
+                return (Err(e), Some(conn));
             }
             // The guarded path, exactly as `query` runs it (see the pg twin).
             let plan = self
                 .guarded_plan(&mut conn, sql, self.query_timeout_ms)
                 .await;
-            if plan.discard() {
-                drop(conn);
-            } else {
-                mysql_close_read_only(conn).await;
-            }
-            plan.into_answer()
+            // A connection the guardrail could not leave clean is dropped.
+            let keep = match plan.discard() {
+                true => {
+                    drop(conn);
+                    None
+                }
+                false => Some(conn),
+            };
+            (plan.into_answer(), keep)
         })
-        .await
-        {
-            Ok(r) => r,
-            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
-        }
+        .await;
+        mysql_finish(phase, self.query_timeout_ms).await
     }
 
     async fn schema(&self, table: Option<&str>) -> Result<Schema, EngineError> {
         let mut conn = self.connect().await?;
         let deadline = Duration::from_millis(self.query_timeout_ms);
-        match tokio::time::timeout(deadline, async move {
+        let phase = tokio::time::timeout(deadline, async move {
             if let Err(e) = self.begin_read_only(&mut conn).await {
-                let _ = conn.close().await;
-                return Err(e);
+                return (Err(e), Some(conn));
             }
             let schema = mysql_schema(&mut conn, table).await;
-            mysql_close_read_only(conn).await;
-            schema
+            (schema, Some(conn))
         })
-        .await
-        {
-            Ok(r) => r,
-            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
-        }
+        .await;
+        mysql_finish(phase, self.query_timeout_ms).await
     }
 
     async fn diagnose(&self) -> Diagnosis {
@@ -3305,16 +3400,53 @@ mod tests {
         assert_eq!(opts.get_port(), 61234);
         assert_eq!(opts.get_username(), "nyet_ro");
         assert_eq!(opts.get_database(), Some("app"));
-        // sslmode forced to disable on the tunnel leg (the ssh tunnel already
-        // encrypts the loopback hop; TLS verification against 127.0.0.1 would
-        // fail anyway). The direct leg honors the url's sslmode — see the
-        // container tests.
+        // A url that says nothing about sslmode stays plaintext on the tunnel
+        // leg: the ssh tunnel already encrypts the loopback hop. The direct leg
+        // honors the url's sslmode — see the container tests.
         assert!(matches!(opts.get_ssl_mode(), PgSslMode::Disable));
         // None -> unchanged.
         let opts2: PgConnectOptions = "postgres://u@h:6000/d".parse().unwrap();
         let opts2 = apply_host_override(opts2, &None);
         assert_eq!(opts2.get_host(), "h");
         assert_eq!(opts2.get_port(), 6000);
+    }
+
+    /// An explicit sslmode at or above `require` survives the tunnel, because a
+    /// server may refuse plaintext outright (Yandex MDB's odyssey answers
+    /// `SSL is required`). Only `verify-full` is downgraded — to `verify-ca`,
+    /// NOT to `require`: the hostname check is the single step that cannot work
+    /// against 127.0.0.1, while chain authentication still can, and dropping to
+    /// `require` would silently discard a verification the user asked for.
+    /// Everything below `require` (including `allow`, which is WEAKER than
+    /// `prefer` despite sorting after `disable`) stays plaintext.
+    #[test]
+    fn host_override_rewrites_sslmode_for_the_tunnel_leg() {
+        let tunnel = Some(("127.0.0.1".to_string(), 61234));
+        let pg = |mode: &str| -> PgSslMode {
+            let opts: PgConnectOptions =
+                format!("postgres://u@db.internal:5432/app?sslmode={mode}")
+                    .parse()
+                    .unwrap();
+            apply_host_override(opts, &tunnel).get_ssl_mode()
+        };
+        for mode in ["disable", "allow", "prefer"] {
+            assert!(
+                matches!(pg(mode), PgSslMode::Disable),
+                "sslmode={mode} is below require and must stay plaintext, got {:?}",
+                pg(mode)
+            );
+        }
+        assert!(matches!(pg("require"), PgSslMode::Require));
+        // Kept, not downgraded: verify-ca never looks at the hostname.
+        assert!(
+            matches!(pg("verify-ca"), PgSslMode::VerifyCa),
+            "verify-ca authenticates the chain without the hostname, so it survives the tunnel"
+        );
+        assert!(
+            matches!(pg("verify-full"), PgSslMode::VerifyCa),
+            "verify-full must lose ONLY the hostname check, got {:?}",
+            pg("verify-full")
+        );
     }
 
     #[test]
@@ -3739,16 +3871,35 @@ mod tests {
     // type + max_execution_time, the variable DESIGN §3 names). ---
 
     #[test]
-    fn mysql_host_override_swaps_host_port_keeps_user_db_forces_disable() {
+    fn mysql_host_override_swaps_host_port_keeps_user_db_and_rewrites_ssl_mode() {
         let opts: MySqlConnectOptions = "mysql://nyet_ro@db.internal:3306/app".parse().unwrap();
         let opts = apply_mysql_host_override(opts, &Some(("127.0.0.1".to_string(), 61234)));
         assert_eq!(opts.get_host(), "127.0.0.1");
         assert_eq!(opts.get_port(), 61234);
         assert_eq!(opts.get_username(), "nyet_ro");
         assert_eq!(opts.get_database(), Some("app"));
-        // sslmode forced to Disabled on the tunnel leg (ssh already encrypts;
-        // the direct leg honors the url's ssl-mode — see the container tests).
+        // A url that says nothing stays plaintext on the tunnel leg (ssh already
+        // encrypts; the direct leg honors the url — see the container tests).
         assert!(matches!(opts.get_ssl_mode(), MySqlSslMode::Disabled));
+        // Same rule as the Postgres twin: REQUIRED and VERIFY_CA survive as they
+        // are, and only VERIFY_IDENTITY (the sole hostname-checking mode) is
+        // downgraded — to VERIFY_CA, so the chain is still authenticated.
+        let tunnel = Some(("127.0.0.1".to_string(), 61234));
+        let my = |mode: &str| -> MySqlSslMode {
+            let o: MySqlConnectOptions = format!("mysql://u@db.internal:3306/app?ssl-mode={mode}")
+                .parse()
+                .unwrap();
+            apply_mysql_host_override(o, &tunnel).get_ssl_mode()
+        };
+        assert!(matches!(my("DISABLED"), MySqlSslMode::Disabled));
+        assert!(matches!(my("PREFERRED"), MySqlSslMode::Disabled));
+        assert!(matches!(my("REQUIRED"), MySqlSslMode::Required));
+        assert!(matches!(my("VERIFY_CA"), MySqlSslMode::VerifyCa));
+        assert!(
+            matches!(my("VERIFY_IDENTITY"), MySqlSslMode::VerifyCa),
+            "VERIFY_IDENTITY must lose ONLY the hostname check, got {:?}",
+            my("VERIFY_IDENTITY")
+        );
         // None -> unchanged.
         let opts2: MySqlConnectOptions = "mysql://u@h:6000/d".parse().unwrap();
         let opts2 = apply_mysql_host_override(opts2, &None);
