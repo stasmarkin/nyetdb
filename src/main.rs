@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audit;
 mod config;
 mod engine;
 mod guardrail;
@@ -182,6 +183,10 @@ enum ErrorCode {
     DirNotAllowed,
     NotImplemented,
     Internal,
+    /// The audit log could not be written (UX-8 fail-closed): the result is NOT
+    /// released to the agent. Infrastructure failure of nyet itself, so it maps
+    /// to the INTERNAL exit class (1), but keeps its own distinct code.
+    AuditFailed,
     /// Validator refusal; carries the `error.reason` string (closed list,
     /// owned by the validator).
     Nyet(&'static str),
@@ -197,6 +202,7 @@ impl ErrorCode {
             ErrorCode::DirNotAllowed => "DIR_NOT_ALLOWED",
             ErrorCode::NotImplemented => "NOT_IMPLEMENTED",
             ErrorCode::Internal => "INTERNAL",
+            ErrorCode::AuditFailed => "AUDIT_FAILED",
             ErrorCode::Nyet(_) => "NYET",
             ErrorCode::ConnectionFailed => "CONNECTION_FAILED",
             ErrorCode::DbError => "DB_ERROR",
@@ -215,7 +221,7 @@ impl ErrorCode {
         match self {
             ErrorCode::ConfigInvalid => 3,
             ErrorCode::DirNotAllowed => 4,
-            ErrorCode::NotImplemented | ErrorCode::Internal => 1,
+            ErrorCode::NotImplemented | ErrorCode::Internal | ErrorCode::AuditFailed => 1,
             ErrorCode::Nyet(_) => 5,
             ErrorCode::ConnectionFailed => 6,
             ErrorCode::DbError => 7,
@@ -356,6 +362,173 @@ fn output_write_failure(e: io::Error) -> Failure {
     )
 }
 
+/// Everything a completed database command needs to hand back: the streams to
+/// write AND the facts the audit record needs. Built by each DB-command body,
+/// consumed by `audit_finish` (log first, then emit — UX-8 fail-closed).
+struct Emitted {
+    data: String,
+    envelope: String,
+    duration_ms: u64,
+    /// query only.
+    row_count: Option<u64>,
+    truncated: Option<bool>,
+    warnings: Vec<&'static str>,
+    /// The result the agent saw, built only when `[audit] log_responses` is on.
+    response: Option<audit::Response>,
+}
+
+/// The command-identity fields of an audit record, known once the session is
+/// open (so the engine is resolved). Config errors BEFORE this point (unknown
+/// alias, directory denied, unsupported engine, missing password) are not
+/// logged — there is no database interaction and no engine to name; they behave
+/// exactly as before this feature.
+struct AuditMeta<'a> {
+    command: &'a str,
+    alias: &'a str,
+    engine: &'a str,
+    cwd: &'a str,
+    sql: Option<&'a str>,
+    table: Option<&'a str>,
+}
+
+/// The single seam that enforces UX-8: **write the audit record (durably) BEFORE
+/// releasing the result to the agent**. On success the line is committed, then
+/// `emit` streams the data; if the audit write fails the result is NOT emitted
+/// and the caller gets `AUDIT_FAILED` (exit 1) instead — the human never misses
+/// an event the agent acted on. A logical failure (a NYET refusal, a DB error)
+/// is logged too (the human sees what the agent TRIED) and its own envelope is
+/// still produced by `main`; a failed audit write overrides even that.
+///
+/// With `[audit] enabled = false` nothing is written and the command behaves
+/// byte-for-byte as before.
+fn audit_finish(
+    cfg: &config::Config,
+    meta: AuditMeta,
+    format: Format,
+    outcome: Result<Emitted, Failure>,
+) -> Result<(), Failure> {
+    if !cfg.audit_enabled() {
+        return match outcome {
+            Ok(e) => emit(format, &e.data, &e.envelope).map_err(output_write_failure),
+            Err(f) => Err(f),
+        };
+    }
+
+    let path = audit_path(cfg)?;
+    // The log holds the agent's SQL (and rows under log_responses); an existing
+    // file with group/other bits leaks it to other local users. Warn like the
+    // config file (we warn, never chmod). A file nyet creates is 0600 already.
+    warn_loose_permissions(&path, "the audit log");
+    let ts = audit_timestamp();
+    let event = match &outcome {
+        Ok(e) => audit::Event {
+            audit_v: audit::AUDIT_V,
+            ts: &ts,
+            command: meta.command,
+            alias: meta.alias,
+            engine: meta.engine,
+            cwd: meta.cwd,
+            sql: meta.sql,
+            table: meta.table,
+            verdict: "ok",
+            reason: None,
+            exit_code: 0,
+            row_count: e.row_count,
+            truncated: e.truncated,
+            duration_ms: e.duration_ms,
+            warnings: &e.warnings,
+            response: e.response.as_ref(),
+        },
+        Err(f) => {
+            // A NYET verdict is a refusal (validator/guardrail); any other code
+            // is an error. The reason is the NYET reason or the error.code.
+            let (verdict, reason) = match f.code {
+                ErrorCode::Nyet(r) => ("refused", r),
+                other => ("error", other.as_str()),
+            };
+            audit::Event {
+                audit_v: audit::AUDIT_V,
+                ts: &ts,
+                command: meta.command,
+                alias: meta.alias,
+                engine: meta.engine,
+                cwd: meta.cwd,
+                sql: meta.sql,
+                table: meta.table,
+                verdict,
+                reason: Some(reason),
+                exit_code: f.code.exit(),
+                row_count: None,
+                truncated: None,
+                // The failure paths do not thread their wall time through; the
+                // forensic signal is verdict + reason + sql, not the timing.
+                duration_ms: 0,
+                warnings: &[],
+                response: None,
+            }
+        }
+    };
+    let line = audit::line(&event);
+    // Persist (write + flush) BEFORE anything reaches the agent.
+    audit::append(&path, &line).map_err(|e| audit_failed(&path, &e))?;
+
+    match outcome {
+        Ok(e) => emit(format, &e.data, &e.envelope).map_err(output_write_failure),
+        Err(f) => Err(f),
+    }
+}
+
+/// Resolve the audit-log path: an explicit literal `[audit] path`, else
+/// `$XDG_DATA_HOME/nyet/audit.jsonl`, else `~/.local/share/nyet/audit.jsonl`.
+/// If none can be formed (no HOME, no XDG) auditing cannot proceed — fail
+/// closed rather than silently skip (Д3, no panic).
+fn audit_path(cfg: &config::Config) -> Result<PathBuf, Failure> {
+    if let Some(p) = &cfg.audit.path {
+        return Ok(PathBuf::from(p));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return Ok(PathBuf::from(xdg).join("nyet/audit.jsonl"));
+        }
+    }
+    match home_dir() {
+        Some(h) => Ok(h.join(".local/share/nyet/audit.jsonl")),
+        None => Err(Failure::new(
+            ErrorCode::AuditFailed,
+            "cannot locate the audit log: neither XDG_DATA_HOME nor HOME is set",
+            "set [audit] path = \"/absolute/path/audit.jsonl\" in the config, or disable \
+             auditing with [audit] enabled = false",
+        )),
+    }
+}
+
+/// A command's structured result as a `Value`, for the audit `response` field
+/// (schema/explain/doctor). A serialization that somehow failed degrades to
+/// null rather than panicking (Д3) — the record is still written.
+fn payload_value<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
+/// ISO 8601 UTC, millisecond precision. chrono comes in through sqlx (already a
+/// dependency) — no new crate for a timestamp.
+fn audit_timestamp() -> String {
+    use sqlx::types::chrono::Utc;
+    // Explicit UTC pattern (the value is already UTC), millisecond precision.
+    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// The audit write failed: the result is withheld (UX-8) and the agent is told
+/// how to fix or disable auditing (Д10). The path is not a secret.
+fn audit_failed(path: &Path, e: &std::io::Error) -> Failure {
+    Failure::new(
+        ErrorCode::AuditFailed,
+        format!("failed to write the audit log at {}: {e}", path.display()),
+        "the query ran but its result was withheld because the audit trail could not be \
+         recorded (UX-8); fix the path and its permissions so nyet can create and append \
+         to it, or disable auditing with [audit] enabled = false in the config",
+    )
+}
+
 fn main() -> ExitCode {
     // clap prints usage errors itself and exits 2.
     let cli = Cli::parse();
@@ -391,7 +564,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
 
     let path = config_path(cli.config)?;
     let text = read_config(&path)?;
-    warn_bad_permissions(&path);
+    warn_loose_permissions(&path, "the config file");
 
     // Routing format is settled from a raw peek of [defaults].format BEFORE
     // the semantic config parse — so a config error (e.g. row_limit = 0)
@@ -463,123 +636,163 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             timeout,
         } => {
             let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, timeout)?;
-            // Flag > per-connection > [defaults] > built-in, capped by the
-            // config owner's max_row_limit (see config::capped).
-            let limit = cfg.row_limit(conn, limit);
-            // Layer 1: the validator. Any deny -> code NYET + reason, exit 5.
-            let (query, is_query, mut warnings) = validate(&query, &session.policy)?;
-            // Layer 1.5: the guardrail. Only a plain query can be wrapped in an
-            // EXPLAIN; SHOW/DESCRIBE are metadata no planner estimates, so they
-            // run unguarded (documented). An EXPLAIN ANALYZE never gets here —
-            // the validator refuses it (reason EXPLAIN_ANALYZE).
-            let guardrail = match is_query {
-                true => config::guardrail(&alias, conn).map_err(|e| config_failure(e, &path))?,
-                false => guardrail::Guardrail::OFF,
-            };
-            // The tunnel is opened AFTER the validator (a refused query exits 5
-            // without paying for ssh) and torn down when the guard drops, so
-            // forwards never accumulate. Fetch limit+1 to detect truncation
-            // without reading everything.
-            let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
-            let (outcome, duration_ms) = run_db(session.db.execute(
-                &query,
-                limit.saturating_add(1),
-                &guardrail,
-            ))?;
+            // Audit identity, captured before the body consumes `query`/`alias`.
+            let engine = conn.engine.clone();
+            let raw_sql = query.clone();
+            let cwd_str = cwd.display().to_string();
+            let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
+            // The whole command as ONE Result so both success and every failure
+            // path (validator/guardrail refusal, DB error) flow through
+            // audit_finish — the log is written before the result is released.
+            let outcome = (|| -> Result<Emitted, Failure> {
+                // Flag > per-connection > [defaults] > built-in, capped by the
+                // config owner's max_row_limit (see config::capped).
+                let limit = cfg.row_limit(conn, limit);
+                // Layer 1: the validator. Any deny -> code NYET + reason, exit 5.
+                let (query, is_query, mut warnings) = validate(&query, &session.policy)?;
+                // Layer 1.5: the guardrail. Only a plain query can be wrapped in an
+                // EXPLAIN; SHOW/DESCRIBE are metadata no planner estimates, so they
+                // run unguarded (documented). An EXPLAIN ANALYZE never gets here —
+                // the validator refuses it (reason EXPLAIN_ANALYZE).
+                let guardrail = match is_query {
+                    true => {
+                        config::guardrail(&alias, conn).map_err(|e| config_failure(e, &path))?
+                    }
+                    false => guardrail::Guardrail::OFF,
+                };
+                // The tunnel is opened AFTER the validator (a refused query exits 5
+                // without paying for ssh) and torn down when the guard drops, so
+                // forwards never accumulate. Fetch limit+1 to detect truncation
+                // without reading everything.
+                let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
+                let (outcome, duration_ms) = run_db(session.db.execute(
+                    &query,
+                    limit.saturating_add(1),
+                    &guardrail,
+                ))?;
 
-            let (mut rs, estimate) = match outcome {
-                // The guardrail refused: nothing ran, and the envelope carries
-                // the plan that justified it (NYET/EXPENSIVE_QUERY, exit 5).
-                engine::QueryOutcome::Refused { estimate, value } => {
-                    let (message, hint) = guardrail.refusal(&alias, value);
-                    return Err(Failure {
-                        code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
-                        message,
-                        hint,
-                        estimate: Some(Box::new(guardrail.describe(estimate))),
+                let (mut rs, estimate) = match outcome {
+                    // The guardrail refused: nothing ran, and the envelope carries
+                    // the plan that justified it (NYET/EXPENSIVE_QUERY, exit 5).
+                    engine::QueryOutcome::Refused { estimate, value } => {
+                        let (message, hint) = guardrail.refusal(&alias, value);
+                        return Err(Failure {
+                            code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
+                            message,
+                            hint,
+                            estimate: Some(Box::new(guardrail.describe(estimate))),
+                        });
+                    }
+                    // Planning itself outran the guardrail's budget. Fail closed:
+                    // planning time is agent-controllable, so "no plan in time" must
+                    // not be a way to switch the guard off. Same reason code — the
+                    // verdict is the same, only the evidence differs.
+                    engine::QueryOutcome::PlanTooSlow { budget_ms } => {
+                        let (message, hint) = guardrail::planning_too_slow(&alias, budget_ms);
+                        return Err(Failure {
+                            code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
+                            message,
+                            hint,
+                            estimate: None,
+                        });
+                    }
+                    engine::QueryOutcome::Ran { result, estimate } => (result, estimate),
+                };
+                // The guardrail was on but reached no verdict — the database would
+                // not plan the statement (no estimate at all), or the plan carried
+                // no number it could judge. Fail open by design (see docs/DEV.md),
+                // but never silently: the timeout and the row limit are what is left.
+                if guardrail.plans()
+                    && estimate.is_none_or(|e| guardrail.check(&e) == guardrail::Check::NoEstimate)
+                {
+                    warnings.push(guardrail_skipped_warning());
+                }
+
+                let truncated = rs.rows.len() as u64 > limit;
+                if truncated {
+                    rs.rows
+                        .truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                }
+                if truncated {
+                    warnings.push(output::Warning {
+                        code: "TRUNCATED",
+                        message: format!(
+                            "result truncated to {limit} rows; add WHERE/LIMIT or raise --limit"
+                        ),
                     });
                 }
-                // Planning itself outran the guardrail's budget. Fail closed:
-                // planning time is agent-controllable, so "no plan in time" must
-                // not be a way to switch the guard off. Same reason code — the
-                // verdict is the same, only the evidence differs.
-                engine::QueryOutcome::PlanTooSlow { budget_ms } => {
-                    let (message, hint) = guardrail::planning_too_slow(&alias, budget_ms);
-                    return Err(Failure {
-                        code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
-                        message,
-                        hint,
-                        estimate: None,
+                // Warned for every format (json/jsonl collapse same-named keys to
+                // the last value; table/csv keep the columns but the ambiguity is
+                // still worth flagging) — so the message stays format-neutral.
+                let duplicates = duplicate_columns(&rs.columns);
+                if !duplicates.is_empty() {
+                    warnings.push(output::Warning {
+                        code: "DUPLICATE_COLUMNS",
+                        message: format!(
+                            "duplicate column name(s): {}; disambiguate with AS aliases — \
+                             in JSON/JSONL output duplicates collapse to the last value",
+                            duplicates.join(", ")
+                        ),
                     });
                 }
-                engine::QueryOutcome::Ran { result, estimate } => (result, estimate),
-            };
-            // The guardrail was on but reached no verdict — the database would
-            // not plan the statement (no estimate at all), or the plan carried
-            // no number it could judge. Fail open by design (see docs/DEV.md),
-            // but never silently: the timeout and the row limit are what is left.
-            if guardrail.plans()
-                && estimate.is_none_or(|e| guardrail.check(&e) == guardrail::Check::NoEstimate)
-            {
-                warnings.push(guardrail_skipped_warning());
-            }
-
-            let truncated = rs.rows.len() as u64 > limit;
-            if truncated {
-                rs.rows
-                    .truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-            }
-            if truncated {
-                warnings.push(output::Warning {
-                    code: "TRUNCATED",
-                    message: format!(
-                        "result truncated to {limit} rows; add WHERE/LIMIT or raise --limit"
+                if session.insecure_transport {
+                    warnings.push(insecure_transport_warning());
+                }
+                let meta = output::QueryMeta {
+                    row_count: rs.rows.len() as u64,
+                    truncated,
+                    duration_ms,
+                    connection: alias.clone(),
+                };
+                let (data, envelope) = match format {
+                    Format::Json => (
+                        String::new(),
+                        output::query_json(&rs.columns, &rs.rows, &meta, &warnings),
                     ),
-                });
-            }
-            // Warned for every format (json/jsonl collapse same-named keys to
-            // the last value; table/csv keep the columns but the ambiguity is
-            // still worth flagging) — so the message stays format-neutral.
-            let duplicates = duplicate_columns(&rs.columns);
-            if !duplicates.is_empty() {
-                warnings.push(output::Warning {
-                    code: "DUPLICATE_COLUMNS",
-                    message: format!(
-                        "duplicate column name(s): {}; disambiguate with AS aliases — \
-                         in JSON/JSONL output duplicates collapse to the last value",
-                        duplicates.join(", ")
+                    Format::Jsonl => (
+                        output::query_jsonl(&rs.columns, &rs.rows),
+                        output::query_meta_json(&meta, &warnings),
                     ),
+                    Format::Table => (
+                        output::query_table(&rs.columns, &rs.rows),
+                        output::query_meta_json(&meta, &warnings),
+                    ),
+                    Format::Csv => (
+                        output::query_csv(&rs.columns, &rs.rows),
+                        output::query_meta_json(&meta, &warnings),
+                    ),
+                };
+                let warning_codes = warnings.iter().map(|w| w.code).collect();
+                // The data/envelope strings are built; rs is now free to MOVE
+                // into the response (log_responses only) — keeps column order,
+                // no clone. Exactly what the agent received, post-truncation.
+                let response = log_responses.then_some(audit::Response::Rows {
+                    columns: rs.columns,
+                    rows: rs.rows,
                 });
-            }
-            if session.insecure_transport {
-                warnings.push(insecure_transport_warning());
-            }
-            let meta = output::QueryMeta {
-                row_count: rs.rows.len() as u64,
-                truncated,
-                duration_ms,
-                connection: alias,
-            };
-            let (data, envelope) = match format {
-                Format::Json => (
-                    String::new(),
-                    output::query_json(&rs.columns, &rs.rows, &meta, &warnings),
-                ),
-                Format::Jsonl => (
-                    output::query_jsonl(&rs.columns, &rs.rows),
-                    output::query_meta_json(&meta, &warnings),
-                ),
-                Format::Table => (
-                    output::query_table(&rs.columns, &rs.rows),
-                    output::query_meta_json(&meta, &warnings),
-                ),
-                Format::Csv => (
-                    output::query_csv(&rs.columns, &rs.rows),
-                    output::query_meta_json(&meta, &warnings),
-                ),
-            };
-            emit(format, &data, &envelope).map_err(output_write_failure)?;
-            Ok(())
+                Ok(Emitted {
+                    data,
+                    envelope,
+                    duration_ms,
+                    row_count: Some(meta.row_count),
+                    truncated: Some(truncated),
+                    warnings: warning_codes,
+                    response,
+                })
+            })();
+            audit_finish(
+                &cfg,
+                AuditMeta {
+                    command: "query",
+                    alias: &alias,
+                    engine: &engine,
+                    cwd: &cwd_str,
+                    sql: Some(&raw_sql),
+                    table: None,
+                },
+                format,
+                outcome,
+            )
         }
         Command::Schema {
             alias,
@@ -590,55 +803,83 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // (there is no agent SQL here, and a catalog read has nothing to
             // estimate).
             let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
-            let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
-            let (schema, duration_ms) = run_db(session.db.schema(table.as_deref()))?;
+            let engine = conn.engine.clone();
+            let cwd_str = cwd.display().to_string();
+            let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
+            let outcome = (|| -> Result<Emitted, Failure> {
+                let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
+                let (schema, duration_ms) = run_db(session.db.schema(table.as_deref()))?;
 
-            // An explicit [table] that matched nothing: the catalog answered,
-            // the object simply is not there. DB_ERROR (exit 7) with the way
-            // out (Д10) — no new error code for it.
-            if let Some(name) = &table {
-                if schema.tables.is_empty() {
-                    return Err(Failure::new(
-                        ErrorCode::DbError,
-                        format!("table '{name}' not found in {alias}"),
-                        format!("run nyet schema {alias} to list available tables"),
-                    ));
+                // An explicit [table] that matched nothing: the catalog answered,
+                // the object simply is not there. DB_ERROR (exit 7) with the way
+                // out (Д10) — no new error code for it.
+                if let Some(name) = &table {
+                    if schema.tables.is_empty() {
+                        return Err(Failure::new(
+                            ErrorCode::DbError,
+                            format!("table '{name}' not found in {alias}"),
+                            format!("run nyet schema {alias} to list available tables"),
+                        ));
+                    }
                 }
-            }
 
-            let mut warnings: Vec<output::Warning> = Vec::new();
-            if schema.is_listing() {
-                warnings.push(output::Warning {
-                    code: "SCHEMA_TRUNCATED",
-                    message: format!(
-                        "schema listing truncated to names: {} objects exceed the {}-object \
-                         detail limit; run nyet schema {alias} <table> for one table's details",
-                        schema.tables.len(),
-                        output::DETAIL_LIMIT
+                let mut warnings: Vec<output::Warning> = Vec::new();
+                if schema.is_listing() {
+                    warnings.push(output::Warning {
+                        code: "SCHEMA_TRUNCATED",
+                        message: format!(
+                            "schema listing truncated to names: {} objects exceed the {}-object \
+                             detail limit; run nyet schema {alias} <table> for one table's details",
+                            schema.tables.len(),
+                            output::DETAIL_LIMIT
+                        ),
+                    });
+                }
+                if session.insecure_transport {
+                    warnings.push(insecure_transport_warning());
+                }
+                let meta = output::SchemaMeta {
+                    table_count: schema.tables.len() as u64,
+                    duration_ms,
+                    connection: alias.clone(),
+                };
+                let (data, envelope) = match format {
+                    Format::Table => (
+                        output::schema_text(&schema),
+                        output::schema_meta_json(&meta, &warnings),
                     ),
-                });
-            }
-            if session.insecure_transport {
-                warnings.push(insecure_transport_warning());
-            }
-            let meta = output::SchemaMeta {
-                table_count: schema.tables.len() as u64,
-                duration_ms,
-                connection: alias,
-            };
-            let (data, envelope) = match format {
-                Format::Table => (
-                    output::schema_text(&schema),
-                    output::schema_meta_json(&meta, &warnings),
-                ),
-                // Only Json remains: jsonl/csv were degraded to json above.
-                _ => (
-                    String::new(),
-                    output::schema_json(&schema, &meta, &warnings),
-                ),
-            };
-            emit(format, &data, &envelope).map_err(output_write_failure)?;
-            Ok(())
+                    // Only Json remains: jsonl/csv were degraded to json above.
+                    _ => (
+                        String::new(),
+                        output::schema_json(&schema, &meta, &warnings),
+                    ),
+                };
+                let warning_codes = warnings.iter().map(|w| w.code).collect();
+                let response =
+                    log_responses.then(|| audit::Response::Payload(payload_value(&schema)));
+                Ok(Emitted {
+                    data,
+                    envelope,
+                    duration_ms,
+                    row_count: None,
+                    truncated: None,
+                    warnings: warning_codes,
+                    response,
+                })
+            })();
+            audit_finish(
+                &cfg,
+                AuditMeta {
+                    command: "schema",
+                    alias: &alias,
+                    engine: &engine,
+                    cwd: &cwd_str,
+                    sql: None,
+                    table: table.as_deref(),
+                },
+                format,
+                outcome,
+            )
         }
         Command::Explain {
             alias,
@@ -649,76 +890,105 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // PLAN instead of the execution. Nothing runs: the EXPLAIN is never
             // ANALYZE, so `nyet explain` cannot be a way to execute anything.
             let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
-            // The very same layer 1 as `nyet query` — planning a write is
-            // refused (exit 5) before anything is sent to the database.
-            let (query, is_query, mut warnings) = validate(&query, &session.policy)?;
-            // The verdict is informational here, but it is measured against this
-            // connection's own guardrail, so `explain` answers exactly what
-            // `query` would decide.
-            let guardrail =
-                config::guardrail(&alias, conn).map_err(|e| config_failure(e, &path))?;
+            let engine = conn.engine.clone();
+            let raw_sql = query.clone();
+            let cwd_str = cwd.display().to_string();
+            let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
+            let outcome = (|| -> Result<Emitted, Failure> {
+                // The very same layer 1 as `nyet query` — planning a write is
+                // refused (exit 5) before anything is sent to the database.
+                let (query, is_query, mut warnings) = validate(&query, &session.policy)?;
+                // The verdict is informational here, but it is measured against this
+                // connection's own guardrail, so `explain` answers exactly what
+                // `query` would decide.
+                let guardrail =
+                    config::guardrail(&alias, conn).map_err(|e| config_failure(e, &path))?;
 
-            // A metadata statement (SHOW/DESCRIBE, or an EXPLAIN the agent wrote
-            // itself) has no plan to ask for: wrapping it in another EXPLAIN
-            // would only earn a confusing syntax error from the server. Answer
-            // that here — honestly, and without touching the database.
-            let (plan, duration_ms) = match is_query {
-                true => {
-                    let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
-                    run_db(session.db.estimate(&query))?
+                // A metadata statement (SHOW/DESCRIBE, or an EXPLAIN the agent wrote
+                // itself) has no plan to ask for: wrapping it in another EXPLAIN
+                // would only earn a confusing syntax error from the server. Answer
+                // that here — honestly, and without touching the database.
+                let (plan, duration_ms) = match is_query {
+                    true => {
+                        let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
+                        run_db(session.db.estimate(&query))?
+                    }
+                    false => {
+                        warnings.push(no_plan_warning());
+                        (None, 0)
+                    }
+                };
+                // No plan at all: either this was not a query, or planning outran
+                // the guardrail's budget — `explain` runs the SAME budget as
+                // `query`, so it cannot answer "ok" for a statement `query` would
+                // refuse. Either way the verdict is `no_estimate` over an empty plan.
+                let empty = plan.is_none();
+                let plan = plan.unwrap_or_else(|| {
+                    if is_query {
+                        warnings.push(planning_too_slow_warning());
+                    }
+                    guardrail::CostEstimate {
+                        plan: serde_json::Value::Array(Vec::new()),
+                        cost: None,
+                        rows: None,
+                        lower_bound: false,
+                    }
+                });
+                // The same honest note the query path gives when a plan carries no
+                // number nyet can judge (a recursive CTE, an unreadable shape).
+                if is_query
+                    && !empty
+                    && guardrail.plans()
+                    && guardrail.check(&plan) == guardrail::Check::NoEstimate
+                {
+                    warnings.push(guardrail_skipped_warning());
                 }
-                false => {
-                    warnings.push(no_plan_warning());
-                    (None, 0)
-                }
-            };
-            // No plan at all: either this was not a query, or planning outran
-            // the guardrail's budget — `explain` runs the SAME budget as
-            // `query`, so it cannot answer "ok" for a statement `query` would
-            // refuse. Either way the verdict is `no_estimate` over an empty plan.
-            let empty = plan.is_none();
-            let plan = plan.unwrap_or_else(|| {
-                if is_query {
-                    warnings.push(planning_too_slow_warning());
-                }
-                guardrail::CostEstimate {
-                    plan: serde_json::Value::Array(Vec::new()),
-                    cost: None,
-                    rows: None,
-                    lower_bound: false,
-                }
-            });
-            // The same honest note the query path gives when a plan carries no
-            // number nyet can judge (a recursive CTE, an unreadable shape).
-            if is_query
-                && !empty
-                && guardrail.plans()
-                && guardrail.check(&plan) == guardrail::Check::NoEstimate
-            {
-                warnings.push(guardrail_skipped_warning());
-            }
-            let estimate = guardrail.describe(plan);
+                let estimate = guardrail.describe(plan);
 
-            if session.insecure_transport {
-                warnings.push(insecure_transport_warning());
-            }
-            let meta = output::ExplainMeta {
-                duration_ms,
-                connection: alias,
-            };
-            let (data, envelope) = match format {
-                Format::Table => (
-                    output::explain_text(&estimate),
-                    output::explain_meta_json(&meta, &warnings),
-                ),
-                // Only Json remains: jsonl/csv were degraded to json above.
-                _ => (
-                    String::new(),
-                    output::explain_json(&estimate, &meta, &warnings),
-                ),
-            };
-            emit(format, &data, &envelope).map_err(output_write_failure)?;
-            Ok(())
+                if session.insecure_transport {
+                    warnings.push(insecure_transport_warning());
+                }
+                let meta = output::ExplainMeta {
+                    duration_ms,
+                    connection: alias.clone(),
+                };
+                let (data, envelope) = match format {
+                    Format::Table => (
+                        output::explain_text(&estimate),
+                        output::explain_meta_json(&meta, &warnings),
+                    ),
+                    // Only Json remains: jsonl/csv were degraded to json above.
+                    _ => (
+                        String::new(),
+                        output::explain_json(&estimate, &meta, &warnings),
+                    ),
+                };
+                let warning_codes = warnings.iter().map(|w| w.code).collect();
+                let response =
+                    log_responses.then(|| audit::Response::Payload(payload_value(&estimate)));
+                Ok(Emitted {
+                    data,
+                    envelope,
+                    duration_ms,
+                    row_count: None,
+                    truncated: None,
+                    warnings: warning_codes,
+                    response,
+                })
+            })();
+            audit_finish(
+                &cfg,
+                AuditMeta {
+                    command: "explain",
+                    alias: &alias,
+                    engine: &engine,
+                    cwd: &cwd_str,
+                    sql: Some(&raw_sql),
+                    table: None,
+                },
+                format,
+                outcome,
+            )
         }
         Command::Doctor { alias, format: _ } => {
             // doctor is the human's setup tool: it exits 0 whenever it ran, with
@@ -727,6 +997,10 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // only non-zero exits are the config-level ones already handled above
             // (config unreadable / unknown alias -> 3, unsupported engine -> 1).
             let permissions = config_permissions(&path);
+            // Only the per-connection path (Some alias) contacts a database, so
+            // only it is audited; `nyet doctor` with no alias is config-level
+            // (no db) and is not logged. Carries (alias, engine) when auditable.
+            let mut audit_id: Option<(String, String)> = None;
             let (checks, meta) = match alias {
                 None => {
                     // No alias: config-file permissions plus the connections
@@ -753,6 +1027,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     let conn = lookup_alias(&cfg, &path, &alias)?;
                     let timeout_secs = cfg.timeout_secs(conn, None);
                     let (mut db, _policy) = build_engine(&alias, conn, timeout_secs)?;
+                    audit_id = Some((alias.clone(), conn.engine.clone()));
                     let (diagnosis, duration_ms) =
                         diagnose_connection(conn, timeout_secs, &mut db)?;
                     let input = output::DoctorInput {
@@ -778,8 +1053,37 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // Only Json remains (doctor accepts json|table only).
                 _ => (String::new(), output::doctor_json(&checks, &meta)),
             };
-            emit(format, &data, &envelope).map_err(output_write_failure)?;
-            Ok(())
+            match audit_id {
+                Some((alias, engine)) => {
+                    let cwd_str = cwd.display().to_string();
+                    let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
+                    let response =
+                        log_responses.then(|| audit::Response::Payload(payload_value(&checks)));
+                    let emitted = Emitted {
+                        data,
+                        envelope,
+                        duration_ms: meta.duration_ms,
+                        row_count: None,
+                        truncated: None,
+                        warnings: Vec::new(),
+                        response,
+                    };
+                    audit_finish(
+                        &cfg,
+                        AuditMeta {
+                            command: "doctor",
+                            alias: &alias,
+                            engine: &engine,
+                            cwd: &cwd_str,
+                            sql: None,
+                            table: None,
+                        },
+                        format,
+                        Ok(emitted),
+                    )
+                }
+                None => emit(format, &data, &envelope).map_err(output_write_failure),
+            }
         }
         // Handled by the short-circuit at the top of run() (before the config
         // read), so this arm is dead — it exists only for match exhaustiveness.
@@ -1280,7 +1584,7 @@ fn config_permissions(path: &Path) -> output::Permissions {
     {
         use std::os::unix::fs::MetadataExt;
         match std::fs::metadata(path) {
-            Ok(md) => match config::permissions_warning(md.mode()) {
+            Ok(md) => match config::permissions_warning(md.mode(), "the config file") {
                 Some(message) => output::Permissions::Loose(message),
                 None => output::Permissions::Secure,
             },
@@ -1497,6 +1801,18 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
              options (a leading '-', or a ${VAR} that expands to one) are rejected"
                 .to_string(),
         ),
+        config::ConfigError::AuditPathEnvVar { value } => (
+            format!(
+                "config file {}: [audit] path \"{value}\" uses ${{VAR}} substitution",
+                path.display()
+            ),
+            "audit.path must be a literal value; ${VAR} substitution is not allowed because \
+             the environment is controlled by the calling agent — it could otherwise redirect \
+             or silence its own audit trail. Write the absolute path literally (the default \
+             ~/.local/share/nyet/audit.jsonl resolves from the agent-controlled \
+             XDG_DATA_HOME/HOME, so an explicit literal path is what an agent cannot redirect)"
+                .to_string(),
+        ),
     };
     Failure::new(ErrorCode::ConfigInvalid, message, hint)
 }
@@ -1550,16 +1866,23 @@ fn read_config(path: &Path) -> Result<String, Failure> {
     })
 }
 
-/// Config accessible by group/others -> human warning on stderr (not a refusal).
-fn warn_bad_permissions(path: &Path) {
+/// A file readable by group/others -> human warning on stderr (not a refusal).
+/// Shared by the config file and the audit log (both may hold credentials/the
+/// agent's SQL); like the config, we WARN, we do not chmod. Only an EXISTING
+/// loose file warns — one nyet creates itself is 0600 from birth.
+fn warn_loose_permissions(path: &Path, what: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if let Ok(md) = std::fs::metadata(path) {
-            if let Some(warning) = config::permissions_warning(md.mode()) {
+            if let Some(warning) = config::permissions_warning(md.mode(), what) {
                 let _ = writeln!(std::io::stderr(), "warning: {}: {warning}", path.display());
             }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, what);
     }
 }
 

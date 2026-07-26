@@ -11,6 +11,41 @@ pub struct Config {
     pub defaults: Defaults,
     #[serde(default)]
     pub connections: BTreeMap<String, Connection>,
+    /// Global audit policy (UX-8), not per-connection — a human decision about
+    /// their own machine, the same for every database.
+    #[serde(default)]
+    pub audit: Audit,
+}
+
+/// `[audit]`: the forensic log of every database-touching command. On by
+/// default (auditing is part of the contract, UX-8); switch it off for
+/// CI/containers with `enabled = false`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Audit {
+    /// Default true.
+    pub enabled: Option<bool>,
+    /// Override the log path; default `$XDG_DATA_HOME/nyet/audit.jsonl` →
+    /// `~/.local/share/nyet/audit.jsonl` (resolved in the cli). LITERAL only:
+    /// `${VAR}` is rejected (see `reject_env_vars_in_policy`), because the
+    /// environment is the calling agent's — it must not be able to redirect or
+    /// silence its own audit trail.
+    pub path: Option<String>,
+    /// Default false. When true, the record also carries the result rows the
+    /// agent saw (volume + PII of the data itself).
+    pub log_responses: Option<bool>,
+}
+
+impl Config {
+    /// Auditing is on unless explicitly disabled (UX-8).
+    pub fn audit_enabled(&self) -> bool {
+        self.audit.enabled.unwrap_or(true)
+    }
+
+    /// Response bodies are logged only when explicitly opted in.
+    pub fn audit_log_responses(&self) -> bool {
+        self.audit.log_responses.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -117,6 +152,11 @@ pub enum ConfigError {
     /// (e.g. an option-injection host after `${VAR}` substitution). Caught at
     /// parse (fail-fast) rather than as a runtime tunnel error.
     SshInvalid { alias: String, message: String },
+    /// `${VAR}` in `[audit] path`: like the per-connection policy values, the
+    /// audit path is security-relevant and the agent controls the environment,
+    /// so substitution there would let it redirect or disable its own audit
+    /// trail. Literal only.
+    AuditPathEnvVar { value: String },
 }
 
 /// Environment lookup, injected for purity (cli passes `std::env::var`).
@@ -310,6 +350,18 @@ fn reject_zero(value: Option<u64>, key: &str) -> Result<(), ConfigError> {
 /// Checked on the RAW tree, before substitution, so an unset variable is
 /// rejected too (nothing here is worth a "maybe").
 fn reject_env_vars_in_policy(value: &toml::Value) -> Result<(), ConfigError> {
+    // `[audit] path` is a global policy value (security-relevant), same rule.
+    if let Some(path) = value
+        .get("audit")
+        .and_then(|a| a.get("path"))
+        .and_then(toml::Value::as_str)
+    {
+        if path.contains("${") {
+            return Err(ConfigError::AuditPathEnvVar {
+                value: path.to_string(),
+            });
+        }
+    }
     let Some(connections) = value.get("connections").and_then(toml::Value::as_table) else {
         return Ok(());
     };
@@ -414,10 +466,12 @@ fn redact_quoted(msg: &str) -> String {
 }
 
 /// group/other permission bits set -> warning text (pure; cli reads the mode).
-pub fn permissions_warning(mode: u32) -> Option<String> {
+/// `what` names the file (e.g. "config file", "audit log") so the same check
+/// serves both — the audit log holds the agent's SQL and is just as sensitive.
+pub fn permissions_warning(mode: u32, what: &str) -> Option<String> {
     if mode & 0o077 != 0 {
         Some(format!(
-            "config file is accessible by group/others (mode {:03o}); credentials may leak — run `chmod 600` on it",
+            "{what} is accessible by group/others (mode {:03o}); credentials may leak — run `chmod 600` on it",
             mode & 0o777
         ))
     } else {
@@ -994,10 +1048,61 @@ mod tests {
     }
 
     #[test]
+    fn audit_defaults_on_and_parses_the_section() {
+        // Absent [audit]: enabled, responses off.
+        let cfg = parse("[connections.a]\nengine = \"sqlite\"\n", &env_of(&[])).unwrap();
+        assert!(cfg.audit_enabled());
+        assert!(!cfg.audit_log_responses());
+        assert!(cfg.audit.path.is_none());
+        // Explicit section.
+        let cfg = parse(
+            "[audit]\nenabled = false\npath = \"/var/log/nyet/audit.jsonl\"\nlog_responses = true\n\
+             [connections.a]\nengine = \"sqlite\"\n",
+            &env_of(&[]),
+        )
+        .unwrap();
+        assert!(!cfg.audit_enabled());
+        assert!(cfg.audit_log_responses());
+        assert_eq!(cfg.audit.path.as_deref(), Some("/var/log/nyet/audit.jsonl"));
+        // Unknown key inside [audit] fails loudly (the convention).
+        assert!(matches!(
+            parse("[audit]\ntypo = 1", &env_of(&[])).unwrap_err(),
+            ConfigError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn env_var_in_audit_path_is_rejected_literal_only() {
+        // The agent controls the environment; ${VAR} in the audit path would let
+        // it redirect or silence its own trail. Rejected before substitution, so
+        // an unset variable fails too.
+        for env in [env_of(&[("LOG", "/tmp/agent-owned")]), env_of(&[])] {
+            let text = "[audit]\npath = \"${LOG}/audit.jsonl\"\n\
+                        [connections.a]\nengine = \"sqlite\"\n";
+            match parse(text, &env).unwrap_err() {
+                ConfigError::AuditPathEnvVar { value } => {
+                    assert_eq!(value, "${LOG}/audit.jsonl")
+                }
+                other => panic!("expected AuditPathEnvVar, got {other:?}"),
+            }
+        }
+        // A literal path is fine.
+        assert!(parse(
+            "[audit]\npath = \"/var/log/nyet/audit.jsonl\"\n[connections.a]\nengine = \"sqlite\"\n",
+            &env_of(&[])
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn permissions_warning_on_group_other_bits() {
-        assert!(permissions_warning(0o100600).is_none());
-        assert!(permissions_warning(0o100644).is_some());
-        assert!(permissions_warning(0o100640).is_some());
-        assert!(permissions_warning(0o100601).is_some());
+        assert!(permissions_warning(0o100600, "config file").is_none());
+        assert!(permissions_warning(0o100644, "config file").is_some());
+        assert!(permissions_warning(0o100640, "config file").is_some());
+        assert!(permissions_warning(0o100601, "config file").is_some());
+        // The label is interpolated, so the same check serves the audit log.
+        assert!(permissions_warning(0o100644, "the audit log")
+            .unwrap()
+            .contains("audit log"));
     }
 }

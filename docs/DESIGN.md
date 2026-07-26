@@ -69,7 +69,8 @@ guardrail; отказ guardrail'а дополнительно несёт top-lev
 
 Прочие ошибки (конфиг, соединение, timeout, ошибка БД) — обычные коды
 (`CONFIG_INVALID`, `CONNECTION_FAILED`, `TIMEOUT`, `DB_ERROR`, ...) без
-`reason`.
+`reason`. `AUDIT_FAILED` (exit 1, класс INTERNAL) — не удалось записать
+аудит-лог: результат withheld, агент не получает данные (§4, UX-8).
 
 Правила стабильности: поля только добавляются; переименование/удаление/смена
 типа = breaking change = bump `v`. `warnings[].code`, `error.code` и
@@ -114,6 +115,11 @@ timeout_secs = 30
 format = "json"
 max_row_limit = 10000                  # опциональные потолки: выше них
 max_timeout_secs = 60                  # --limit/--timeout агента не поднимут
+
+[audit]                                # глобальная политика аудита (UX-8)
+enabled = true                         # дефолт true; false — для CI/контейнеров
+path = "/var/log/nyet/audit.jsonl"     # дефолт $XDG_DATA_HOME/nyet/audit.jsonl; literal-only
+log_responses = false                  # дефолт false; true — логировать и rows ответа
 
 [connections.prod]
 engine = "postgres"                    # postgres | mysql | sqlite (v0.2) | ...
@@ -179,6 +185,14 @@ allowed_dirs = ["~/Workspace/app"]
   который активный режим не читает (`max_rows` при `mode = "cost"`), — жёсткая
   ошибка (exit 3), а не тихий откат к «без guardrail». Глобальных дефолтов в
   `[defaults]` для guardrail нет (YAGNI): порог — свойство конкретной базы.
+- **`[audit]`** (глобальная политика, не per-connection): `enabled` (дефолт
+  true — аудит часть договора, UX-8; `false` для CI/контейнеров), `path`
+  (дефолт `$XDG_DATA_HOME/nyet/audit.jsonl` → `~/.local/share/nyet/audit.jsonl`),
+  `log_responses` (дефолт false). `path` — **literal-only**: `${VAR}` в нём
+  запрещён тем же правилом `reject_env_vars_in_policy`, что и `allowed_dirs`/
+  `guardrail.mode` (окружение контролирует агент — иначе он перенаправил бы или
+  заглушил бы собственный аудит-трейл). Ошибка записи лога → `AUDIT_FAILED`
+  (exit 1), результат агенту НЕ отдаётся (fail-closed, см. §4).
 - Неизвестные ключи в конфиге — жёсткая ошибка (fail loud, ловит опечатки).
 
 ---
@@ -277,6 +291,19 @@ zero-width unicode, denylist-функции), а также представит
 - **Prompt injection через результаты запросов**: полной защиты не существует
   (продемонстрированные атаки 2026 г.). Митигации: read-only ограничивает blast
   radius, аудит-лог даёт форензику; остальное — ответственность harness'а.
+  Аудит-лог реализован (UX-8): каждая команда, идущая в БД (`query`/`schema`/
+  `explain`/`doctor <alias>`), пишет одну jsonl-строку в
+  `~/.local/share/nyet/audit.jsonl` — включая отказы и ошибки («что агент
+  ПЫТАЛСЯ»). Включён по умолчанию, **fail-closed**: запись фиксируется до отдачи
+  результата, провал записи → `AUDIT_FAILED`, данные агенту не уходят. Никогда
+  не логируются креденшалы (только alias+engine, не url; текст ошибки БД в
+  запись не попадает — только `error.code`). Порядок гарантирует, что человек не
+  пропустит событие, на которое агент успел среагировать. **Явный `[audit] path`
+  literal-only** (агент не перепишет пин через env), НО **дефолтный путь
+  резолвится из агент-контролируемых `XDG_DATA_HOME`/`HOME`** — агент может
+  перенаправить дефолтный лог (та же граница, что спуфинг cwd: агент с
+  shell/env-доступом вне скоупа). Агент-устойчивый след требует явного literal
+  `path` вне env-влияния + слой 3 (read-only роль).
 - **Враждебный пользователь-человек**: nyet — инструмент пользователя, а не
   система контроля доступа между людьми.
 

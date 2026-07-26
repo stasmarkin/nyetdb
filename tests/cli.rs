@@ -2235,3 +2235,267 @@ fn query_accepts_a_leading_hyphen_alias_after_end_of_options() {
     let v = success_envelope(&stdout(&out));
     assert_eq!(v["rows"], serde_json::json!([{"n": 3}]));
 }
+
+// ---------------------------------------------------------------------------
+// Audit log (UX-8): every database-touching command leaves a jsonl record;
+// fail-closed when it cannot be written; opt-out via [audit] enabled = false.
+// ---------------------------------------------------------------------------
+
+/// The default audit-log location under a test HOME.
+fn audit_file(home: &Path) -> std::path::PathBuf {
+    home.join(".local/share/nyet/audit.jsonl")
+}
+
+/// The single audit record (fails if there is not exactly one line).
+fn one_audit_record(home: &Path) -> serde_json::Value {
+    let text = fs::read_to_string(audit_file(home)).expect("audit file must exist");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "expected one audit line, got: {text}");
+    serde_json::from_str(lines[0]).expect("audit line must be valid JSON")
+}
+
+#[test]
+fn audit_records_a_successful_query() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id, email FROM users ORDER BY id",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // The result still reached the agent, unchanged.
+    assert!(stdout(&out).contains(r#""rows":[{"id":1"#));
+    // ...and a matching audit record was written first.
+    let rec = one_audit_record(tmp.path());
+    assert_eq!(rec["audit_v"], 1);
+    assert_eq!(rec["command"], "query");
+    assert_eq!(rec["alias"], "db");
+    assert_eq!(rec["engine"], "sqlite");
+    assert_eq!(rec["verdict"], "ok");
+    assert_eq!(rec["exit_code"], 0);
+    assert_eq!(rec["row_count"], 3);
+    assert_eq!(rec["sql"], "SELECT id, email FROM users ORDER BY id");
+    // ISO 8601 UTC timestamp — pin the shape, not the (flapping) value.
+    let ts = rec["ts"].as_str().unwrap();
+    assert!(
+        ts.ends_with('Z') && ts.contains('T') && ts.len() >= 20,
+        "ts: {ts}"
+    );
+    // No response body unless log_responses is on; no credentials anywhere.
+    assert!(rec.get("response").is_none());
+    let raw = fs::read_to_string(audit_file(tmp.path())).unwrap();
+    assert!(!raw.contains("password") && !raw.contains("://"));
+}
+
+#[test]
+fn audit_records_a_validator_refusal_with_reason() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args(["query", "db", "DELETE FROM users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let rec = one_audit_record(tmp.path());
+    assert_eq!(rec["command"], "query");
+    assert_eq!(rec["verdict"], "refused");
+    assert_eq!(rec["reason"], "WRITE_OPERATION");
+    assert_eq!(rec["exit_code"], 5);
+    assert_eq!(rec["sql"], "DELETE FROM users");
+}
+
+#[test]
+fn audit_records_schema_and_explain() {
+    let (tmp, cfg) = sqlite_fixture("");
+    nyet(tmp.path())
+        .args(["schema", "db", "users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    nyet(tmp.path())
+        .args(["explain", "db", "SELECT * FROM users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let text = fs::read_to_string(audit_file(tmp.path())).unwrap();
+    let recs: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0]["command"], "schema");
+    assert_eq!(recs[0]["table"], "users");
+    assert_eq!(recs[0]["verdict"], "ok");
+    assert_eq!(recs[1]["command"], "explain");
+    assert_eq!(recs[1]["sql"], "SELECT * FROM users");
+}
+
+#[test]
+fn audit_disabled_writes_nothing() {
+    let (tmp, cfg) = sqlite_fixture("[audit]\nenabled = false\n");
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1 AS n", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains(r#""rows":[{"n":1}]"#));
+    assert!(
+        !audit_file(tmp.path()).exists(),
+        "no audit file when disabled"
+    );
+}
+
+#[test]
+fn audit_log_responses_includes_the_rows_the_agent_saw() {
+    let (tmp, cfg) = sqlite_fixture("[audit]\nlog_responses = true\n");
+    nyet(tmp.path())
+        .args([
+            "query",
+            "db",
+            "SELECT id, email FROM users ORDER BY id",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let rec = one_audit_record(tmp.path());
+    // The response carries exactly the rows the agent received, in column order.
+    assert_eq!(
+        rec["response"],
+        serde_json::json!([
+            {"id": 1, "email": "a@b.c"},
+            {"id": 2, "email": "d@e.f"},
+            {"id": 3, "email": null}
+        ])
+    );
+}
+
+/// Fail-closed (UX-8, UX-1): if the audit record cannot be written, the query
+/// result is NOT released — the agent gets AUDIT_FAILED (exit 1) and no rows.
+#[test]
+fn audit_write_failure_is_fail_closed_and_withholds_the_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("fixture.db");
+    make_db(&db);
+    // A regular file stands where a directory would need to be, so mkdir of the
+    // audit path's parent fails deterministically (ENOTDIR).
+    let blocker = tmp.path().join("blocker");
+    fs::write(&blocker, "x").unwrap();
+    let audit_path = blocker.join("sub/audit.jsonl");
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[audit]\npath = \"{}\"\n[connections.db]\nengine = \"sqlite\"\npath = \"{}\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            audit_path.display(),
+            db.display(),
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT id, email FROM users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "AUDIT_FAILED");
+    assert!(v["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("enabled = false"));
+    // The data the agent must NOT have received.
+    assert!(
+        !stdout(&out).contains("a@b.c"),
+        "result leaked despite audit failure"
+    );
+}
+
+#[test]
+fn audit_env_var_in_path_is_config_error() {
+    let (tmp, cfg) = sqlite_fixture("[audit]\npath = \"${LOGDIR}/audit.jsonl\"\n");
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1", "--config"])
+        .arg(&cfg)
+        .env("LOGDIR", "/tmp/agent-owned")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+}
+
+/// Cross-PROCESS concurrency: two nyet processes append large (>4 KiB) records
+/// to the same audit file at once (log_responses on, a big blob row). The
+/// advisory lock must keep both lines whole and valid.
+#[test]
+fn audit_is_safe_across_concurrent_processes() {
+    let (tmp, cfg) = sqlite_fixture("[audit]\nlog_responses = true\n");
+    let spawn = || {
+        nyet(tmp.path())
+            .args([
+                "query",
+                "db",
+                "SELECT hex(randomblob(4096)) AS blob",
+                "--config",
+            ])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let a = spawn();
+    let b = spawn();
+    assert!(a.wait_with_output().unwrap().status.success());
+    assert!(b.wait_with_output().unwrap().status.success());
+    let text = fs::read_to_string(audit_file(tmp.path())).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "both processes must have logged");
+    for l in &lines {
+        let v: serde_json::Value = serde_json::from_str(l)
+            .unwrap_or_else(|_| panic!("garbled line: {}", &l[..60.min(l.len())]));
+        // 4096 bytes -> 8192 hex chars: the record is well past 4 KiB.
+        assert_eq!(v["response"][0]["blob"].as_str().unwrap().len(), 8192);
+    }
+}
+
+/// An existing audit log with group/other bits leaks the agent's SQL to other
+/// local users — warn on stderr like the config file (warn, never chmod).
+#[cfg(unix)]
+#[test]
+fn audit_warns_on_a_loose_existing_log_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, cfg) = sqlite_fixture("");
+    let logf = audit_file(tmp.path());
+    fs::create_dir_all(logf.parent().unwrap()).unwrap();
+    fs::write(&logf, "").unwrap();
+    fs::set_permissions(&logf, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT 1 AS n", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("audit log") && stderr(&out).contains("chmod"),
+        "expected a loose-permissions warning: {}",
+        stderr(&out)
+    );
+}

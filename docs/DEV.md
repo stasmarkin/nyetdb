@@ -170,9 +170,13 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 ├─ output    (src/output.rs)    — pure: values -> envelope/table strings;
 │                                 also owns the `schema` and `doctor` data
 │                                 models (the contract shapes) + their rules
-└─ skill     (src/skill.rs)     — pure: (instruction template + the user's
-                                  connections) -> the `agent-setup` SKILL.md
-                                  string; std only, no IO
+├─ skill     (src/skill.rs)     — pure: (instruction template + the user's
+│                                 connections) -> the `agent-setup` SKILL.md
+│                                 string; std only, no IO
+└─ audit     (src/audit.rs)     — pure record builder ((event, ts) -> jsonl
+                                  line, snapshot-tested) + the ONE IO piece
+                                  (append: mkdir + create 0600 + advisory lock
+                                  + write + flush). serde/serde_json + std only
 ```
 
 Dependencies flow downward only: the pure modules do no IO and know nothing
@@ -1594,3 +1598,97 @@ shares `lookup_alias` (unknown alias -> exit 3) and `build_engine` but
 deliberately **skips `check_scope`** (a named alias is diagnosed from any
 directory) and never calls `engine_failure` (a connect failure becomes a `fail`
 check via `diagnose_connection`, not an exit-6 envelope).
+
+## Audit log (`src/audit.rs`)
+
+The forensic log the human relies on (UX-8): one jsonl line per
+database-touching command. The split follows Д1/Д2 — `audit.rs` is a pure record
+builder plus the single IO primitive, the cli owns the orchestration.
+
+**Record schema, versioned independently.** `audit_v` (a `const` in `audit.rs`)
+is the record-schema version, deliberately separate from the JSON-envelope `v`:
+the log can gain fields on its own cadence without touching the agent contract.
+Fields: `audit_v`, `ts` (ISO 8601 UTC ms), `command`, `alias`, `engine`, `cwd`,
+`sql` (query/explain — the RAW agent text, before Unicode normalization, so a
+zero-width injection is visible) or `table` (schema), `verdict`
+(`ok`/`refused`/`error`), `reason` (the NYET reason on a refusal, the
+`error.code` on an error), `exit_code`, `row_count`+`truncated` (query),
+`duration_ms`, `warnings` (codes only), and — under `log_responses` — `response`
+(the rows the agent saw, in column order via the same ordered-object serializer
+as `output`; other commands log their structured payload as a `Value`). All
+optional fields are `skip_serializing_if`, so each line stays minimal (UX-4).
+Snapshot-tested with an injected timestamp (`ts` is never compared byte-for-byte
+in the e2e — only its shape).
+
+**Privacy — what is excluded.** The `Event` struct has nowhere to put a
+password or a url: only `alias`+`engine` identify the connection. A url can
+carry an inline password, so it is never logged. Pinned by
+`warning_codes_are_listed_but_never_the_url_or_password` and by the e2e reading
+the raw file back and asserting it holds no `password`/`://`.
+
+**Where it is logged (the pipeline point).** `main::audit_finish` is the single
+seam. Each DB command (`query`/`schema`/`explain`/`doctor <alias>`) runs its
+body as one `Result<Emitted, Failure>` — so **every** outcome, success or a
+refusal/DB-error `Failure`, flows through the same place — and then
+`audit_finish` writes the record **before** `emit` (success) or before `main`
+prints the error envelope (failure). The audit point is *after* the session is
+open (engine resolved) but does not require a connect: a validator refusal is
+logged though nothing reached the database ("what the agent tried"). Config
+errors *before* the session (unknown alias, directory denied, unsupported
+engine, missing `password_env`) are **not** logged — there is no engine to name
+and no database interaction; behavior there is byte-for-byte as before.
+`list`, `agent-setup` and `doctor` with no alias never contact a database and
+are not logged (Д9 — nothing extra on the cold-start path).
+
+**Fail-closed ordering (UX-8/UX-1).** The record is written and flushed before
+the result is released. If the append fails, `audit_finish` returns
+`AUDIT_FAILED` (a new `error.code`, exit 1 / INTERNAL class — it is nyet's own
+infrastructure failing, not the request) and the result is **never emitted** —
+`stdout` carries the error envelope (json) or stays empty (data formats), so the
+agent gets no rows. The human cannot miss an event the agent acted on. A refusal
+or DB error is logged too and, if THAT write fails, `AUDIT_FAILED` overrides even
+the original error.
+
+**Concurrency — no interleaving.** Several `nyet` processes (parallel agents)
+append to one file. A jsonl line with `log_responses` can exceed 4 KiB, so a
+single `write()` is not guaranteed atomic; `audit::append` therefore holds an
+advisory exclusive lock (`std::fs::File::lock`, stable since Rust 1.89 —
+`flock(2)` on unix, no new crate, no `unsafe`) across the write+flush, and opens
+with `O_APPEND`. Two concurrent large writes each land whole. Proven by
+`concurrent_large_appends_never_interleave` (4 threads × 50 × 8 KiB) and by the
+cross-process e2e `audit_is_safe_across_concurrent_processes` (two `nyet query`
+processes, big-blob rows).
+
+**Durability trade-off (Д9).** The line is `write`+`flush`ed (in the OS cache,
+visible to readers, survives a process crash) but NOT `fsync`ed: a per-query
+fsync would tax every request, and a full power loss dropping only the last line
+is acceptable for a cooperative-agent log. The load-bearing guarantee is the
+cli's ORDERING (record committed before the agent gets its result), not fsync.
+
+**No new dependency (Д8).** The timestamp comes from `chrono`, already in the
+tree via sqlx (`sqlx::types::chrono`); the lock is `std`. `audit.rs` depends on
+serde/serde_json + std only.
+
+**Path resolution.** `main::audit_path`: explicit literal `[audit] path` →
+`$XDG_DATA_HOME/nyet/audit.jsonl` → `~/.local/share/nyet/audit.jsonl`. `${VAR}`
+in an explicit `path` is a config error (`AuditPathEnvVar`, exit 3) via the same
+`reject_env_vars_in_policy` as the other policy values, so a config owner's
+pinned path cannot be rewritten through the environment. **Honest limit:** the
+*default* path still resolves from `XDG_DATA_HOME`/`HOME`, which are
+agent-controlled — an agent can redirect the DEFAULT log by setting
+`XDG_DATA_HOME` (the same threat-model boundary as cwd spoofing, DESIGN §4; the
+defense is an explicit literal `path` plus a read-only role, not the log alone).
+literal-only therefore hardens the explicit pin, not the default. If neither
+HOME nor XDG_DATA_HOME is set and no explicit path is given, auditing cannot
+proceed and fails closed (`AUDIT_FAILED`), never a panic (Д3).
+
+**Existing-file permission warning.** `main::warn_loose_permissions` (shared
+with the config file) stat-warns to stderr if an EXISTING log has group/other
+bits — it holds the agent's SQL (and rows under `log_responses`). Like the
+config, nyet warns and does not chmod; a file nyet creates is 0600 from birth.
+
+**Partial-write rollback.** `audit::write_flush` records the file length before
+the write and, on a `write_all`/`flush` error (a full disk mid record),
+`set_len`s back to it under the still-held flock — so a committed prefix cannot
+corrupt every jsonl line below it — then returns the error (`AUDIT_FAILED`,
+fail-closed). Fault-injected by `a_partial_write_is_rolled_back_and_leaves_valid_jsonl`.

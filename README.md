@@ -95,6 +95,12 @@ format = "json"        # default output format: json | jsonl | table | csv
 max_row_limit = 10000
 max_timeout_secs = 60
 
+# Global audit policy (on by default). See the "Audit log" section below.
+[audit]
+enabled = true                         # false disables logging (CI/containers)
+# path = "/var/log/nyet/audit.jsonl"   # default: ~/.local/share/nyet/audit.jsonl
+log_responses = false                  # true also logs the result rows
+
 [connections.prod]
 engine = "postgres"                    # postgres | mysql | sqlite | ...
 url = "postgres://nyet_ro@db.internal:5432/app"
@@ -990,6 +996,86 @@ The full allow/deny specification is the public test corpus in
 least one allow and one deny case, and every known bypass is pinned as a
 corpus case first, then fixed.
 
+## Audit log
+
+Letting an agent near a database is only safe if you can see afterwards what it
+did — so the audit log is part of the contract, not an optional extra (UX-8).
+Every command that reaches a database (`query`, `schema`, `explain`, and
+`doctor <alias>`) appends one JSON line to
+
+```
+$XDG_DATA_HOME/nyet/audit.jsonl        # default: ~/.local/share/nyet/audit.jsonl
+```
+
+`list`, `agent-setup` and `nyet doctor` with no alias never touch a database,
+so they are not logged.
+
+**On by default.** A refusal (`NYET`), a database error and a timeout are logged
+too — the log shows what the agent *tried*, not only what succeeded.
+
+Example lines (one JSON object per line — a successful query, then a refusal):
+
+```json
+{"audit_v":1,"ts":"2026-07-26T12:34:56.789Z","command":"query","alias":"prod","engine":"postgres","cwd":"/home/me/app","sql":"SELECT id, email FROM users LIMIT 5","verdict":"ok","exit_code":0,"row_count":5,"truncated":false,"duration_ms":12}
+{"audit_v":1,"ts":"2026-07-26T12:35:01.114Z","command":"query","alias":"prod","engine":"postgres","cwd":"/home/me/app","sql":"DELETE FROM users","verdict":"refused","reason":"WRITE_OPERATION","exit_code":5,"duration_ms":0}
+```
+
+Fields: `audit_v` (the record-schema version, independent of the envelope `v`),
+`ts` (ISO 8601 UTC, ms), `command`, `alias`, `engine`, `cwd`, `sql`
+(query/explain — the RAW text, so a hidden-character injection is visible) or
+`table` (schema's argument), `verdict` (`ok`/`refused`/`error`), `reason` (the
+NYET reason or the `error.code`), `exit_code`, `row_count`+`truncated` (query),
+`duration_ms`, and `warnings` (the warning codes). **Never logged: passwords,
+`password_env` values, or the connection url** — only the alias and engine, so
+an inline-password url can never leak into the log.
+
+Read it with `jq`, e.g. every write an agent attempted against `prod`:
+
+```sh
+jq -c 'select(.alias=="prod" and .verdict=="refused")' ~/.local/share/nyet/audit.jsonl
+```
+
+**Logging the results too.** `log_responses = true` adds a `response` field with
+the exact rows the agent received (post-truncation, in column order) — off by
+default because of volume and the PII in the data itself. Same rule: no
+credentials.
+
+**Fail-closed.** The record is written *before* the result is handed to the
+agent. If the log cannot be written (bad path, no permission, full disk), the
+query result is **withheld**: the agent gets `AUDIT_FAILED` (exit 1) and no
+data, so you never miss an event the agent acted on. Fix the path/permissions,
+or turn auditing off:
+
+```toml
+[audit]
+enabled = false                              # default true; for CI/containers
+path = "/var/log/nyet/audit.jsonl"           # default $XDG_DATA_HOME/nyet/audit.jsonl
+log_responses = false                        # default; true logs result rows too
+```
+
+An explicit `path` is a literal — `${VAR}` substitution is rejected there, so a
+config owner who pins the path controls it and the calling agent cannot rewrite
+that pin through the environment. **But the *default* path is resolved from
+`XDG_DATA_HOME`/`HOME`, which the agent's environment controls**: an agent that
+sets `XDG_DATA_HOME=/tmp/junk` (leaving `HOME` so the config still resolves)
+sends the log there, and you would find `~/.local/share/nyet/audit.jsonl` empty
+and wrongly conclude the agent did nothing. This is the same known boundary as
+cwd spoofing (see the threat model: an agent with shell/environment access is
+out of scope; the real defense is layer 3, a read-only DB role). **If you need a
+trail that survives an agent with environment control, set an explicit literal
+`[audit] path`** somewhere the agent's env does not steer, and back it with a
+read-only role. The file is created `0600` (it holds the agent's SQL); an
+existing file with looser permissions gets a stderr warning (nyet warns, it does
+not chmod — like the config file). The parent directory is created if missing.
+Durability is a process-level flush, not `fsync`: the record survives a process
+crash and is visible to readers immediately, but a full power loss may drop the
+very last line — the accepted trade for not paying an fsync on every query.
+
+**Rotation is external.** nyet only appends; point `logrotate` (or your tool of
+choice) at the file. It stays valid jsonl across a rotation because each line is
+written whole under an advisory lock, so concurrent `nyet` processes never
+interleave.
+
 ## Output contract
 
 stdout always carries exactly one compact JSON envelope. For data formats
@@ -1003,8 +1089,10 @@ otherwise human-readable diagnostics. Errors:
 ```
 
 Every error carries an actionable `hint`. Error codes today:
-`CONFIG_INVALID`, `DIR_NOT_ALLOWED`, `NOT_IMPLEMENTED`, `INTERNAL`, `NYET`
-(with `reason`, see above), `CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
+`CONFIG_INVALID`, `DIR_NOT_ALLOWED`, `NOT_IMPLEMENTED`, `INTERNAL`,
+`AUDIT_FAILED` (the audit log could not be written — the result is withheld,
+see [Audit log](#audit-log)), `NYET` (with `reason`, see above),
+`CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
 Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
 `INSECURE_TRANSPORT`, `SCHEMA_TRUNCATED`, `GUARDRAIL_SKIPPED`, `NO_PLAN`.
 
@@ -1017,7 +1105,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | success (including success with warnings) |
-| 1 | internal error / engine not implemented yet |
+| 1 | internal error / engine not implemented yet / audit log unwritable (`AUDIT_FAILED`) |
 | 2 | CLI usage error |
 | 3 | config error (not found, invalid, unknown alias) |
 | 4 | connection not allowed from the current directory |
