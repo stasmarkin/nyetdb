@@ -1,0 +1,383 @@
+//! Pure generator for `nyet agent-setup`: a Claude Code skill (SKILL.md —
+//! YAML frontmatter + Markdown body) that teaches an AI agent to use nyet.
+//!
+//! Д1/Д2: a stable instruction template plus the user's already-read
+//! connections -> one String, no IO. The cli reads the config and writes the
+//! output. Token-economical on purpose (UX-4) — it is a document the agent
+//! reads and pays for — while still self-sufficient (UX-3): an agent seeing
+//! nyet for the first time can reach a successful query from it alone.
+
+/// One connection advertised in the dynamic "Your connections" section.
+pub struct Conn {
+    pub alias: String,
+    pub engine: String,
+}
+
+/// What the dynamic section is built from.
+pub enum Connections {
+    /// The config could not be located, read or parsed (or cwd was
+    /// unresolvable): degrade to the "set up a config" hint rather than fail —
+    /// agent-setup's value is teaching the agent even before any setup.
+    Unavailable,
+    /// The config loaded; these connections are reachable from the current
+    /// directory (consistent with `nyet list`; possibly empty).
+    Available(Vec<Conn>),
+}
+
+/// The stable instruction: frontmatter + body, up to the dynamic section.
+/// A raw string so the JSON examples need no escaping; ends right where the
+/// per-user "Your connections" section begins.
+const HEAD: &str = r#"---
+name: nyet
+description: Read-only database access for AI agents. Use nyet to inspect database schemas and run safe read-only SQL (SELECT, SHOW, DESCRIBE, EXPLAIN) against the user's configured databases (PostgreSQL, MySQL/MariaDB, SQLite). It enforces read-only, keeps credentials behind aliases, and returns compact JSON. Reach for it whenever a task needs to read from a database.
+---
+
+# nyet — read-only database access
+
+`nyet` is a read-only CLI for databases. By default a write is refused with a
+`NYET` reason+hint — blocked across layers (SQL validation, a server-side
+read-only session, and a recommended read-only role) — so send only read
+queries. It is read-only by default, not an access-control boundary: the config
+owner can selectively permit specific functions via `allow_functions` (a
+durable-write function such as `nextval` could be re-enabled that way), so do
+not rely on it as a hard guarantee. You name a database by its **alias** — never
+a URL, host, or password. The user owns the config; credentials never reach you.
+
+## Commands
+
+    nyet list --format json                     # connections reachable from here
+    nyet schema <alias> [table] --format json   # tables, columns, keys, indexes
+    nyet explain <alias> "<SQL>" --format json  # query plan + cost/rows (none on SQLite), without running it
+    nyet query <alias> "<SQL>" --format json    # run one read-only query
+    nyet doctor [alias]                         # (for the human) diagnose the setup
+
+Usual flow: `nyet list` to see aliases, `nyet schema <alias>` to learn the
+tables, then `nyet query <alias> "SELECT ..."`. Run `nyet <command> --help` for
+more.
+
+**Always pass `--format json` when you parse the output.** `query`/`list`/
+`schema`/`explain` otherwise follow the user's `[defaults].format`, and `doctor`
+defaults to a human table — so never rely on the default. With `--format json`
+the whole answer is one JSON envelope on stdout. Query options: `--limit N`
+(max rows), `--timeout SECS`. (The other formats — `jsonl`/`csv`/`table` on
+`query` — stream rows on stdout and put the envelope on stderr; use them only
+when you deliberately want that, not for parsing.)
+
+If an alias contains a space or shell metacharacter, quote it:
+`nyet query "prod db" "SELECT 1" --format json`.
+
+    nyet query <alias> "SELECT id, email FROM users ORDER BY id LIMIT 20" --format json
+    {"v":1,"ok":true,"rows":[{"id":1,"email":"a@b.c"}],"meta":{"row_count":1,"truncated":false,"duration_ms":3,"connection":"..."}}
+
+## Reading the result (JSON envelope)
+
+Success is `{"v":1,"ok":true, ...}`:
+- `rows` — array of row objects, keys in column order (`query` only).
+- `schema` — the schema payload (`schema` only).
+- `meta` — fields depend on the command: `query` → `row_count`, `truncated`
+  (true = the row limit cut the result; add a WHERE/LIMIT or raise `--limit`),
+  `duration_ms`, `connection`; `schema` → `table_count`, `duration_ms`,
+  `connection`; `explain` → `duration_ms`, `connection`.
+- `warnings` — array of `{code, message}`, omitted when empty. These are NOT
+  errors; the answer is valid. Codes include `TRUNCATED`, `SCHEMA_TRUNCATED`,
+  `GUARDRAIL_SKIPPED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
+  `INSECURE_TRANSPORT`.
+
+Failure is `{"v":1,"ok":false,"error":{"code":...,"message":...,"hint":...}}`.
+Always read `hint` — it tells you how to fix it. A refusal (`"code":"NYET"`)
+also carries a `reason`.
+
+## Exit codes (branch on these; do not parse the text)
+
+    0  success (possibly with warnings)
+    1  internal error, or an engine this build does not support yet
+    2  CLI usage error
+    3  config error (missing/invalid config, or unknown alias)
+    4  connection not allowed from the current directory
+    5  query refused by nyet — the validator or the guardrail ("code":"NYET")
+    6  connection or auth failed
+    7  the database returned an execution error
+    8  timeout
+
+## When nyet refuses (exit 5, "code":"NYET")
+
+nyet runs a single read statement only (SELECT, plus SHOW/DESCRIBE/EXPLAIN).
+`reason` says why it refused; `hint` says what to do. Fix the query per the
+hint and retry — do not resend the same statement, and there is no override
+flag. Common reasons:
+- `WRITE_OPERATION` — the statement is not a plain read: a write
+  (INSERT/UPDATE/DELETE/DDL) anywhere including CTEs and subqueries, a
+  `SELECT ... INTO`, or a non-read construct such as any `PRAGMA` (even a
+  read-only one — fail closed). Rewrite as a SELECT; for SQLite schema info,
+  query `sqlite_master` instead of `PRAGMA`.
+- `MULTI_STATEMENT` — send one statement, not several.
+- `EXPENSIVE_QUERY` — the plan is over the guardrail limit. The plan is usually
+  in the envelope's `estimate`; if planning itself outran its budget there may be
+  no `estimate`, so go by `message`/`hint`. Narrow it (add a WHERE filter or a
+  LIMIT, join on an indexed column).
+- `DENIED_FUNCTION`, `LOCKING_CLAUSE` (`FOR UPDATE`/`FOR SHARE`),
+  `EXPLAIN_ANALYZE`, `TXN_CONTROL`, `EXECUTABLE_COMMENT`, `PARSE_FAILED` — read
+  the message and rewrite accordingly.
+
+## Your connections
+
+"#;
+
+/// Instruction template + the user's connections -> the SKILL.md string.
+pub fn skill(connections: &Connections) -> String {
+    let mut out = String::from(HEAD);
+    out.push_str(&connections_section(connections));
+    out.push('\n');
+    out
+}
+
+/// Shell-safe rendering of an alias for a copy-pasteable example: bare when it
+/// is a plain identifier, otherwise POSIX single-quoted (only `'` is special
+/// inside single quotes). `nyet` itself takes the alias as one positional arg,
+/// so `nyet query 'prod db' ...` resolves the alias `prod db`.
+fn shell_quote(alias: &str) -> String {
+    let safe = !alias.is_empty()
+        && alias
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    if safe {
+        alias.to_string()
+    } else {
+        format!("'{}'", alias.replace('\'', r"'\''"))
+    }
+}
+
+fn connections_section(connections: &Connections) -> String {
+    match connections {
+        Connections::Unavailable => {
+            "No nyet config was found (or it could not be read). The user owns the config \
+             — once it exists, `nyet list` shows the connections reachable from a given \
+             directory. Until then, use the command shapes above with the real alias."
+                .to_string()
+        }
+        // Sorted by alias for a deterministic document; the cli already passes
+        // them sorted (BTreeMap), sorted here too so the pure function does not
+        // depend on the caller for that.
+        Connections::Available(conns) => {
+            let mut sorted: Vec<&Conn> = conns.iter().collect();
+            sorted.sort_by(|a, b| a.alias.cmp(&b.alias));
+            let Some(first) = sorted.first() else {
+                return "No connections are reachable from this directory. Run `nyet list` to \
+                     confirm, or add this directory to a connection's `allowed_dirs` in \
+                     the config."
+                    .to_string();
+            };
+            let mut out = String::from(
+                "Reachable from this directory at setup time (run `nyet list` for the \
+                 current list):\n\n",
+            );
+            for conn in &sorted {
+                out.push_str(&format!("    {}  {}\n", conn.alias, conn.engine));
+            }
+            // The runnable example needs an alias clap will read as a positional.
+            // A leading `-` alias (`--help`, `-x`) is parsed as an OPTION, and
+            // shell quotes do not help (the shell strips them before clap sees
+            // the arg), so pick the first alias that is not `-`-led; shell_quote
+            // then covers spaces / metacharacters in an arbitrary TOML key.
+            match sorted.iter().find(|c| !c.alias.starts_with('-')) {
+                Some(c) => {
+                    let a = shell_quote(&c.alias);
+                    out.push_str(&format!(
+                        "\nStart with:\n\n    nyet schema {a} --format json\n    \
+                         nyet query {a} \"SELECT 1\" --format json"
+                    ));
+                }
+                // Every alias begins with `-`: pass it after a `--`
+                // end-of-options marker so clap reads it as the positional.
+                None => {
+                    let a = shell_quote(&first.alias);
+                    out.push_str(&format!(
+                        "\nEvery alias here begins with `-`, so pass it after a `--` \
+                         end-of-options marker:\n\n    nyet query --format json -- {a} \"SELECT 1\""
+                    ));
+                }
+            }
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(alias: &str, engine: &str) -> Conn {
+        Conn {
+            alias: alias.into(),
+            engine: engine.into(),
+        }
+    }
+
+    /// The YAML frontmatter is the first `---`-delimited block; return its
+    /// inner lines. Manual parse (no yaml dependency): the generator writes it,
+    /// so this checks the shape it must keep.
+    fn frontmatter(text: &str) -> Vec<&str> {
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next(),
+            Some("---"),
+            "must open with a frontmatter fence"
+        );
+        lines.take_while(|l| *l != "---").collect()
+    }
+
+    #[test]
+    fn frontmatter_is_valid_and_names_the_skill() {
+        let text = skill(&Connections::Unavailable);
+        let fm = frontmatter(&text);
+        // Both required keys present with non-empty values.
+        for key in ["name:", "description:"] {
+            let line = fm
+                .iter()
+                .find(|l| l.starts_with(key))
+                .unwrap_or_else(|| panic!("frontmatter missing {key}: {fm:?}"));
+            let value = line[key.len()..].trim();
+            assert!(!value.is_empty(), "{key} value is empty");
+        }
+        // name is a kebab-safe single token; description says WHEN to use nyet.
+        assert!(fm.iter().any(|l| l.trim() == "name: nyet"));
+        assert!(fm
+            .iter()
+            .any(|l| l.starts_with("description:") && l.contains("read-only")));
+        // Exactly two lines are a bare `---` fence (open + close); a stray one
+        // in the body would corrupt the frontmatter parse.
+        assert_eq!(text.lines().filter(|l| *l == "---").count(), 2);
+    }
+
+    #[test]
+    fn body_teaches_the_core_mechanics() {
+        let text = skill(&Connections::Unavailable);
+        // Commands.
+        for cmd in [
+            "nyet list",
+            "nyet schema",
+            "nyet explain",
+            "nyet query",
+            "nyet doctor",
+        ] {
+            assert!(text.contains(cmd), "missing command: {cmd}");
+        }
+        // Envelope + refusal mechanics (reason + hint) and a sample reason.
+        for marker in [
+            "\"ok\":true",
+            "\"ok\":false",
+            "reason",
+            "hint",
+            "WRITE_OPERATION",
+            "EXPENSIVE_QUERY",
+            "alias",
+        ] {
+            assert!(text.contains(marker), "missing marker: {marker}");
+        }
+        // Exit codes 0..8 each documented.
+        for code in ["0  success", "5  query refused", "8  timeout"] {
+            assert!(text.contains(code), "missing exit code line: {code}");
+        }
+        // Aliases-not-credentials principle.
+        assert!(text.contains("credentials never reach you"));
+        // Parse examples pass --format json explicitly (the default depends on
+        // the user's [defaults].format, so the agent must not rely on it).
+        assert!(text.contains("--format json"));
+        assert!(text.contains("[defaults].format"));
+        // Honest read-only framing (UX-7): "by default" a write is refused, and
+        // the config owner can allow specific functions — no absolute guarantee.
+        assert!(text.contains("By default a write is refused"));
+        assert!(text.contains("allow_functions"));
+        assert!(!text.to_lowercase().contains("impossible"));
+        // meta fields are per-command (schema has table_count, not row_count).
+        assert!(text.contains("table_count"));
+        // explain's cost/rows are not universal — SQLite gives no numeric
+        // estimate; and the format default is per-command (doctor -> table).
+        assert!(text.contains("none on SQLite"));
+        assert!(text.contains("defaults to a human table"));
+        // WRITE_OPERATION is the catch-all for any non-read statement, PRAGMA
+        // included (validator.rs pragma_deny) — the agent must not be surprised.
+        assert!(text.contains("PRAGMA"));
+        // EXPENSIVE_QUERY does not always carry an estimate (budget-exhausted
+        // planning) — say so rather than promising a plan.
+        assert!(text.contains("no `estimate`"));
+    }
+
+    #[test]
+    fn example_aliases_are_shell_quoted_when_unsafe() {
+        assert_eq!(shell_quote("prod"), "prod");
+        assert_eq!(shell_quote("prod_db-1.x"), "prod_db-1.x");
+        assert_eq!(shell_quote("prod db"), "'prod db'");
+        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+        // A space alias reaches the generated example already quoted.
+        let text = skill(&Connections::Available(vec![conn("prod db", "postgres")]));
+        assert!(
+            text.contains("nyet query 'prod db' \"SELECT 1\" --format json"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn leading_hyphen_alias_never_lands_in_a_broken_runnable_example() {
+        // A `-`-led alias is parsed by clap as an option, and shell quotes do
+        // not help — so it must not appear as a bare positional in the example.
+        // With a normal alias present, the example uses the normal one.
+        let text = skill(&Connections::Available(vec![
+            conn("--weird", "postgres"),
+            conn("prod", "postgres"),
+        ]));
+        assert!(text.contains("nyet query prod \"SELECT 1\" --format json"));
+        assert!(!text.contains("nyet query --weird"));
+        // Both are still listed (informational).
+        assert!(text.contains("--weird  postgres"));
+
+        // When EVERY alias is `-`-led, the example uses a `--` end-of-options
+        // marker so clap reads the alias as the positional.
+        let text = skill(&Connections::Available(vec![conn("--weird", "postgres")]));
+        assert!(
+            text.contains("nyet query --format json -- --weird \"SELECT 1\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn dynamic_section_lists_real_connections_sorted_with_an_example() {
+        // Deliberately unsorted input: the generator sorts by alias.
+        let conns =
+            Connections::Available(vec![conn("prod", "postgres"), conn("analytics", "mariadb")]);
+        let text = skill(&conns);
+        let section = text.split("## Your connections").nth(1).unwrap();
+        // Both connections, alias + engine.
+        assert!(section.contains("analytics  mariadb"));
+        assert!(section.contains("prod  postgres"));
+        // Sorted: analytics before prod.
+        assert!(
+            section.find("analytics").unwrap() < section.find("prod").unwrap(),
+            "connections must be sorted by alias"
+        );
+        // A concrete example uses the first (sorted) real alias, with json.
+        assert!(section.contains("nyet query analytics \"SELECT 1\" --format json"));
+        assert!(section.contains("nyet schema analytics --format json"));
+    }
+
+    #[test]
+    fn empty_available_degrades_to_a_hint_not_an_example() {
+        let text = skill(&Connections::Available(Vec::new()));
+        let section = text.split("## Your connections").nth(1).unwrap();
+        assert!(section.contains("No connections are reachable from this directory"));
+        assert!(section.contains("allowed_dirs"));
+        // No bogus concrete example when there is no real alias.
+        assert!(!section.contains("nyet query prod"));
+    }
+
+    #[test]
+    fn unavailable_config_still_yields_a_full_instruction_with_a_setup_hint() {
+        let text = skill(&Connections::Unavailable);
+        // The instruction is complete (the agent learns nyet before any setup)...
+        assert!(text.contains("## Commands"));
+        assert!(text.contains("## Exit codes (branch on these; do not parse the text)"));
+        // ...and the dynamic section points at how to configure.
+        let section = text.split("## Your connections").nth(1).unwrap();
+        assert!(section.contains("No nyet config was found"));
+    }
+}

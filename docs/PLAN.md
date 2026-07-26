@@ -131,7 +131,7 @@ ssh и разбор ошибок.
 7. ~~`nyet schema` — introspection, токен-оптимизированный формат (UX-3, UX-4).~~ **сделано**
 8. ~~`nyet explain` + auto-guardrail по стоимости плана.~~ **сделано**
 9. ~~`nyet doctor` — честная диагностика сетапа (UX-7).~~ **сделано**
-10. `nyet agent-setup` — генерация инструкции для AGENTS.md/скилла (UX-3).
+10. ~~`nyet agent-setup` — генерация Claude Code скилла (SKILL.md) для агента (UX-3).~~ **сделано**
 11. Аудит-лог (UX-8).
 12. npm-обёртка через dist (закрывает бэклог npm-имён).
 13. Redis-движок (`COMMAND INFO`).

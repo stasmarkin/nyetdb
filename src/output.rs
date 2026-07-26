@@ -541,6 +541,24 @@ pub fn bare_success() -> String {
     })
 }
 
+/// `nyet agent-setup --format json`: the whole SKILL.md text inside the
+/// envelope, for programmatic access. New append-only field `skill` (string);
+/// serde escapes the markdown (newlines, quotes) into a valid JSON string.
+#[derive(Serialize)]
+struct SkillEnvelope<'a> {
+    v: u8,
+    ok: bool,
+    skill: &'a str,
+}
+
+pub fn skill_json(skill: &str) -> String {
+    to_json(&SkillEnvelope {
+        v: ENVELOPE_V,
+        ok: true,
+        skill,
+    })
+}
+
 pub fn error_json(
     code: &str,
     reason: Option<&str>,
@@ -1227,6 +1245,16 @@ mod tests {
         assert_eq!(
             error_json("CONFIG_INVALID", None, "boom", "fix it", None),
             r#"{"v":1,"ok":false,"error":{"code":"CONFIG_INVALID","message":"boom","hint":"fix it"}}"#
+        );
+    }
+
+    #[test]
+    fn skill_envelope_wraps_the_markdown_and_escapes_it() {
+        // A markdown fragment with the two characters that must be escaped in a
+        // JSON string — a newline and a double quote — serialized into `skill`.
+        assert_eq!(
+            skill_json("---\nname: nyet\n\"ok\":true"),
+            r#"{"v":1,"ok":true,"skill":"---\nname: nyet\n\"ok\":true"}"#
         );
     }
 

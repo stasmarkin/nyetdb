@@ -167,9 +167,12 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 │                                 host parsing; the shell-out to system `ssh`
 │                                 is the only IO. std only (net/process), no
 │                                 sqlx/config/clap
-└─ output    (src/output.rs)    — pure: values -> envelope/table strings;
-                                  also owns the `schema` and `doctor` data
-                                  models (the contract shapes) + their rules
+├─ output    (src/output.rs)    — pure: values -> envelope/table strings;
+│                                 also owns the `schema` and `doctor` data
+│                                 models (the contract shapes) + their rules
+└─ skill     (src/skill.rs)     — pure: (instruction template + the user's
+                                  connections) -> the `agent-setup` SKILL.md
+                                  string; std only, no IO
 ```
 
 Dependencies flow downward only: the pure modules do no IO and know nothing
@@ -781,6 +784,66 @@ the envelope shape live in the pure module.
 depends on statistics, parameters and server settings, and a stale cached
 estimate would be a guardrail that lies. Reconsider only if a connection daemon
 (ROADMAP v0.5) ever gives it a natural home.
+
+## `nyet agent-setup` (`src/skill.rs` generator)
+
+A local generator (UX-3: an agent must be able to learn nyet by itself) that
+emits a **Claude Code skill** — a `SKILL.md` with YAML frontmatter
+(`name`/`description`) and a Markdown body. No new dependency; no database, no
+network, no runtime (Д9 — it short-circuits at the top of `run()`, before the
+config read). The split follows Д1/Д2: `skill::skill` is a **pure function**
+(instruction template + the already-read connections -> String, unit-tested with
+no IO), and the cli does the best-effort config load and the stream write.
+
+**Skill format — verified, not guessed (a hard requirement).** The frontmatter
+shape was checked against the current Claude Code skills docs
+(`code.claude.com/docs/en/skills` frontmatter reference) via the
+`claude-code-guide` subagent. What that established: for a **directory** skill
+(`.claude/skills/<name>/SKILL.md`) no frontmatter field is strictly required and
+the command name comes from the directory, not `name`; `description` is the
+recommended field and is what Claude uses to decide when to load the skill
+(truncated at ~1536 chars in listings). nyet still writes both `name: nyet`
+(kebab-safe single token) and a `description` phrased as *when* to use nyet
+(reading a database, inspecting schema, safe read-only queries), so the file is
+valid whether dropped in as a directory skill or a plugin skill. The generator
+writes the YAML by hand (no yaml crate — Д8): the frontmatter is trivial and we
+generate it, we do not parse it. A `frontmatter_is_valid_and_names_the_skill`
+unit test parses it manually and asserts `name`/`description` are present and
+non-empty, and that exactly two bare `---` fences exist (no stray fence in the
+body).
+
+**Hybrid content.** A stable instruction (commands with examples; how to read
+the `ok`/`rows`/`meta`/`warnings` envelope and `error.code`/`reason`/`hint`;
+the exit-code table; how to fix a `NYET` refusal from `reason`+`hint`; that the
+agent operates on aliases, never credentials) plus a dynamic "Your connections"
+section listing the real aliases and engines. **Scope decision: connections
+reachable from the current directory**, the same scope as `nyet list` (not the
+whole config) — the skill is generated from the project directory where it will
+live, so cwd scope is exactly the connections relevant there, the concrete
+`nyet query <alias>` example then uses an alias that actually works from there,
+and it keeps one mental model with `nyet list`. Determinism: connections are
+sorted by alias (the cli passes them from a `BTreeMap`, and `skill::skill` sorts
+again so the pure function does not depend on the caller) for a stable snapshot.
+
+**Degradation, not failure.** A missing / unreadable / unparseable config, or an
+unresolvable cwd, degrades the dynamic section to a hint (`Connections::
+Unavailable`) — `agent-setup` still emits the full instruction and exits 0. It
+is never an exit-3 config error: the command's value is teaching the agent
+*before* setup. Empty-but-reachable (config fine, nothing scoped here) is a
+distinct hint pointing at `allowed_dirs` / `nyet list`.
+
+**Output / envelope.** Default is the raw `SKILL.md` on stdout with the success
+envelope one JSON line on stderr — markdown is treated as a data format, routed
+through the same `emit()` as table/csv/jsonl (DESIGN §1: the envelope's place is
+decided by the format). `--format json` puts the whole `SKILL.md` in a **new
+append-only envelope field `skill` (string)** on stdout via
+`output::skill_json`; serde escapes the markdown (newlines, quotes) into a valid
+JSON string. `agent-setup` has its own two-value format enum (`markdown` | `json`
+— the row formats are meaningless for a single document) and does not honor
+`[defaults].format`. It adds no error/warning code and does not extend the exit
+table: exit 0 (a bad config degrades, never exit 3; a closed reader / broken
+pipe is exit 0 too), and — like every command — only a non-broken-pipe stdout
+write failure (a full disk -> `INTERNAL`, exit 1) errors.
 
 ## `nyet doctor` (`src/output.rs` verdicts, `engine::diagnose` facts)
 
@@ -1506,6 +1569,13 @@ section above). It introduces one append-only envelope field, `checks:
 [{name, status, message, hint?}]`, whose `status` is a **closed list**
 (`ok` | `warn` | `fail` | `na`); the check `name`s and the status list follow the
 same append-only rule as the codes above (renaming/removing = bump `v`).
+
+`nyet agent-setup` adds no error/warning code either — it exits 0 (a bad config
+degrades rather than errors, and a closed reader / broken pipe is exit 0 too);
+like every command, only a non-broken-pipe stdout write failure (a full disk ->
+`INTERNAL`, exit 1) can error. It introduces one append-only envelope field, `skill`
+(string), carried only by `--format json`; the default markdown output puts the
+`SKILL.md` on stdout and a bare `{"v":1,"ok":true}` envelope on stderr.
 
 `nyet query` pipeline order is pinned by tests: format (right after config
 parse — it routes every later envelope) -> alias -> directory scoping ->

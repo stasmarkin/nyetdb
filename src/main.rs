@@ -8,6 +8,7 @@ mod engine;
 mod guardrail;
 mod output;
 mod resolver;
+mod skill;
 mod tunnel;
 mod validator;
 
@@ -114,6 +115,38 @@ enum Command {
         #[arg(long, value_enum)]
         format: Option<PlainFormat>,
     },
+    /// Generate a Claude Code skill (SKILL.md) that teaches an AI agent to use
+    /// nyet: how to read databases, inspect schemas and run safe read-only
+    /// queries, how to read the JSON envelope and recover from a refusal, plus
+    /// the connections available from here
+    ///
+    /// It needs no database or network — it is local generation. A missing or
+    /// broken config is not an error: the instruction is still emitted (its
+    /// value is teaching the agent before setup) and the connections section
+    /// degrades to a hint. Install it with:
+    ///
+    ///   nyet agent-setup > .claude/skills/nyet/SKILL.md
+    ///
+    /// Default output is the raw SKILL.md on stdout (the envelope goes to
+    /// stderr, like a data format); `--format json` wraps the whole SKILL.md
+    /// in the `skill` field of a JSON envelope on stdout.
+    // verbatim: see the Schema arm — the examples are the point (UX-3).
+    #[command(verbatim_doc_comment)]
+    AgentSetup {
+        /// Output format (default: markdown)
+        #[arg(long, value_enum)]
+        format: Option<SetupFormat>,
+    },
+}
+
+/// `agent-setup` emits Markdown by default (the SKILL.md a human redirects to a
+/// file) and can wrap it in a JSON envelope for programmatic access. Its own
+/// tiny enum: the other formats (jsonl/csv/table) are meaningless for a single
+/// document, and it does not honor `[defaults].format` (that serves query rows).
+#[derive(Clone, Copy, ValueEnum)]
+enum SetupFormat {
+    Markdown,
+    Json,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -348,6 +381,14 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
+    // agent-setup is local generation (Д9: no runtime, no db, no network) and
+    // must survive a missing/broken config (degradation, never exit 3), so it
+    // short-circuits before the mandatory config read below.
+    if let Command::AgentSetup { format } = &cli.command {
+        let format = format.unwrap_or(SetupFormat::Markdown);
+        return agent_setup(cli.config, format, route_format);
+    }
+
     let path = config_path(cli.config)?;
     let text = read_config(&path)?;
     warn_bad_permissions(&path);
@@ -740,7 +781,68 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             emit(format, &data, &envelope).map_err(output_write_failure)?;
             Ok(())
         }
+        // Handled by the short-circuit at the top of run() (before the config
+        // read), so this arm is dead — it exists only for match exhaustiveness.
+        Command::AgentSetup { .. } => unreachable!("agent-setup is short-circuited above"),
     }
+}
+
+/// Generate the SKILL.md and emit it (DESIGN §1 stream routing). Markdown is a
+/// data format — the document on stdout, the envelope one JSON line on stderr;
+/// `--format json` puts the whole SKILL.md in the envelope's `skill` field on
+/// stdout. Never fails on config (agent_setup degrades) — only a stdout write
+/// failure (Internal, exit 1) can error, like every other command.
+fn agent_setup(
+    config_flag: Option<PathBuf>,
+    format: SetupFormat,
+    route_format: &mut Format,
+) -> Result<(), Failure> {
+    let connections = load_connections(config_flag);
+    let text = skill::skill(&connections);
+    match format {
+        SetupFormat::Markdown => {
+            // Markdown routes like the other data formats (table/csv/jsonl):
+            // data on stdout, envelope on stderr. Reuse emit — the single owner
+            // of stream routing and broken-pipe handling.
+            *route_format = Format::Table;
+            emit(Format::Table, &text, &output::bare_success()).map_err(output_write_failure)
+        }
+        SetupFormat::Json => {
+            *route_format = Format::Json;
+            emit(Format::Json, "", &output::skill_json(&text)).map_err(output_write_failure)
+        }
+    }
+}
+
+/// Best-effort load of the connections reachable from cwd (consistent with
+/// `nyet list`), for the skill's dynamic section. Any failure to locate, read
+/// or parse the config, or to resolve cwd, degrades to `Unavailable` — a hint,
+/// not an exit-3 error: teaching the agent must work before any setup.
+fn load_connections(config_flag: Option<PathBuf>) -> skill::Connections {
+    let Ok(path) = config_path(config_flag) else {
+        return skill::Connections::Unavailable;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return skill::Connections::Unavailable;
+    };
+    let Ok(cfg) = config::parse(&text, &|name: &str| std::env::var(name)) else {
+        return skill::Connections::Unavailable;
+    };
+    let Ok(cwd) = std::env::current_dir().and_then(|d| d.canonicalize()) else {
+        return skill::Connections::Unavailable;
+    };
+    let home = home_dir();
+    let canon = |p: &Path| std::fs::canonicalize(p).ok();
+    let conns = cfg
+        .connections
+        .iter()
+        .filter(|(_, conn)| resolver::is_allowed(&cwd, &conn.allowed_dirs, home.as_deref(), &canon))
+        .map(|(alias, conn)| skill::Conn {
+            alias: alias.clone(),
+            engine: conn.engine.clone(),
+        })
+        .collect();
+    skill::Connections::Available(conns)
 }
 
 /// Layer 1 for both `query` and `explain`: any deny -> NYET + reason (exit 5),
@@ -1126,6 +1228,9 @@ fn command_format_flag(command: &Command) -> Option<Format> {
         | Command::Explain { format, .. }
         | Command::Doctor { format, .. } => format.map(PlainFormat::as_format),
         Command::Query { format, .. } => *format,
+        // agent-setup has its own format enum and sets its routing itself; the
+        // value here is unused (it short-circuits run() before any error path).
+        Command::AgentSetup { .. } => None,
     }
 }
 
@@ -1134,6 +1239,9 @@ fn command_format_flag(command: &Command) -> Option<Format> {
 fn default_format(command: &Command) -> Format {
     match command {
         Command::Doctor { .. } => Format::Table,
+        // Markdown default routes like a data format (stderr envelope);
+        // agent_setup overrides this before any error path anyway.
+        Command::AgentSetup { .. } => Format::Table,
         _ => Format::Json,
     }
 }

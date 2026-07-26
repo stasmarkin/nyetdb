@@ -20,7 +20,7 @@ nyet list [--format json|table]
 nyet schema <alias> [table] [--format json|table]
 nyet explain <alias> <query> [--format json|table]
 nyet doctor [alias] [--format json|table]
-nyet agent-setup                   # v0.3
+nyet agent-setup [--format markdown|json]
 ```
 
 ### Потоки
@@ -29,10 +29,11 @@ nyet agent-setup                   # v0.3
   один поток и парсит один формат.
 - **stderr** — только человекочитаемая диагностика/логи (`-v`). Агенту парсить
   не нужно.
-- Исключение — форматы `table`/`csv`/`jsonl`: данные в stdout в своём формате,
-  конверт без `rows` — одной JSON-строкой в stderr. Место конверта определяется
-  форматом, а не исходом: для этих форматов и ошибочный конверт идёт в stderr,
-  а stdout при ошибке остаётся пустым (в stdout — только данные, никогда конверт).
+- Исключение — форматы `table`/`csv`/`jsonl` (и `markdown`-вывод `agent-setup`):
+  данные в stdout в своём формате, конверт без `rows` — одной JSON-строкой в
+  stderr. Место конверта определяется форматом, а не исходом: для этих форматов
+  и ошибочный конверт идёт в stderr, а stdout при ошибке остаётся пустым (в
+  stdout — только данные, никогда конверт).
 
 ### JSON-конверт
 

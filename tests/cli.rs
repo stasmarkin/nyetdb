@@ -2059,3 +2059,179 @@ fn doctor_unknown_alias_is_exit_3() {
         serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
     assert_eq!(v["error"]["code"], "CONFIG_INVALID");
 }
+
+// ---------------------------------------------------------------------------
+// nyet agent-setup (local generation — no db, no network)
+// ---------------------------------------------------------------------------
+
+/// Assert the text is a valid SKILL.md skeleton: a frontmatter fence with
+/// non-empty name/description, and the teaching body.
+fn assert_valid_skill(text: &str) {
+    assert!(
+        text.starts_with("---\n"),
+        "must open with a frontmatter fence"
+    );
+    let (frontmatter, body) = text[4..].split_once("\n---\n").expect("closing fence");
+    assert!(
+        frontmatter.lines().any(|l| l.trim() == "name: nyet"),
+        "frontmatter: {frontmatter}"
+    );
+    assert!(
+        frontmatter
+            .lines()
+            .any(|l| l.starts_with("description:") && l.trim().len() > "description:".len()),
+        "frontmatter: {frontmatter}"
+    );
+    // Body teaches the commands, the envelope and the refusal mechanics, and
+    // tells the agent to pass --format json (the default depends on the config).
+    for marker in [
+        "nyet query",
+        "nyet schema",
+        "5  query refused",
+        "WRITE_OPERATION",
+        "hint",
+        "--format json",
+    ] {
+        assert!(body.contains(marker), "body missing {marker}");
+    }
+}
+
+/// No config: agent-setup still emits a full instruction (exit 0) plus a hint
+/// to set one up — its value is teaching the agent before setup. Markdown on
+/// stdout, envelope on stderr.
+#[test]
+fn agent_setup_without_config_still_emits_instruction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = nyet(tmp.path())
+        .args(["agent-setup", "--config", "/no/such/config.toml"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let md = stdout(&out);
+    assert_valid_skill(&md);
+    assert!(md.contains("No nyet config was found"), "{md}");
+    // Envelope routes to stderr (markdown is a data format).
+    assert!(stderr(&out)
+        .trim()
+        .lines()
+        .last()
+        .unwrap()
+        .contains(r#"{"v":1,"ok":true}"#));
+}
+
+/// With a real config, the dynamic section names the connections reachable from
+/// cwd (consistent with `nyet list`) and a concrete example uses a real alias.
+#[test]
+fn agent_setup_lists_reachable_connections() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args(["agent-setup", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let md = stdout(&out);
+    assert_valid_skill(&md);
+    let section = md.split("## Your connections").nth(1).unwrap();
+    assert!(section.contains("db  sqlite"), "{section}");
+    assert!(
+        section.contains("nyet query db \"SELECT 1\" --format json"),
+        "{section}"
+    );
+    // Only aliases + engines are advertised — never the file path / url.
+    assert!(
+        !md.contains("fixture.db"),
+        "path leaked into the skill: {md}"
+    );
+}
+
+/// `--format json` wraps the whole SKILL.md in the envelope's `skill` field on
+/// stdout; the markdown (newlines, quotes) round-trips through JSON escaping.
+#[test]
+fn agent_setup_json_wraps_the_skill_in_the_envelope() {
+    let (tmp, cfg) = sqlite_fixture("");
+    let out = nyet(tmp.path())
+        .args(["agent-setup", "--format", "json", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["ok"], true);
+    // The escaping is proven by the parse succeeding and the string coming back
+    // with its real newlines and quotes intact.
+    let skill = v["skill"].as_str().unwrap();
+    assert_valid_skill(skill);
+    assert!(skill.contains('\n') && skill.contains('"'));
+    assert!(skill.contains("db  sqlite"));
+}
+
+/// A space-containing alias (a valid TOML quoted key) is accepted as one CLI
+/// positional — so the shell-quoted example the skill generates really works.
+#[test]
+fn query_accepts_an_alias_containing_a_space() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("fixture.db");
+    make_db(&db);
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.\"prod db\"]\nengine = \"sqlite\"\npath = \"{}\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            db.display(),
+            tmp.path().display()
+        ),
+    );
+    // Command::args passes "prod db" as a single argument (no shell splitting),
+    // exactly what `nyet query 'prod db' ...` yields after the shell.
+    let out = nyet(tmp.path())
+        .args([
+            "query",
+            "prod db",
+            "SELECT count(*) AS n FROM users",
+            "--format",
+            "json",
+            "--config",
+        ])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["rows"], serde_json::json!([{"n": 3}]));
+}
+
+/// A leading-hyphen alias parses as an option unless it follows `--`; the skill
+/// generates exactly that form, so verify clap honors `--` end-of-options.
+#[test]
+fn query_accepts_a_leading_hyphen_alias_after_end_of_options() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("fixture.db");
+    make_db(&db);
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.\"--weird\"]\nengine = \"sqlite\"\npath = \"{}\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            db.display(),
+            tmp.path().display()
+        ),
+    );
+    // `--config` (global) before `--`; after `--` clap reads "--weird" as the
+    // alias positional instead of an option.
+    let out = nyet(tmp.path())
+        .args(["query", "--format", "json", "--config"])
+        .arg(&cfg)
+        .args(["--", "--weird", "SELECT count(*) AS n FROM users"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["rows"], serde_json::json!([{"n": 3}]));
+}

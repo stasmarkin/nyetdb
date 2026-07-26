@@ -329,6 +329,7 @@ nyet schema <alias> [table] [--format json|table]
 nyet explain <alias> <sql> [--format json|table]
 nyet query <alias> <sql> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
 nyet doctor [alias] [--format json|table]
+nyet agent-setup [--format markdown|json]
 ```
 
 `nyet list` prints aliases and engines only — never URLs or credentials:
@@ -824,6 +825,38 @@ role to make read-only) — nyet does not invent a metric where there is none.
 connections reachable from the current directory (a named alias, by contrast, is
 diagnosed regardless of `allowed_dirs` — you own the config and may be testing
 it from anywhere).
+
+### nyet agent-setup
+
+```sh
+nyet agent-setup > .claude/skills/nyet/SKILL.md   # install as a Claude Code skill
+nyet agent-setup --format json                    # the SKILL.md inside a JSON envelope
+```
+
+Generates a **Claude Code skill** (a `SKILL.md`: YAML frontmatter with
+`name`/`description` + a Markdown body) that teaches an AI agent to use nyet —
+the commands with examples, how to read the JSON envelope and exit codes, and
+how to recover from a `NYET` refusal via `reason`+`hint`. It needs no database
+or network (pure local generation), and works **even without a config**: the
+instruction is emitted regardless (its value is teaching the agent before
+setup), so a missing or unreadable config is not an error, just a degraded
+section.
+
+The content is a **hybrid**: a stable instruction plus a dynamic "Your
+connections" section listing the real aliases and engines **reachable from the
+current directory** (the same scope as `nyet list`), with a concrete
+`nyet query <alias> "..."` example using one of them. Run it from the project
+directory where the skill will live. With no reachable connections (or no
+config) that section degrades to a hint pointing at `nyet list` and
+`allowed_dirs`.
+
+Output defaults to the raw `SKILL.md` on stdout (redirect it to a file; the
+success envelope goes to stderr as one JSON line, like the other data formats);
+`--format json` wraps the whole `SKILL.md` in the `skill` field of a JSON
+envelope on stdout for programmatic access. A missing or broken config never
+fails it (exit 0), and a closed reader (broken pipe) is exit 0 too; like any
+command, only a non-broken-pipe stdout write failure (e.g. a full disk) errors
+(exit 1).
 
 ## Security
 
