@@ -2499,3 +2499,355 @@ fn audit_warns_on_a_loose_existing_log_file() {
         stderr(&out)
     );
 }
+
+// ---------------------------------------------------------------------------
+// PII policy (step PII-1): net A refuses by name before execution, net B by the
+// driver's column provenance after it, and a connection with a policy never
+// receives the raw database error text.
+// ---------------------------------------------------------------------------
+
+/// The one cell value that must never appear in either stream.
+const PII_VALUE: &str = "alice@example.com";
+
+/// Fixture: `users` (with a protected `email`), an unprotected `orders`, and a
+/// VIEW that renames `users.email` — the case only net B can catch.
+/// `pii_section` is appended after the connection block (TOML ordering).
+fn pii_fixture(pii_section: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("pii.db");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        use sqlx::ConnectOptions;
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .create_if_missing(true)
+            .connect()
+            .await
+            .unwrap();
+        for sql in [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, created_at TEXT)".to_string(),
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, uid INTEGER, amount INTEGER)".to_string(),
+            "CREATE TABLE dict (id INTEGER, email TEXT, note TEXT)".to_string(),
+            // a user table that only SHARES A NAME with MariaDB's histogram
+            // catalog — on sqlite it is an ordinary table (finding 10)
+            "CREATE TABLE column_stats (id INTEGER, n INTEGER)".to_string(),
+            "CREATE VIEW v_users AS SELECT id, email AS contact FROM users".to_string(),
+            format!("INSERT INTO users VALUES (1, '{PII_VALUE}', '2020-01-01')"),
+            format!("INSERT INTO dict VALUES (1, '{PII_VALUE}', 'x')"),
+            "INSERT INTO orders VALUES (1, 1, 42)".to_string(),
+            "INSERT INTO column_stats VALUES (1, 7)".to_string(),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        sqlx::Connection::close(conn).await.unwrap();
+    });
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.db]\nengine = \"sqlite\"\npath = \"{}\"\n\
+             allowed_dirs = [\"{}\"]\n{pii_section}",
+            db.display(),
+            tmp.path().display()
+        ),
+    );
+    (tmp, cfg)
+}
+
+const PII_SECTION: &str = "[connections.db.pii]\ncolumns = [\"users.email\"]\n";
+
+fn run_query(tmp: &Path, cfg: &Path, sql: &str) -> Output {
+    nyet(tmp)
+        .args(["query", "db", sql, "--config"])
+        .arg(cfg)
+        .current_dir(tmp)
+        .output()
+        .unwrap()
+}
+
+/// Neither stream may ever carry the protected value.
+fn assert_no_pii_leak(out: &Output, sql: &str) {
+    assert!(!stdout(out).contains(PII_VALUE), "{sql}: leaked to stdout");
+    assert!(!stderr(out).contains(PII_VALUE), "{sql}: leaked to stderr");
+}
+
+#[test]
+fn pii_net_a_refuses_before_execution() {
+    let (tmp, cfg) = pii_fixture(PII_SECTION);
+    for sql in [
+        "SELECT email FROM users",
+        "SELECT u.email FROM users u",
+        "SELECT substr(email, 1, 3) FROM users",
+        "SELECT * FROM users",
+        "SELECT count(*) FROM users WHERE email LIKE 'a%'",
+        "SELECT id FROM users ORDER BY email",
+        // finding 3: USING / NATURAL name the join column outside the Expr
+        // tree — both were a working join oracle over the protected value.
+        "SELECT count(*) AS n FROM users JOIN dict USING (email)",
+        "SELECT count(*) AS n FROM users NATURAL JOIN dict",
+        // round 2, finding B: a parenthesised join hides its constraint one
+        // level down, and the agent can bring its own dictionary — this is a
+        // full equality oracle over the protected value.
+        "SELECT count(*) AS n FROM (users JOIN dict USING (email))",
+        "SELECT count(*) AS n FROM (users NATURAL JOIN dict)",
+        "SELECT count(*) AS n FROM (users NATURAL JOIN (SELECT 'x' AS email) d)",
+        "SELECT count(*) AS n FROM orders o JOIN (users JOIN dict USING (email)) x ON 1=1",
+    ] {
+        let out = run_query(tmp.path(), &cfg, sql);
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stderr(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "NYET", "{sql}");
+        assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+        let hint = v["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("no CLI flag"), "{sql}: {hint}");
+        assert_no_pii_leak(&out, sql);
+    }
+}
+
+#[test]
+fn pii_net_b_catches_a_renaming_view() {
+    // Net A sees only `v_users.contact` — no rule mentions it — so the query
+    // runs; SQLite reports the column's true origin (users.email) and net B
+    // refuses before a single row is formatted.
+    let (tmp, cfg) = pii_fixture(PII_SECTION);
+    let out = run_query(tmp.path(), &cfg, "SELECT contact FROM v_users");
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["reason"], "PII_COLUMN");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("users.email"),
+        "{v}"
+    );
+    assert_no_pii_leak(&out, "SELECT contact FROM v_users");
+    // The unmarked column of the same view is fine.
+    let out = run_query(tmp.path(), &cfg, "SELECT id FROM v_users");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}
+
+#[test]
+fn pii_leaves_unmarked_reads_working() {
+    // Otherwise the feature is just a wall (UX-2/UX-1 balance).
+    let (tmp, cfg) = pii_fixture(PII_SECTION);
+    for sql in [
+        "SELECT count(*) AS n FROM users",
+        "SELECT id, created_at FROM users",
+        "SELECT * FROM orders",
+        "SELECT id, amount FROM orders WHERE amount > 10",
+        // finding 9: the wildcard's own source has no rules, so nothing
+        // protected can come back — these used to be refused with a message
+        // that was simply untrue.
+        "SELECT * FROM orders WHERE uid IN (SELECT id FROM users)",
+        "SELECT o.* FROM orders o JOIN users u ON u.id = o.uid",
+        // finding 10: an ordinary user table that shares its name with
+        // MariaDB's histogram catalog is not a catalog on sqlite.
+        "SELECT n FROM column_stats",
+        // round 2, finding D: a subquery inside FROM is not the wildcard's source
+        "SELECT * FROM (SELECT id FROM users) t",
+        // round 2, finding E: a qualified prefix that provably names an unruled
+        // source settles ownership — the same proof `o.*` already uses
+        "SELECT o.uid FROM orders o JOIN users u ON u.id = o.uid",
+        // round 2, finding F: an ALIAS spelling a protected table name is not
+        // that table
+        "SELECT amount FROM orders AS users",
+        "SELECT * FROM orders AS users",
+    ] {
+        let out = run_query(tmp.path(), &cfg, sql);
+        assert_eq!(out.status.code(), Some(0), "{sql}: {}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["ok"], true, "{sql}");
+        assert_no_pii_leak(&out, sql);
+    }
+}
+
+#[test]
+fn without_a_pii_section_nothing_changes() {
+    // UX-5: an existing config keeps its exact behavior, value and all.
+    let (tmp, cfg) = pii_fixture("");
+    let out = run_query(tmp.path(), &cfg, "SELECT email FROM users");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains(PII_VALUE), "{}", stdout(&out));
+    // ...including the verbatim database error text.
+    let out = run_query(tmp.path(), &cfg, "SELECT nosuchcol FROM orders");
+    assert_eq!(out.status.code(), Some(7));
+    let v = error_envelope(&out);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nosuchcol"),
+        "{v}"
+    );
+}
+
+#[test]
+fn pii_withholds_the_database_error_text() {
+    // A database error can quote the offending CELL VALUE (PostgreSQL:
+    // `invalid input syntax for type integer: "..."`), which is an exfiltration
+    // channel one cell per query. With a PII policy the whole message is
+    // withheld — no pattern filtering, that would be theatre (UX-7).
+    let (tmp, cfg) = pii_fixture(PII_SECTION);
+    let out = run_query(tmp.path(), &cfg, "SELECT nosuchcol FROM orders");
+    assert_eq!(out.status.code(), Some(7), "{}", stderr(&out));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "DB_ERROR");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains("withheld"), "{message}");
+    assert!(!message.contains("nosuchcol"), "{message}");
+    assert!(
+        v["error"]["hint"].as_str().unwrap().contains("nyet schema"),
+        "{v}"
+    );
+}
+
+#[test]
+fn a_malformed_pii_rule_is_exit_3() {
+    for (section, marker) in [
+        (
+            "[connections.db.pii]\ncolumns = [\"email\"]\n",
+            "table.column",
+        ),
+        (
+            "[connections.db.pii]\ncolumns = [\"${PII_RULE}\"]\n",
+            "literal",
+        ),
+    ] {
+        let (tmp, cfg) = pii_fixture(section);
+        let out = nyet(tmp.path())
+            .args(["query", "db", "SELECT 1", "--config"])
+            .arg(&cfg)
+            .env("PII_RULE", "users.email")
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{section}: {}", stderr(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "CONFIG_INVALID");
+        let text = format!("{} {}", v["error"]["message"], v["error"]["hint"]);
+        assert!(text.contains(marker), "{section}: {text}");
+    }
+}
+
+#[test]
+fn pii_refusals_are_audited_without_the_data() {
+    // The refusal IS logged (the human sees what the agent tried), and the log
+    // can never hold rows the agent did not get: both nets run before the
+    // `response` payload is built, so a refused query has none.
+    let (tmp, cfg) = pii_fixture(&format!("{PII_SECTION}[audit]\nlog_responses = true\n"));
+    // Net A refusal.
+    let out = run_query(tmp.path(), &cfg, "SELECT email FROM users");
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    // Net B refusal, on the same log.
+    let out = run_query(tmp.path(), &cfg, "SELECT contact FROM v_users");
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    let text = fs::read_to_string(audit_file(tmp.path())).expect("audit file must exist");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["verdict"], "refused", "{v}");
+        assert_eq!(v["reason"], "PII_COLUMN", "{v}");
+        assert_eq!(v["exit_code"], 5, "{v}");
+        // The raw SQL stays (forensics for the human, file mode 0600), the data
+        // never appears.
+        assert!(v["sql"].is_string(), "{v}");
+        assert!(v.get("response").is_none(), "{v}");
+    }
+    assert!(!text.contains(PII_VALUE), "the audit log leaked the value");
+}
+
+/// The view limitation, pinned in BOTH directions so it cannot drift silently
+/// (finding 1). Net B judges the origin the driver reports; an expression
+/// carries no origin at all, so wrapping a view column defeats it exactly the
+/// way the bare column already defeats it on PostgreSQL and MySQL. The
+/// documented, enforceable answer is to list the view's own columns.
+#[test]
+fn pii_view_limitation_is_pinned_in_both_directions() {
+    let (tmp, cfg) = pii_fixture(PII_SECTION);
+    // Unlisted view + a computed column: nyet does NOT catch this. Pinned so a
+    // change (in either direction) shows up as a failing test, not as a
+    // silently changed guarantee.
+    for sql in [
+        "SELECT contact || '' AS c FROM v_users",
+        "SELECT substr(contact, 1, 50) AS c FROM v_users",
+        "SELECT count(*) AS n FROM v_users WHERE contact LIKE 'a%'",
+    ] {
+        let out = run_query(tmp.path(), &cfg, sql);
+        assert_eq!(out.status.code(), Some(0), "{sql}: {}", stderr(&out));
+    }
+    // Listing the view closes all three: net A now knows `v_users.contact`.
+    let (tmp, cfg) =
+        pii_fixture("[connections.db.pii]\ncolumns = [\"users.email\", \"v_users.contact\"]\n");
+    for sql in [
+        "SELECT contact FROM v_users",
+        "SELECT contact || '' AS c FROM v_users",
+        "SELECT substr(contact, 1, 50) AS c FROM v_users",
+        "SELECT count(*) AS n FROM v_users WHERE contact LIKE 'a%'",
+    ] {
+        let out = run_query(tmp.path(), &cfg, sql);
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+        assert_no_pii_leak(&out, sql);
+    }
+}
+
+/// Net A is shared by `query` and `explain`, so a plan for a refused query is
+/// refused too — pinned because `explain` returns no rows and therefore has no
+/// net B of its own (finding 6).
+#[test]
+fn pii_explain_is_refused_like_the_query() {
+    let (tmp, cfg) = pii_fixture(PII_SECTION);
+    for sql in ["SELECT email FROM users", "SELECT * FROM users"] {
+        let out = nyet(tmp.path())
+            .args(["explain", "db", sql, "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+        assert_no_pii_leak(&out, sql);
+    }
+}
+
+/// `nyet doctor` keeps the honest CONNECT message even on a PII connection —
+/// symmetric with `engine_failure`, which passes `EngineError::Connect` through
+/// verbatim too. A refused handshake happens before any row exists, and doctor
+/// exists to tell the human why the connection is broken (round 2, finding H).
+/// The write PROBE, which does run a statement, is redacted instead — unit
+/// tested on `redact_diagnosis`, since provoking a probe detail needs a server.
+#[test]
+fn pii_doctor_keeps_the_connect_diagnosis_honest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let broken = format!("{}/nosuchdir/x.db", tmp.path().display());
+    for pii in ["", "[connections.db.pii]\ncolumns = [\"users.email\"]\n"] {
+        let cfg = write_config(
+            tmp.path(),
+            &format!(
+                "[connections.db]\nengine = \"sqlite\"\npath = \"{broken}\"\n\
+                 allowed_dirs = [\"{}\"]\n{pii}",
+                tmp.path().display()
+            ),
+        );
+        let out = nyet(tmp.path())
+            .args(["doctor", "db", "--format", "json", "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert!(
+            stdout(&out).contains("nosuchdir"),
+            "doctor must stay diagnostic: {}",
+            stdout(&out)
+        );
+    }
+}

@@ -120,6 +120,11 @@ max_timeout_secs = 30                  # overriding the [defaults] ones
 allow_functions = ["pg_sleep"]         # remove from the built-in denylist
 deny_functions = ["my_scary_fn"]       # add your own bans
 
+# Columns that hold personal data. Any query that could expose one is
+# refused outright (NYET / PII_COLUMN, exit 5). See "PII columns" below.
+[connections.prod.pii]
+columns = ["users.email", "users.phone", "customers.ssn"]
+
 # Auto-guardrail: refuse a query whose PLAN is over the limit (see below).
 # On by default with a generous limit; which modes exist depends on the engine.
 [connections.prod.guardrail]
@@ -225,6 +230,209 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO nyet_ro;
 
 Then `url = "postgres://nyet_ro@db.internal:5432/app"` and
 `password_env = "NYET_RO_PASSWORD"`.
+
+### PII columns
+
+A connection can declare which columns hold personal data. `nyet` then refuses
+— it never masks, filters or partially returns — any query that could expose
+them:
+
+```toml
+[connections.prod.pii]
+columns = ["users.email", "users.phone", "app.customers.ssn"]
+```
+
+Each entry is `table.column`, optionally schema-qualified, written with **plain
+unquoted identifiers** — one column per list entry. Matching is
+**case-insensitive** and the schema qualifier is **ignored** (only the
+`table.column` tail is compared) — quote a part (`"users"."e-mail"`) when the
+name cannot be written bare; matching still ignores case. This is because
+Postgres folds unquoted identifiers to
+lower case, MySQL's table-name case sensitivity depends on the platform, and the
+same table can be reached under several qualifications — widening the refusal is
+the only safe direction. Anything nyet cannot parse *or could never match* is a
+hard config error (exit 3) — for instance a whole list crammed into one string
+(`"users.email, users.phone"`, one forgotten comma), or a stray quote.
+A rule that is accepted but can never fire is worse than a rejected one: you
+would believe the column is protected while every query returns it. An absent
+section, or `columns = []`, means no policy at all — an existing config behaves
+exactly as before.
+
+Like `allowed_dirs`, `validator.allow_functions` and `guardrail.mode`, this is a
+**policy** value: `${VAR}` substitution inside a rule is rejected (exit 3). The
+environment belongs to the calling agent, and it must not be able to unprotect
+its own target. For the same reason **there is no CLI flag to override the
+policy** — an agent that can lift its own limit does not have one.
+
+**What gets refused** (`error.reason = "PII_COLUMN"`, exit 5). Everything below
+is about relations nyet can identify by name — see the limits section for what
+that excludes:
+
+- the column named in any clause — `SELECT`, `WHERE`, `JOIN ON`,
+  `JOIN ... USING (col)`, `GROUP BY`, `HAVING`, `ORDER BY`, a subquery or a CTE.
+  A filter is not "safer" than a projection: `SELECT count(*) FROM users WHERE
+  email LIKE 'a%'` reads the value one character at a time out of the row count,
+  and `FROM users JOIN dict USING (email)` does the same through the join —
+  parenthesised joins (`FROM (users JOIN dict USING (email))`) included;
+- a `NATURAL JOIN` involving a protected table — it joins on every column the
+  two relations share, and which ones those are cannot be told without the
+  schema;
+- a whole-relation read of a protected table in any spelling nyet can see:
+  `SELECT * FROM users`, PostgreSQL's `... UNION ALL TABLE users`, and both
+  spellings of `FROM ONLY users` / `FROM ONLY (users)`;
+- the column wrapped in anything — `substr(email,1,3)`, `CAST(email AS TEXT)`,
+  `md5(email)`, `concat(email,'x')`, `json_build_object('e', email)`;
+- a whole-row projection of a source that has protected columns —
+  `SELECT u.* FROM users u`, PostgreSQL's composite `SELECT u FROM users u`, and
+  a row expansion passed to a function, whether the function sits in the
+  projection (`json_agg(u.*)`, which really does return every column — verified)
+  or in table-source position (`FROM f(u.*)`, `FROM LATERAL f(u.*)`);
+- a table source nyet cannot sort into any of its categories — it may be the
+  protected table under a spelling nyet reads differently, so it is refused
+  (`PII_UNPROVABLE`) rather than assumed harmless. This is a guard against a
+  future parser, not a catch-all: a source nyet *does* recognise as opaque (a
+  subquery, a set-returning function, `UNNEST`, `JSON_TABLE`) is allowed, and
+  what it returns falls under the limits below;
+- renaming a protected table's columns positionally with an alias column list
+  (`SELECT c FROM users AS u (a, b, c)`) — nyet does not know the real column
+  order, so which alias now stands for the protected column is unprovable;
+- an **unqualified** column name that matches a protected column of any table
+  the statement reads (`SELECT email FROM users u JOIN orders o ON ...`) —
+  without the database's schema, ownership is unprovable, so it is refused;
+- catalogs of **this engine** that publish sampled data values, on any
+  connection with a PII policy: PostgreSQL `pg_stats` / `pg_stats_ext` /
+  `pg_statistic` / `pg_statistic_ext_data` (their `most_common_vals` and
+  `histogram_bounds` are literal cell values), MySQL/MariaDB
+  `information_schema.column_statistics` and `mysql.column_stats`, SQLite
+  `sqlite_stat3` / `sqlite_stat4`. The list is per engine, so your own table
+  that happens to be called `column_stats` on SQLite is just a table;
+- a result column that turns out to come from a protected column even though
+  the query never named it (`error.reason` is still `PII_COLUMN`, and
+  `PII_UNPROVABLE` when the database will not state a column's origin at all —
+  see "How it is enforced" below).
+
+**What keeps working** — the point is a policy, not a wall:
+
+```
+nyet query prod "SELECT count(*) FROM users"          # aggregate, no protected input
+nyet query prod "SELECT id, created_at FROM users"    # the unmarked columns
+nyet query prod "SELECT * FROM orders"                # a table with no rules
+nyet query prod "SELECT * FROM orders WHERE uid IN (SELECT id FROM users)"
+nyet query prod "SELECT o.* FROM orders o JOIN users u ON u.id = o.uid"
+```
+
+A wildcard is judged against **its own source**: the last two are fine because
+`*` and `o.*` expand `orders`, which carries no rules — reading a protected
+table elsewhere in the statement does not make them unsafe. The same proof
+applies to a qualified column (`SELECT o.email FROM orders o JOIN users u ...`
+is fine — `o` provably names `orders`), and to an alias that merely spells a
+protected name (`SELECT * FROM orders AS users` is `orders`).
+
+Refusals are deliberately wider than that in two places, both fail-closed:
+
+- an **unqualified** column name is refused wherever it appears in a statement
+  that reads a protected table, even if it belongs to another table in the same
+  FROM — without the schema, ownership is unprovable;
+- a relation that *is* named like a protected table is treated as one, so a CTE
+  or a temp table called `users` on a connection with `users.email` rules is
+  refused (`WITH users AS (SELECT 1 AS email) SELECT email FROM users`).
+  Qualifying does not help — the name is what nyet matches on; **rename the CTE**
+  (`WITH signups AS (...) SELECT email FROM signups`).
+
+**Database errors are withheld.** On a connection with a PII policy, `nyet`
+never passes the raw text of an error the DATABASE raised while running a
+statement — in `query`, `schema`, `explain` and `doctor` alike: PostgreSQL and MySQL
+quote the offending **cell value** in their messages (`invalid input syntax for
+type integer: "alice@example.com"`), which is an exfiltration channel one cell
+per query that no filter on the result can see. The whole message is replaced by
+an honest one (`DB_ERROR`, exit 7, "its error text is withheld ... check the
+query against the real schema with `nyet schema <alias>`"). Filtering the text
+with patterns would be theatre, so nyet does not pretend to. `nyet doctor`
+likewise reports its verdicts (connectivity, read-only, superuser) and replaces
+the server's wording in its write-probe detail.
+
+**One deliberate exception:** a CONNECT failure keeps its verbatim message
+everywhere, `doctor` included (`password authentication failed for user
+"nyet_ro"`, `no pg_hba.conf entry for host ...`). A refused handshake happens
+before any row exists, so it cannot quote a cell — and hiding it would make
+`nyet doctor`, whose entire job is telling you why the connection is broken,
+useless exactly when you need it. Connections without a PII policy keep the
+verbatim, actionable error everywhere.
+
+#### How it is enforced (and what it does not cover)
+
+Two independent nets, both fail-closed:
+
+- **Net A — names, before execution.** The validator walks the parsed statement
+  and refuses on the rules above. Table aliases are resolved, so `FROM users u
+  ... u.email` is the same as `users.email`.
+- **Net B — provenance, after execution and before output.** Every result column
+  carries the origin the *driver* reported. A column that resolves to a
+  protected `table.column` is refused (`PII_COLUMN`) even if the query never
+  named it; a column whose origin the database will not state is refused as
+  `PII_UNPROVABLE`. It runs on the one path rows can leave the engine, so
+  nothing is formatted, logged or printed until it passes. `nyet explain`
+  returns a plan and no rows, so net A alone applies there.
+
+Net B is a **cross-check on the wire**: it sees what the server actually
+returned, which is how a divergence between nyet's parse and the server's
+becomes visible. On PostgreSQL and MySQL/MariaDB it keys on the same names net A
+checks (the driver reports a view as a view); on SQLite it additionally resolves
+a *bare* view column to its base table. It cannot judge computed columns at all
+— those carry no origin.
+
+**Honest limits** (UX-7 — we do not claim what we do not do):
+
+- **Views are not followed.** The rules apply to the names nyet sees, and on
+  PostgreSQL and MySQL/MariaDB the driver reports a view column's origin as *the
+  view*, not the base table. So a view over a protected table is **not** covered
+  by a rule on that table — list the view's own columns too
+  (`columns = ["users.email", "v_users.contact"]`). **This holds for computed
+  columns on every engine, SQLite included**: an expression carries no
+  provenance at all, so while SQLite blocks `SELECT contact FROM v_users`, it
+  does not block `SELECT contact || '' FROM v_users` or the row-count oracle
+  `SELECT count(*) FROM v_users WHERE contact LIKE 'a%'`. Refusing every
+  computed column would close that, and was rejected on **cost**, not because it
+  would gain nothing: it would refuse every aggregate, every expression and every
+  set operation on every PII connection. Listing the view is the fix that
+  actually holds. The same applies to anything else that renames data
+  server-side: materialized views, **set-returning functions**
+  (`CREATE FUNCTION f() RETURNS SETOF users` — `SELECT * FROM f()` returns
+  everything, and net B reports the function, not the base table), foreign
+  tables.
+- **Counting oracles are not closed.** `row_count`, the guardrail's row
+  `estimate` and query timing still respond to filters on *unmarked* columns
+  that correlate with protected ones. Refusing every filter would refuse every
+  query.
+- **The real boundary is the database.** nyet is one process an agent with shell
+  access can walk around (threat model). Column-level privileges, views and RLS
+  are enforced by the server for *every* client:
+
+  ```sql
+  -- PostgreSQL: grant the columns, not the table
+  REVOKE SELECT ON users FROM nyet_ro;
+  GRANT SELECT (id, org_id, created_at) ON users TO nyet_ro;
+  -- or expose a curated view and grant only that
+  CREATE VIEW users_public AS SELECT id, org_id, created_at FROM users;
+  GRANT SELECT ON users_public TO nyet_ro;
+  -- row-level policies compose with the above
+  ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY users_own_org ON users FOR SELECT TO nyet_ro USING (org_id = 7);
+  ```
+
+  ```sql
+  -- MySQL/MariaDB: column-level grants
+  REVOKE SELECT ON app.users FROM 'nyet_ro'@'%';
+  GRANT SELECT (id, org_id, created_at) ON app.users TO 'nyet_ro'@'%';
+  -- or a view, granted alone (MySQL has no RLS; a WHERE in the view is the idiom)
+  CREATE VIEW app.users_public AS SELECT id, org_id, created_at FROM app.users;
+  GRANT SELECT ON app.users_public TO 'nyet_ro'@'%';
+  FLUSH PRIVILEGES;
+  ```
+
+  With those in place `nyet schema` reports only what the role may read, and a
+  bypass attempt gets nothing either. The `[pii]` section is the fast, local,
+  reviewable layer on top — not a replacement.
 
 ### SSH tunnels (a database behind a bastion)
 
@@ -917,6 +1125,8 @@ to do:
 | `EXPLAIN_ANALYZE` | `EXPLAIN ANALYZE ...` (or PostgreSQL's `EXPLAIN (ANALYZE, ...)`) — it *runs* the statement it claims to explain, so it is an execution wearing a plan's clothes; use `nyet explain` for a plan, a plain `EXPLAIN` is fine as a query |
 | `EXPENSIVE_QUERY` | the query plan's estimate is above this connection's guardrail limit, so the query was not executed — the envelope carries the plan. Also used when *planning itself* outran the guardrail's budget (then there is no plan to carry): see the auto-guardrail section |
 | `EXECUTABLE_COMMENT` | a MySQL/MariaDB executable comment or optimizer hint (`/*! … */`, `/*M! … */`, `/*+ … */`) — the server runs its body but a SQL parser drops it, so nyet cannot see what it does; remove the comment |
+| `PII_COLUMN` | the query could expose a column this connection's `[pii]` policy protects — named directly, wrapped in an expression, swept up by `*`, used as a filter, or resolved from the result's provenance. See "PII columns" |
+| `PII_UNPROVABLE` | the database would not state where a result column came from, on a connection with a PII policy — an undetermined origin is refused rather than guessed |
 
 PRAGMA is refused with a pointer instead of a dead end: schema questions
 have a SELECT answer (`SELECT name, sql FROM sqlite_master WHERE type = 'table'`).
@@ -952,8 +1162,16 @@ lists (per engine; rationale in [docs/DEV.md](docs/DEV.md)):
   stay allowed), `lo_import`/`lo_export`, `pg_stat_file`, and the prefix families
   `dblink*`, `pg_read_*` (server-file read) and `pg_ls_*` (server-dir listing).
   These act outside the read-only transaction, so the validator is the only
-  guard. Prefix families are built-in and not tunable via `allow_functions`; the
-  enumerated names (including `pg_sleep`) are.
+  guard. Also the whole **`*_to_xml` export family** — `query_to_xml`,
+  `table_to_xml`, `schema_to_xml`, `database_to_xml`, `cursor_to_xml` and their
+  `*_to_xmlschema` / `*_to_xml_and_xmlschema` variants. These are built into
+  `pg_catalog`, need no extension and no DBA, and they defeat the validator
+  outright: `query_to_xml` **executes a SQL string** nyet never parses (so
+  `query_to_xml('select pg_sleep(3)', …)` ran a denied function), and the
+  `table_/schema_/database_to_xml` forms dump a whole relation, schema or
+  database without naming a single column. Same class as `dblink`, only
+  built in. Prefix families are built-in and not tunable via `allow_functions`;
+  the enumerated names (including `pg_sleep` and the `*_to_xml` family) are.
 
 Matching is case-insensitive and is done on the **terminal** name component, so
 qualified targets (`pg_catalog.pg_sleep`, `main.load_extension`) and table-valued

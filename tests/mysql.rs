@@ -881,3 +881,152 @@ fn mysql_guardrail_and_explain_end_to_end() {
         container.rm().await.unwrap();
     });
 }
+
+/// The PII policy against a live MariaDB (step PII-1): net A by name, net B by
+/// the driver's column provenance, and the withheld database error. The view
+/// behavior is the measured fact behind the documented limitation.
+#[test]
+fn mysql_pii_policy_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        const VALUE: &str = "alice@example.com";
+        {
+            use sqlx::{ConnectOptions, Connection, Executor};
+            let opts: sqlx::mysql::MySqlConnectOptions =
+                format!("mysql://root@127.0.0.1:{port}/test")
+                    .parse()
+                    .unwrap();
+            let mut w = opts.connect().await.unwrap();
+            for sql in [
+                format!("INSERT INTO users VALUES (9, '{VALUE}')"),
+                "CREATE TABLE orders (id int primary key, uid int, amount int)".to_string(),
+                "INSERT INTO orders VALUES (1, 9, 42)".to_string(),
+                "CREATE TABLE dict (id int, email varchar(255), note varchar(255))".to_string(),
+                format!("INSERT INTO dict VALUES (9, '{VALUE}', 'x')"),
+                "CREATE VIEW v_users AS SELECT id, email AS contact FROM users".to_string(),
+            ] {
+                w.execute(sqlx::AssertSqlSafe(sql)).await.unwrap();
+            }
+            w.close().await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_mysql_config_with(
+            tmp.path(),
+            port,
+            "[connections.my.pii]\ncolumns = [\"users.email\"]\n",
+        );
+        let no_leak = |out: &Output, sql: &str| {
+            assert!(!stdout(out).contains(VALUE), "{sql}: leaked to stdout");
+            assert!(!stderr(out).contains(VALUE), "{sql}: leaked to stderr");
+        };
+
+        for sql in [
+            "SELECT email FROM users",
+            "SELECT u.email FROM users u",
+            "SELECT `email` FROM `users`",
+            "SELECT * FROM users",
+            "SELECT count(*) FROM users WHERE email LIKE 'a%'",
+            "SELECT * FROM information_schema.column_statistics",
+            // finding 3: the USING / NATURAL join oracle.
+            "SELECT count(*) FROM users JOIN dict USING (email)",
+            "SELECT count(*) FROM users NATURAL JOIN dict",
+            // round 2, finding A: `TABLE t` as the right operand of a set
+            // operation used to switch net A off completely.
+            "SELECT NULL AS a, NULL AS b, NULL AS c UNION ALL TABLE users",
+            // round 2, finding B: the parenthesised join.
+            "SELECT count(*) FROM (users JOIN dict USING (email))",
+            "SELECT count(*) FROM (users NATURAL JOIN dict)",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "my", sql]);
+            assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+            no_leak(&out, sql);
+            assert_no_password_leak(&out);
+        }
+
+        // Net B does not fire on legitimate reads: MySQL/MariaDB report
+        // `db.table` + the original column name on the wire, for free.
+        for sql in [
+            "SELECT id FROM users ORDER BY id",
+            "SELECT count(*) AS n FROM users",
+            "SELECT * FROM orders",
+            "SELECT id, amount FROM orders WHERE 1 = 0",
+            "SHOW TABLES",
+            "SELECT 1 AS one",
+            // finding 9: the wildcard's own source carries no rules.
+            "SELECT * FROM orders WHERE uid IN (SELECT id FROM users)",
+            "SELECT o.* FROM orders o JOIN users u ON u.id = o.uid",
+            "SELECT count(*) FROM users JOIN dict USING (id)",
+            // round 2, findings D/E/F.
+            "SELECT * FROM (SELECT id FROM users) t",
+            "SELECT o.uid FROM orders o JOIN users u ON u.id = o.uid",
+            "SELECT amount FROM orders AS users",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "my", sql]);
+            // NET B LIVENESS: blinded origins arrive as Unknown, which net B
+            // refuses as PII_UNPROVABLE (exit 5) — this line goes red then.
+            assert_eq!(out.status.code(), Some(0), "{sql}: {}", stdout(&out));
+            no_leak(&out, sql);
+        }
+
+        // The raw database error is withheld on a PII connection.
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["query", "my", "SELECT nosuchcol FROM orders"],
+        );
+        assert_eq!(out.status.code(), Some(7), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["code"], "DB_ERROR");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains("withheld"), "{message}");
+        assert!(!message.contains("nosuchcol"), "{message}");
+
+        // Measured limitation: MariaDB reports a VIEW column's origin as the
+        // view (`test.v_users`.`contact`), not the base table — so a rule on
+        // `users.email` does not cover it, and the view must be listed.
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["query", "my", "SELECT contact FROM v_users"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert!(
+            stdout(&out).contains(VALUE),
+            "the documented view limitation changed: {}",
+            stdout(&out)
+        );
+        let cfg_view = write_mysql_config_with(
+            tmp.path(),
+            port,
+            "[connections.my.pii]\ncolumns = [\"users.email\", \"v_users.contact\"]\n",
+        );
+        let out = run(
+            tmp.path(),
+            &cfg_view,
+            &["query", "my", "SELECT contact FROM v_users"],
+        );
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        no_leak(&out, "SELECT contact FROM v_users (view listed)");
+
+        // No [pii] section -> byte-for-byte the old behavior.
+        let plain = write_mysql_config(tmp.path(), port);
+        let out = run(
+            tmp.path(),
+            &plain,
+            &["query", "my", "SELECT email FROM users ORDER BY id"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert!(stdout(&out).contains(VALUE), "{}", stdout(&out));
+        let out = run(
+            tmp.path(),
+            &plain,
+            &["query", "my", "SELECT nosuchcol FROM orders"],
+        );
+        assert_eq!(out.status.code(), Some(7));
+        assert!(stdout(&out).contains("nosuchcol"), "{}", stdout(&out));
+
+        container.rm().await.unwrap();
+    });
+}

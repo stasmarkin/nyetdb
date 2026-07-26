@@ -998,3 +998,248 @@ fn postgres_schema_respects_role_privileges() {
         container.rm().await.unwrap();
     });
 }
+
+/// PostgreSQL's `*_to_xml` family runs a SQL string the parser never sees and
+/// dumps whole relations without naming a column. Denied for EVERY connection,
+/// PII policy or not: it re-enables every function the validator refuses.
+#[test]
+fn postgres_xml_export_functions_are_denied() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_pg_config(tmp.path(), port);
+        for sql in [
+            "SELECT query_to_xml('select email from users', true, false, '')::text",
+            "SELECT table_to_xml('users'::regclass, true, false, '')::text",
+            "SELECT cast(schema_to_xml('public', true, false, '') as text)",
+            "SELECT xpath('//email/text()', query_to_xml('select email from users', \
+             true, false, ''))::text",
+            // the wider defect: the family re-enabled the whole function denylist
+            "SELECT query_to_xml('select pg_sleep(3)', true, false, '')::text",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "pg", sql]);
+            assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["reason"], "DENIED_FUNCTION", "{sql}");
+            assert!(!stdout(&out).contains("a@b.c"), "leaked: {}", stdout(&out));
+        }
+        // Neighbouring functions are untouched (the enumeration is exact).
+        for sql in [
+            "SELECT xmlcomment('ok')::text AS v",
+            "SELECT * FROM generate_series(1, 3) AS g",
+            "SELECT unnest(ARRAY[1, 2]) AS n",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "pg", sql]);
+            assert_eq!(out.status.code(), Some(0), "{sql}: {}", stdout(&out));
+        }
+        container.rm().await.unwrap();
+    });
+}
+
+/// The PII policy against a live PostgreSQL (step PII-1): net A by name, net B
+/// by the driver's column provenance, the withheld database error, and the
+/// honestly documented view limitation — all measured, not assumed.
+#[test]
+fn postgres_pii_policy_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        // A distinctive cell value: any appearance in either stream is a leak.
+        const VALUE: &str = "alice@example.com";
+        {
+            use sqlx::{ConnectOptions, Connection, Executor};
+            let opts: sqlx::postgres::PgConnectOptions =
+                format!("postgres://postgres@127.0.0.1:{port}/postgres")
+                    .parse()
+                    .unwrap();
+            let mut w = opts.password(PW).connect().await.unwrap();
+            for sql in [
+                format!("INSERT INTO users VALUES (9, '{VALUE}')"),
+                "CREATE TABLE orders (id int primary key, uid int, amount int)".to_string(),
+                "INSERT INTO orders VALUES (1, 9, 42)".to_string(),
+                "CREATE TABLE dict (id int, email text, note text)".to_string(),
+                format!("INSERT INTO dict VALUES (9, '{VALUE}', 'x')"),
+                "CREATE VIEW v_users AS SELECT id, email AS contact FROM users".to_string(),
+            ] {
+                w.execute(sqlx::AssertSqlSafe(sql)).await.unwrap();
+            }
+            w.close().await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.pii]\ncolumns = [\"users.email\"]\n",
+        );
+        let no_leak = |out: &Output, sql: &str| {
+            assert!(!stdout(out).contains(VALUE), "{sql}: leaked to stdout");
+            assert!(!stderr(out).contains(VALUE), "{sql}: leaked to stderr");
+        };
+
+        // Net A: the protected column by name, a whole-row projection, the
+        // WHERE-oracle, and the value-sampling catalog.
+        for sql in [
+            "SELECT email FROM users",
+            "SELECT u.email FROM users u",
+            "SELECT * FROM users",
+            "SELECT u FROM users u",
+            "SELECT count(*) FROM users WHERE email LIKE 'a%'",
+            "SELECT * FROM pg_stats",
+            // finding 2: sqlparser reads `ONLY` as the table and `users` as its
+            // alias — the server, however, runs the real query (verified: it
+            // returns the protected value).
+            "SELECT email FROM ONLY users",
+            "SELECT * FROM ONLY users",
+            // finding 5: f(t.*) expands the whole row inside a call. Verified
+            // live: json_agg(u.*) returns {"id":..,"email":"alice@example.com"}.
+            "SELECT json_agg(u.*)::text FROM users u",
+            "SELECT concat(u.*) FROM users u",
+            // finding 4: an alias column list renames columns positionally.
+            "SELECT c FROM users AS u (a, b, c)",
+            // finding 3: USING / NATURAL name the join column outside any Expr.
+            "SELECT count(*) FROM users JOIN dict USING (email)",
+            "SELECT count(*) FROM users NATURAL JOIN dict",
+            // round 2, finding A: `TABLE t` keeps its name as a plain String
+            // inside SetExpr — it used to switch net A off completely and
+            // returned every column of users (verified live).
+            "SELECT NULL AS a, NULL AS b, NULL AS c UNION ALL TABLE users",
+            "SELECT NULL AS a UNION ALL TABLE pg_stats",
+            // round 2, finding B: a parenthesised join hides its constraint.
+            "SELECT count(*) FROM (users JOIN dict USING (email))",
+            "SELECT count(*) FROM (users NATURAL JOIN dict)",
+            "SELECT count(*) FROM orders o JOIN (users JOIN dict USING (email)) x ON true",
+            // round 2, finding C: a function in TABLE-SOURCE position.
+            "SELECT 1 FROM users u, LATERAL json_agg(u.*)",
+            // round 3, finding B: `FROM ONLY (t)` — sqlparser reads it as a
+            // TABLE FUNCTION, so the scan skipped it and net A went off
+            // entirely. Verified live: each of these returned the value.
+            "SELECT email || '' FROM ONLY (users)",
+            "SELECT substr(email, 1, 5) AS x FROM ONLY (users)",
+            "SELECT (SELECT email FROM ONLY (users) LIMIT 1) AS x",
+            "SELECT count(*) FROM ONLY (users) WHERE email LIKE 'a%'",
+            "SELECT count(*) FROM ONLY (users) JOIN dict USING (email)",
+            "SELECT count(*) FROM ONLY (users) NATURAL JOIN dict",
+            "SELECT * FROM ONLY (users)",
+            "SELECT most_common_vals::text FROM ONLY (pg_stats) WHERE tablename = 'users'",
+            "SELECT email FROM ONLY (public.users)",
+            "SELECT 1 FROM (SELECT 1) z, ONLY (users)",
+            // round 3, finding C: a wildcard over a parenthesised join must see
+            // that join's own sources.
+            "SELECT * FROM (users JOIN dict ON true)",
+            "SELECT u.* FROM (users u JOIN dict ON true)",
+            // round 4, finding 1: a correlated sub-SELECT has an empty FROM, so
+            // a LOCAL wildcard scope saw nothing while `u.*` copied every
+            // protected column outwards. The count form cleared BOTH nets.
+            "SELECT count(*) FROM users u, LATERAL (SELECT u.*) s WHERE s.email LIKE 'a%'",
+            "SELECT s.email FROM users u, LATERAL (SELECT u.*) s",
+            "SELECT count(*) FROM users u CROSS JOIN LATERAL (SELECT u.*) AS s(a, b, c, d) \
+             WHERE s.b LIKE 'a%'",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "pg", sql]);
+            assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+            no_leak(&out, sql);
+            assert_no_password_leak(&out);
+        }
+
+        // Net B must not fire on a legitimate read: this proves the extra
+        // DESCRIBE really resolves origins on the FETCH path (without it every
+        // Postgres column comes back Unknown and this would be PII_UNPROVABLE).
+        for sql in [
+            "SELECT id FROM users ORDER BY id",
+            "SELECT count(*) AS n FROM users",
+            "SELECT * FROM orders",
+            // An EMPTY result takes the prepared-statement column path: its
+            // origins must be resolved there too, or this would be a refusal.
+            "SELECT id, amount FROM orders WHERE 1 = 0",
+            // Metadata statements have no table columns at all.
+            "SHOW server_version",
+            "SELECT 1 AS one",
+            // finding 9: the wildcard's own source carries no rules.
+            "SELECT * FROM orders WHERE uid IN (SELECT id FROM users)",
+            "SELECT o.* FROM orders o JOIN users u ON u.id = o.uid",
+            "SELECT count(*) FROM users JOIN dict USING (id)",
+            // round 2, findings D/E/F.
+            "SELECT * FROM (SELECT id FROM users) t",
+            "SELECT o.uid FROM orders o JOIN users u ON u.id = o.uid",
+            "SELECT amount FROM orders AS users",
+            // round 3, finding D: a derived table's alias is a provable source.
+            "SELECT s.uid FROM users u JOIN (SELECT id, uid FROM orders) s ON s.id = u.id",
+            "SELECT * FROM generate_series(1, 3) AS g",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "pg", sql]);
+            // NET B LIVENESS: this is the assertion that goes red if sqlx ever
+            // stops resolving column origins on this path. Blinded origins come
+            // back as ColumnOrigin::Unknown, which net B refuses as
+            // PII_UNPROVABLE (exit 5) — so a silent regression cannot pass here.
+            assert_eq!(out.status.code(), Some(0), "{sql}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["ok"], true, "{sql}");
+            no_leak(&out, sql);
+        }
+
+        // Leak guard: the query never NAMES a protected column (it goes through
+        // the view), so it runs — and PostgreSQL answers `invalid input syntax
+        // for type integer: "alice@example.com"`. The PII policy withholds that
+        // message wholesale; the value must not reach either stream.
+        let sql = "SELECT contact::int FROM v_users";
+        let out = run(tmp.path(), &cfg, &["query", "pg", sql]);
+        assert_eq!(out.status.code(), Some(7), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["code"], "DB_ERROR");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("withheld"),
+            "{v}"
+        );
+        no_leak(&out, sql);
+
+        // The honest limitation (README/DEV): PostgreSQL reports a VIEW column's
+        // origin as the view itself, so a rule on the base table does not cover
+        // the view — the config owner must list it.
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["query", "pg", "SELECT contact FROM v_users"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert!(
+            stdout(&out).contains(VALUE),
+            "the documented view limitation changed: {}",
+            stdout(&out)
+        );
+        // ...and listing the view closes it.
+        let cfg_view = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.pii]\ncolumns = [\"users.email\", \"v_users.contact\"]\n",
+        );
+        let out = run(
+            tmp.path(),
+            &cfg_view,
+            &["query", "pg", "SELECT contact FROM v_users"],
+        );
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["reason"], "PII_COLUMN");
+        no_leak(&out, "SELECT contact FROM v_users (view listed)");
+
+        // A connection WITHOUT a [pii] section is untouched, error text included.
+        let plain = write_pg_config(tmp.path(), port);
+        let out = run(
+            tmp.path(),
+            &plain,
+            &["query", "pg", "SELECT email FROM users ORDER BY id"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert!(stdout(&out).contains(VALUE), "{}", stdout(&out));
+        let out = run(
+            tmp.path(),
+            &plain,
+            &["query", "pg", "SELECT nosuchcol FROM orders"],
+        );
+        assert_eq!(out.status.code(), Some(7));
+        assert!(stdout(&out).contains("nosuchcol"), "{}", stdout(&out));
+
+        container.rm().await.unwrap();
+    });
+}

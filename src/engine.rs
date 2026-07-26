@@ -10,12 +10,13 @@ use crate::output::{
     build_table, ConnectFact, Diagnosis, KeyPart, ProbeFact, Schema, SchemaColumn, SchemaFk,
     SchemaIndex, SchemaTable, ServerFacts, SuperuserFact,
 };
+use crate::validator::Origin;
 use futures_util::TryStreamExt;
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlRow, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgRow, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
-use sqlx::{Column, ConnectOptions, Connection, Row, TypeInfo, ValueRef};
+use sqlx::{Column, ColumnOrigin, ConnectOptions, Connection, Row, TypeInfo, ValueRef};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,6 +25,27 @@ use std::time::Duration;
 pub struct ResultSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
+    /// Where each column came from, as the DRIVER reported it — the raw
+    /// material for the cli's net B (`validator::check_origins`). Same length
+    /// and order as `columns`; a missing entry counts as `Origin::Unknown`
+    /// (fail closed) on a connection with a PII policy.
+    pub origins: Vec<Origin>,
+}
+
+/// Translate the driver's column metadata into the pure `Origin` the validator
+/// judges. One place for all three engines, so they cannot drift.
+fn origins_of<C: Column>(columns: &[C]) -> Vec<Origin> {
+    columns
+        .iter()
+        .map(|c| match c.origin() {
+            ColumnOrigin::Table(t) => Origin::Table {
+                table: t.table.to_string(),
+                column: t.name.to_string(),
+            },
+            ColumnOrigin::Expression => Origin::Expression,
+            ColumnOrigin::Unknown => Origin::Unknown,
+        })
+        .collect()
 }
 
 // Debug: test assertions unwrap on it; the fields are curated messages/hints
@@ -96,6 +118,12 @@ pub enum QueryOutcome {
     /// Planning itself outran the guardrail's budget: NOTHING was executed
     /// (fail closed — see `Plan::TooSlow`).
     PlanTooSlow { budget_ms: u64 },
+    /// Net B refused the RESULT (PII): the query ran, but a result column's
+    /// reported provenance is protected or unprovable, so no row is released.
+    /// A variant rather than a check the caller may forget: rows leave the
+    /// engine layer only through this enum, and every arm must be matched
+    /// (finding 6).
+    PiiRefused(Box<crate::validator::Refusal>),
 }
 
 /// What the guardrail's EXPLAIN produced. The two failure modes are deliberately
@@ -531,6 +559,7 @@ impl Engine for Sqlite {
         let deadline = Duration::from_millis(self.query_timeout_ms);
         match tokio::time::timeout(deadline, async move {
             let mut columns: Vec<String> = Vec::new();
+            let mut origins: Vec<Origin> = Vec::new();
             let mut rows: Vec<Vec<Value>> = Vec::new();
             {
                 // AssertSqlSafe is sqlx's marker for "audited dynamic SQL":
@@ -543,6 +572,7 @@ impl Engine for Sqlite {
                             if columns.is_empty() {
                                 columns =
                                     row.columns().iter().map(|c| c.name().to_string()).collect();
+                                origins = origins_of(row.columns());
                             }
                             rows.push(decode_row(&row)?);
                         }
@@ -562,11 +592,16 @@ impl Engine for Sqlite {
                         .iter()
                         .map(|c| c.name().to_string())
                         .collect();
+                    origins = origins_of(statement.columns());
                 }
             }
             let _ = conn.close().await;
             Ok::<QueryOutcome, EngineError>(QueryOutcome::Ran {
-                result: ResultSet { columns, rows },
+                result: ResultSet {
+                    columns,
+                    rows,
+                    origins,
+                },
                 estimate: None,
             })
         })
@@ -893,6 +928,15 @@ pub struct Postgres {
     /// hung-connect tests pass `Some(short)` so they finish fast without the 10s
     /// production floor.
     pub connect_timeout_ms: Option<u64>,
+    /// Resolve column PROVENANCE for the result (net B). Set by the cli only
+    /// when the connection has a PII policy, because it costs one extra
+    /// DESCRIBE round trip: on the FETCH path sqlx asks Postgres not to resolve
+    /// origins, so `PgColumn::origin()` comes back `Unknown` for real table
+    /// columns (only the oid+attnum are filled in). Preparing the statement
+    /// FIRST resolves the names and caches them on the connection, so the
+    /// following fetch reports `Table(table, column)` — verified against
+    /// postgres:16-alpine, see docs/DEV.md.
+    pub resolve_column_origins: bool,
 }
 
 /// Redirect host+port to the tunnel's local end while keeping every other
@@ -1069,7 +1113,18 @@ impl Engine for Postgres {
                 });
             }
 
+            // Net B needs the column origins the fetch path does not resolve;
+            // preparing first fills the connection's origin cache (and the
+            // statement cache, so the fetch below reuses this very PARSE). Best
+            // effort: if it fails the origins stay Unknown and the cli refuses
+            // the result — fail closed, never a silent pass.
+            if self.resolve_column_origins {
+                use sqlx::{Executor, SqlSafeStr};
+                let sql_str = sqlx::AssertSqlSafe(sql.to_string()).into_sql_str();
+                let _ = conn.prepare(sql_str).await;
+            }
             let mut columns: Vec<String> = Vec::new();
+            let mut origins: Vec<Origin> = Vec::new();
             let mut rows: Vec<Vec<Value>> = Vec::new();
             let fetched = {
                 let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql.to_string())).fetch(&mut conn);
@@ -1082,6 +1137,7 @@ impl Engine for Postgres {
                             if columns.is_empty() {
                                 columns =
                                     row.columns().iter().map(|c| c.name().to_string()).collect();
+                                origins = origins_of(row.columns());
                             }
                             match decode_pg_row(&row) {
                                 Ok(r) => rows.push(r),
@@ -1104,12 +1160,17 @@ impl Engine for Postgres {
                         .iter()
                         .map(|c| c.name().to_string())
                         .collect();
+                    origins = origins_of(statement.columns());
                 }
             }
             pg_close_read_only(conn).await;
             fetched?;
             Ok::<QueryOutcome, EngineError>(QueryOutcome::Ran {
-                result: ResultSet { columns, rows },
+                result: ResultSet {
+                    columns,
+                    rows,
+                    origins,
+                },
                 estimate,
             })
         })
@@ -2127,6 +2188,7 @@ impl Engine for Mysql {
             // helper if a third server engine lands — two copies isn't worth a
             // generic yet.
             let mut columns: Vec<String> = Vec::new();
+            let mut origins: Vec<Origin> = Vec::new();
             let mut rows: Vec<Vec<Value>> = Vec::new();
             let fetched = {
                 let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql.to_string())).fetch(&mut conn);
@@ -2139,6 +2201,7 @@ impl Engine for Mysql {
                             if columns.is_empty() {
                                 columns =
                                     row.columns().iter().map(|c| c.name().to_string()).collect();
+                                origins = origins_of(row.columns());
                             }
                             match decode_mysql_row(&row) {
                                 Ok(r) => rows.push(r),
@@ -2160,12 +2223,17 @@ impl Engine for Mysql {
                         .iter()
                         .map(|c| c.name().to_string())
                         .collect();
+                    origins = origins_of(statement.columns());
                 }
             }
             mysql_close_read_only(conn).await;
             fetched?;
             Ok::<QueryOutcome, EngineError>(QueryOutcome::Ran {
-                result: ResultSet { columns, rows },
+                result: ResultSet {
+                    columns,
+                    rows,
+                    origins,
+                },
                 estimate,
             })
         })
@@ -2962,6 +3030,9 @@ mod tests {
                 QueryOutcome::Refused { .. } | QueryOutcome::PlanTooSlow { .. } => {
                     unreachable!("a guardrail that is off never plans, so it never refuses")
                 }
+                // Net B lives in the cli's Db::execute wrapper, not in the
+                // engines, so a direct engine call never produces this.
+                QueryOutcome::PiiRefused(_) => unreachable!("net B runs above the engine layer"),
             }
         }
     }
@@ -3454,6 +3525,7 @@ mod tests {
             query_timeout_ms: 100,
             host_override: None,
             connect_timeout_ms: Some(500), // short so the hang test finishes fast
+            resolve_column_origins: false,
         };
         match pg_block_on(engine.execute_rows("SELECT 1", 10)) {
             Err(EngineError::Connect { hint, .. }) => {
@@ -3509,6 +3581,7 @@ mod tests {
                 query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
+                resolve_column_origins: false,
             };
 
             // Layer 2: a write bypassing the validator fails at the database
@@ -3620,6 +3693,7 @@ mod tests {
                 query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
+                resolve_column_origins: false,
             };
             match slow
                 .execute_rows(
@@ -3643,6 +3717,7 @@ mod tests {
                 query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
+                resolve_column_origins: false,
             };
             match tls_required.execute_rows("SELECT 1", 10).await {
                 Err(EngineError::Connect { hint, .. }) => {

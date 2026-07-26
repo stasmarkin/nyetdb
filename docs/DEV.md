@@ -154,8 +154,11 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 ├─ config    (src/config.rs)    — pure: TOML text -> validated structures; env lookup injected
 ├─ resolver  (src/resolver.rs)  — pure: (cwd, allowed_dirs) -> allowed?; canonicalize injected
 ├─ validator (src/validator.rs) — pure: (SQL text, Policy) -> Allow{sql,warnings} |
-│                                 Deny{reason,message,hint}; depends ONLY on
-│                                 sqlparser + unicode-properties (+std)
+│                                 Deny{reason,message,hint}; also owns the PII
+│                                 policy (PiiRules) and the post-execution
+│                                 provenance check (Origin/check_origins);
+│                                 depends ONLY on sqlparser + unicode-properties
+│                                 (+std)
 ├─ guardrail (src/guardrail.rs) — pure: (config) -> Guardrail; (plan) ->
 │                                 CostEstimate; (estimate) -> Check + refusal
 │                                 texts. serde_json + output only — the plan
@@ -182,8 +185,9 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 Dependencies flow downward only: the pure modules do no IO and know nothing
 about clap or each other; file reading, env access, cwd/realpath, the tokio
 runtime and the query timeout live in the cli layer. The edges between "leaf"
-modules are `engine -> output`, `engine -> guardrail`, `guardrail -> output` and
-`config -> guardrail` (the guardrail owns the judging and its own config
+modules are `engine -> output`, `engine -> guardrail`, `engine -> validator`
+(only for the pure `Origin` type it fills in from the driver's column metadata),
+`guardrail -> output`, `config -> guardrail` and `config -> validator` (the guardrail owns the judging and its own config
 resolution — `config::guardrail` is the single entry point, called at parse time
 to fail loud and again by the cli to get the value; output owns the serialized
 shapes; the engines only run the EXPLAIN and hand the result over). The first
@@ -1242,6 +1246,363 @@ Dev:
   proof that `require` is enforced by the rustls backend, not silently
   downgraded to plaintext.
 
+## PII columns (`[connections.X.pii]`, step PII-1)
+
+The config owner marks `table.column` pairs as personal data; nyet **refuses**
+any query that could expose them. Masking values is deliberately NOT part of
+this step — the only sanction is a whole-query deny (`NYET`/`PII_COLUMN`, exit 5).
+
+### Two nets, both fail-closed
+
+**Net A — names, before execution** (`src/validator.rs`, pure). A pre-pass
+(`TableScan::push_factor`) classifies EVERY table factor. From it `PiiScope`
+builds the protected column names of the protected relations in scope, the
+handles that stand for them, and the full relation-name set. The main `Checker`
+walk then refuses:
+
+- any `Expr::Identifier` / `Expr::CompoundIdentifier` whose terminal component
+  is a protected column name — which covers projection, WHERE, JOIN ON, GROUP
+  BY, HAVING, ORDER BY, subqueries and CTE bodies at once, because the visitor
+  passes every expression in the tree through the same hook. Function calls,
+  casts and operators need no special case: they are reached through their own
+  sub-expressions, so `substr(email,1,3)` is caught by the inner `email`;
+- `JOIN ... USING (col)` and `NATURAL JOIN`. `JoinConstraint::Using` holds
+  `ObjectName`s **outside** the `Expr` tree and `Natural` holds nothing at all,
+  so neither is reachable from `pre_visit_expr`. Both are a working equality
+  oracle over the protected value — the agent brings its own dictionary
+  (`FROM (users NATURAL JOIN (SELECT '<guess>' AS email) d)` answers 1 or 0).
+  `Checker::check_joins` is applied from TWO hooks, which between them see every
+  `TableWithJoins` in the statement exactly once: `pre_visit_select` for
+  `select.from`, and the `TableFactor::NestedJoin` arm of
+  `pre_visit_table_factor` for a parenthesised join, whose own `joins` live a
+  level deeper and produce no `Select` of their own. Checking only the first was
+  a bypass (`FROM (users JOIN dict USING (email))`). The local wildcard scope
+  recurses into the same nested joins (`SELECT * FROM (users JOIN dict ON true)`
+  expands `users` too);
+- `TABLE t` — a whole-relation read whose name sqlparser keeps as a plain
+  `String` inside `SetExpr::Table`, not as a `TableFactor` or even an
+  `ObjectName`. No visitor hook reaches it, so it is walked explicitly from
+  `query.body` (`set_expr_tables`, recursing through `SetOperation`) in
+  `Checker::pre_visit_query`. `TableScan` walks it too, but that hook is
+  REDUNDANT rather than load-bearing: the `Checker` refuses a protected
+  `TABLE t` unconditionally and earlier, so the scan's only effect is adding
+  unprotected names to `relations` — a widening of allow, with no deny case that
+  discriminates it. It is only reachable as an operand of a set operation
+  (`SELECT NULL UNION ALL TABLE users`), and left unhandled it switched net A
+  off ENTIRELY — columns, wildcard, composite, alias-columns and the catalog
+  denylist at once — while the server returned every column. `SetExpr` has no
+  other variant carrying a relation outside a `TableFactor` (`Insert`/`Update`/
+  `Delete`/`Merge` are already `WRITE_OPERATION`);
+- a wildcard, judged against **the source it expands**, not the whole statement:
+  `SelectItem::Wildcard` needs that select's own FROM to be rule-free, and
+  `prefix.*` is safe when `prefix` provably names a relation with no rules. An
+  unresolvable prefix inside a scope holding a protected relation fails closed.
+  `count(*)` is a `FunctionArgExpr::Wildcard`, a different enum the visitor never
+  surfaces as an `Expr` — which is why `SELECT count(*) FROM users` stays
+  allowed, while `f(t.*)` (a `FunctionArgExpr::QualifiedWildcard`) does not:
+  `json_agg(u.*)` really returns `{"id":1,"email":"..."}` — verified live on
+  postgres:16-alpine. `Checker::check_function_args` is called from BOTH sides of
+  the AST where a function can appear — the `Expr::Function` arm and the
+  table-source arms of `pre_visit_table_factor` (`TableFactor::Table` with
+  `args`, and `TableFactor::Function`, i.e. `FROM f(u.*)` /
+  `FROM LATERAL f(u.*)`), which carry their `FunctionArg`s in a different field;
+- a bare table name or alias used as a VALUE (PostgreSQL's whole-row composite
+  `SELECT u FROM users u`);
+- an alias COLUMN list on a protected relation (`users AS u (a, b, c)`), which
+  renames columns positionally — nyet does not know the real column order, so
+  which alias hides the protected column is unprovable;
+- any table in this engine's `*_VALUE_SAMPLING_CATALOGS` whenever the connection
+  has ANY rule. The list is **per dialect**, like `denied_prefixes`: a user table
+  named `column_stats` on SQLite is a table, not MariaDB's histogram catalog.
+
+**The root rule: classification is exhaustive, and "unknown" is not "absent".**
+Three review rounds produced five separate bypasses — `FROM ONLY t`,
+`FROM ONLY (t)`, `SetExpr::Table`, a parenthesised join, `f(t.*)` in table-source
+position — and every one of them was the SAME defect: `push_factor` silently
+ignored a shape it did not understand, `PiiScope` came out empty, and an empty
+scope reads as "no protected relation here", which switches net A off wholesale
+(columns, wildcards, USING/NATURAL, whole-row and the catalog denylist at once).
+Two changes close the class rather than the instances:
+
+1. `push_factor` matches `TableFactor` **exhaustively — no `_` arm**. A new
+   variant in a future sqlparser breaks the BUILD instead of quietly reopening
+   the hole. Each variant lands in exactly one of three buckets:
+   - **named relation** (`Table`, once `relation_name` has resolved it) ->
+     a `ScannedRelation`, whose columns net A can judge;
+   - **wrapper** (`NestedJoin`, `Pivot`, `Unpivot`, `MatchRecognize`) -> recurse
+     into the factor it wraps; the alias is remembered as a prefix only;
+   - **opaque row source** (`Derived`, `Table` with `args` — i.e. a table
+     function, `TableFunction`, `Function`, `UNNEST`, `JsonTable`,
+     `OpenJsonTable`, `XmlTable`, `SemanticView`) -> only the alias is
+     remembered, as a resolvable prefix, NEVER as a protected handle. Their
+     columns come from their own body or arguments, which the rest of net A
+     judges; what a *server-side* opaque source returns is the documented view
+     limitation. Denying them outright would refuse `generate_series`,
+     `unnest`, `json_table` on every PII connection for no proven gain.
+2. `PiiScope` carries `unresolved` separately from an empty scope, and
+   `active()` is true for either. A factor nyet could not identify refuses the
+   statement (`PII_UNPROVABLE`) instead of reading as "nothing to protect".
+   **Honest note:** with sqlparser 0.62 and the three dialects nyet ships,
+   `unresolved` is currently unreachable — the only way `terminal_ident` fails
+   is `ObjectNamePart::Function`, which only the Snowflake dialect produces. It
+   is a guard for the next parser version, so no corpus case discriminates it
+   (unlike the eleven rules that do); the exhaustive match is what actually
+   holds the line today.
+
+**A qualified wildcard is judged GLOBALLY.** `SelectItem::Wildcard` (bare `*`)
+is judged against its own select's FROM, because that is what it expands. A
+QUALIFIED wildcard names its source itself, so it does not need the local scope
+— and using it was a bypass: a correlated sub-select has an EMPTY FROM, so
+`SELECT count(*) FROM users u, LATERAL (SELECT u.*) s WHERE s.email LIKE 'a%'`
+saw a local scope with nothing to protect while `u.*` copied every protected
+column of the OUTER `users u` into a derived table whose alias is (correctly)
+unprotected. The count form cleared BOTH nets — net B saw an `Expression` — and
+was a working character-by-character oracle, exactly the channel net A refuses
+`WHERE email LIKE` for. `check_function_args` already judged `f(t.*)` globally;
+the two are consistent now.
+
+**`relation_name` — one resolver, two disguises.** PostgreSQL's `FROM ONLY tbl`
+(do not descend into inheritance children) has no representation in sqlparser
+and arrives in two shapes, both of which the server runs as a plain read of
+`tbl`: `ONLY tbl` becomes a table called `ONLY` **aliased** `tbl`, and
+`ONLY (tbl)` becomes a **table function** called `ONLY` with `tbl` as its
+argument. The second one was a complete exfiltration on PostgreSQL — verified
+live, `SELECT most_common_vals FROM ONLY (pg_stats)` handed over the sampled
+values of the protected column. Both are undone in `relation_name`, the single
+function the scan AND the catalog denylist call, so the two can never again
+agree on different names.
+
+**Physical name vs alias.** A `ScannedRelation` stores the PHYSICAL table name
+separately from the alias; the alias becomes a handle only once the physical name
+is known to be protected. `FROM orders AS users` is therefore `orders`, whatever
+it is called locally. PostgreSQL's `FROM ONLY tbl` — which sqlparser lands as a
+table literally named `ONLY` with `tbl` as its alias, and which left the scope
+empty and net A off while the server ran the real query — is undone explicitly in
+`TableScan::push_factor` instead. The earlier "match on any of the names" fix
+closed `ONLY` too, but cost a false refusal on every alias that happened to spell
+a protected table name.
+
+**What over-denial is still deliberate.** A relation whose own name is a
+protected table's name is treated as that table, so a CTE or temp table called
+`users` is refused on a connection with `users.*` rules. The AST *does*
+distinguish them — `Query.with` carries every CTE's `alias.name` — so this is a
+cost decision, not an impossibility: dropping those names correctly needs
+LEXICAL scoping, and `PiiScope` is one flat scope for the whole statement. Both
+naive versions are fail-OPEN:
+
+- drop every CTE name -> `WITH users AS (SELECT * FROM users) SELECT * FROM users`
+  loses the real table too;
+- drop only CTE names whose body is clean ->
+  `SELECT email FROM users WHERE id IN (WITH users AS (SELECT 1 AS x) SELECT x FROM users)`
+  declares the CTE in a nested scope, so the name falls out of `handles`,
+  `active()` goes false and the OUTER read of the real `users` sails through.
+
+Real scoping costs more than this false refusal is worth. Documented in the
+README instead, with the working way out (rename the CTE — qualifying does not
+help, because the name is what the match keys on).
+
+**Scopes are flat for COLUMN names, local for wildcards.** An *unqualified*
+`email` is refused wherever it appears in a statement that reads a protected
+table: without the schema nyet cannot prove ownership, and `WHERE email LIKE
+'a%'` + `row_count` is a character-by-character oracle (over-denial is the only
+safe direction, UX-1). A *qualified* `o.email` is different — `PiiScope::
+prefix_is_safe` proves `o` names an unruled source, the same proof `o.*` already
+relied on. Keeping the strict rule there forbade a strict subset of what the
+wildcard rule allowed, while the data came back through `o.*` anyway. A wildcard
+likewise expands exactly one source, so it is judged against that select's own
+FROM — and `PiiScope::of_from` collects **only** the FROM's own sources (plus,
+recursively, the ones inside wrapping factors), never descending into derived
+bodies or the subqueries inside ON conditions: a visitor walk there refused
+`SELECT * FROM (SELECT id FROM users) t` with a message that was simply untrue.
+
+The same proof reaches derived tables: the alias of ANY source — including a
+subquery, a VALUES list or a table function — goes into `relations`, so
+`SELECT s.email FROM users u JOIN (SELECT contact AS email FROM signups) s ...`
+is allowed. A derived table's columns can only come from its own body, which
+net A judges separately, so the qualifier settles ownership exactly as it does
+for a real table. Aliases never enter `handles`, so an alias that shadows a
+protected table's name stays refused.
+
+**Net B — provenance, after execution and before output** (`validator::Origin` /
+`check_origins`). The engines translate the driver's `sqlx::ColumnOrigin` into
+the pure `Origin` enum on the same `ResultSet` that carries the columns; the cli
+judges. A `Table(t, c)` matching a rule is `PII_COLUMN`; an `Unknown` — or a
+column with no origin entry at all — is `PII_UNPROVABLE`; `Expression` passes.
+
+**Where net B lives, and why there.** In `main::Db::execute` — the ONE wrapper
+all three engines and every command go through to get rows. It used to be a call
+in the `query` branch, which is discipline, not a waist: `explain` never got it.
+A refusal now becomes `QueryOutcome::PiiRefused`, so the enum's exhaustive match
+forces every present and future caller to handle it. `explain` returns a plan
+and no `ResultSet`, so net A alone applies there (its plan names relations, which
+is schema-level — `nyet schema` exposes the same — never cell values).
+
+**What net B is honestly worth.** It is a wire-level cross-check: it sees what
+the server actually returned, which is how a divergence between nyet's parse and
+the server's becomes visible. On PostgreSQL and MySQL/MariaDB the driver reports
+a *view* as a view column's origin, so there it keys on the same names net A
+checks; on SQLite it additionally resolves a *bare* view column to its base
+table.
+
+`Expression` is accepted, and that is a documented LIMIT, not a proof. A
+computed column carries no provenance at all, so `contact || ''` over an
+unlisted view slips past net B even on SQLite, where the bare `contact` is
+caught — and, before net A learned about `SetExpr::Table`, so did every column
+of `SELECT NULL,... UNION ALL TABLE users` (a base table with rules, no view
+involved). Closing `Expression` WOULD have caught both. It was rejected on
+**cost**: it refuses every aggregate, every computed column and every set
+operation on every PII connection (UX-1), and it is not the root fix for either
+bypass — both live in net A and are fixed there. The boundary that holds for
+renaming layers is: list the view's own columns, and use column-level GRANTs.
+`tests/cli.rs::pii_view_limitation_is_pinned_in_both_directions` pins both sides
+so this cannot drift silently.
+
+### What the drivers actually report (measured, sqlx 0.9, July 2026)
+
+| engine | on the FETCH path | table naming | sees through a view? |
+|---|---|---|---|
+| SQLite (bundled) | full `Table(table, column)`, free | bare (`users`) | **yes** — `SELECT mail FROM v` reports `users.email` |
+| MySQL 8.4 / MariaDB 11.4 | full `Table(db.table, column)`, free; the table ALIAS is resolved to the real name | `db.table` (`test.users`) | **no** — reports the view (`test.v_users`, `contact`) |
+| PostgreSQL 16 | `Unknown` for real table columns, `Expression` for computed ones | — | — |
+
+PostgreSQL is the odd one: sqlx calls `resolve_statement_metadata` with
+`resolve_column_origin = false` on the `run`/fetch path, so the names are never
+looked up (`PgColumn::relation_id()`/`relation_attribute_no()` — the wire
+`RowDescription` oid+attnum — are always there, but the catalog lookup that turns
+them into names is skipped). **Fix taken:** when the connection has a PII policy,
+`Postgres::execute` calls `conn.prepare(sql)` once before the fetch. That path
+DOES resolve origins, and it caches both the origin names and the prepared
+statement on the connection, so the following fetch reuses the same PARSE and
+reports `Table(table, column)` — verified against postgres:16-alpine
+(`postgres_pii_policy_end_to_end` fails with `PII_UNPROVABLE` on
+`SELECT id FROM users` if the prepare is removed). Cost: one extra DESCRIBE round
+trip, paid ONLY by connections with a PII policy (`Postgres::resolve_column_origins`,
+set in `open_session`). The alternative — reading oid+attnum and querying
+`pg_attribute` ourselves — costs the same round trip and more code (Д5).
+PostgreSQL names the table search_path-relative (`users`, `s.t`, `v`), which is
+why matching ignores the schema qualifier.
+
+Because two of the three engines report a VIEW as the origin, **views are a
+documented limitation, not a bug**: a rule on `users.email` does not cover
+`v_users.contact`. Both container tests pin the current behavior in both
+directions (the view leaks under a base-table rule; listing the view closes it),
+so a driver change that starts resolving through views turns the test red rather
+than silently changing the guarantee.
+
+**Testing net B.** A deny-only e2e exists on SQLite
+(`pii_net_b_catches_a_renaming_view`). On PostgreSQL and MySQL none is known
+*today* — but "net A refuses everything net B would" is an observation about the
+current parser coverage, and it has been false twice. `FROM ONLY (users)` is the
+clean example: sqlparser read it as a table function, net A saw no relation at
+all, and on PostgreSQL the bare projection `SELECT email FROM ONLY (users)` was
+refused by **net B alone** — the driver reported the origin as `users.email`
+whatever the parser thought. That is exactly the divergence net B exists for
+(and exactly why an expression wrapper, which carries no origin, got through it
+until net A was fixed). What the container
+tests pin there is net B **liveness**: `SELECT id FROM users` must exit 0 on a
+PII connection, and if sqlx ever stops resolving origins the columns arrive as
+`Unknown` and that line turns into an exit-5 `PII_UNPROVABLE`. The judging logic
+itself is unit-tested (`net_b_judges_the_reported_provenance`).
+
+### Database errors are withheld
+
+`main::db_error_withheld`. PostgreSQL and MySQL quote the offending CELL VALUE in
+their messages (`invalid input syntax for type integer: "alice@example.com"`,
+`Incorrect string value: 'a@b.c' for function uuid_to_bin`) — an exfiltration
+channel of one cell per query that no filter on the RESULT can see, and one that
+does not need to name a protected column (route it through a view). On a
+connection with any PII rule, `EngineError::Db` is replaced wholesale before it
+reaches the envelope; `Connect` and `Timeout` messages are curated constants and
+are left alone. **No regex filtering** — that would be theatre (UX-7) and would
+fail the first time a driver phrases a message differently. The SQLSTATE class is
+not surfaced either: on its own it is not actionable enough to be worth a new
+envelope field (`nyet schema` answers the questions the message would have).
+Connections without a PII policy are byte-for-byte unchanged, verbatim error
+included (pinned by `without_a_pii_section_nothing_changes`).
+
+`nyet doctor` never goes through `run_db`/`engine_failure`, so
+`main::redact_diagnosis` applies the same rule to the facts it collected: the
+write PROBE runs a statement against real data, so its `detail` is replaced,
+while the VERDICTS stay intact (which check failed and whether the role is
+read-only is diagnosis, not data). `ConnectFact::Failed` is deliberately left
+verbatim — symmetric with `engine_failure`, which also passes
+`EngineError::Connect` through: a refused handshake happens before any row
+exists and cannot quote a cell, and telling the human why the connection is
+broken is doctor's entire job. The four independently derived
+`redact_db_errors` locals that let doctor slip through are now one accessor,
+`Session::redact_db_errors`.
+
+Measured while choosing the leak-guard fixtures: PostgreSQL echoes the value on
+any failed input conversion; MySQL 8.4 echoes it from `UUID_TO_BIN` (error 1411);
+MariaDB 11.4 in its default `sql_mode` downgrades most cast failures to warnings,
+so its e2e asserts the redaction itself (the raw text must not appear) rather
+than a value echo.
+
+### Audit and the pipeline point
+
+`Event.sql` keeps the RAW agent text even under a PII policy: the log is
+forensics for the HUMAN, the file is 0600, and the point of the record is showing
+what the agent TRIED — including the query that was refused for naming a
+protected column. `Event.response` (only under `[audit] log_responses`) is built
+from the `ResultSet` AFTER both nets have passed, so it can only ever hold rows
+the agent also received; a refusal logs `verdict: "refused"`, `reason:
+"PII_COLUMN"` and no response at all (`pii_refusals_are_audited_without_the_data`).
+
+### Module edges
+
+`PiiRules` holds ONE piece of state, the `(table, column)` pair set; "which
+tables are protected" and "is this scope active" are derived on the fly, because
+a cached copy is exactly what a later edit desynchronizes into a fail-OPEN net A.
+`PiiRules::parse` rejects anything that could never match an identifier (a
+comma-separated list crammed into one entry, a stray quote): a rule that is
+accepted but can never fire leaves the config owner believing a column is
+protected while every query returns it — silently worse than a rejected rule. A
+fully double-quoted part is taken verbatim (`"users"."e-mail"`), so a name that
+cannot be written bare is protectable at all; matching stays case-insensitive
+there too (over-matching, the safe direction).
+
+`PiiRules`, `Origin`, `Refusal` and `check_origins` live in `validator.rs` — still pure,
+still sqlparser + std only. `engine.rs` imports `validator::Origin` to translate
+`sqlx::ColumnOrigin`; that is one more leaf→leaf edge of the same kind as
+`engine -> guardrail` and `engine -> output` (the stable pure type is defined
+once, the IO adapter fills it in). `config.rs` calls `validator::PiiRules::parse`
+from `config::pii` — the same single-entry-point pattern as `config::guardrail`:
+called at parse time so a malformed rule is a loud exit 3, and again by the cli
+to get the value. No new dependency (Д8).
+
+### PostgreSQL `*_to_xml` — a function-denylist hole, wider than PII
+
+Found while reviewing PII-1, but **not a PII defect**: it predates this step and
+applies to every connection, policy or not. Fourteen `pg_catalog` functions —
+`query_to_xml`, `table_to_xml`, `schema_to_xml`, `database_to_xml`,
+`cursor_to_xml` plus their `*_to_xmlschema` / `*_to_xml_and_xmlschema` variants
+— are built in, need no extension, and are callable by a plain `GRANT SELECT`
+role. Two separate powers:
+
+- `query_to_xml('<sql>', ...)` **executes a SQL string sqlparser never sees**,
+  which re-enables the entire function denylist: measured,
+  `query_to_xml('select pg_sleep(3)', ...)` slept 2985 ms and exited 0 while
+  `pg_sleep` itself is denied. (Layer 2 still holds — `nextval` inside the
+  string is refused by the read-only transaction.) Same class as `dblink`.
+- `table_/schema_/database_/cursor_to_xml` dump a whole relation, schema or
+  database **without naming a column**, so net A has nothing to match and net B
+  sees an `Expression`.
+
+Fixed by ENUMERATING all fourteen in `POSTGRES_DENIED_FUNCTIONS` rather than by
+a substring match on `_to_xml`: it reuses the existing mechanism (the family
+shares a SUFFIX, and `denied_prefixes` cannot express that), the family has been
+closed since PostgreSQL 8.3, and enumeration keeps `validator.allow_functions`
+as the documented escape hatch — the same trade already made for `pg_sleep`. A
+substring matcher would be a second, non-tunable mechanism for one family.
+
+**Are there other built-ins that execute a SQL string?** Reviewed: no. `dblink*`
+(prefix-denied) and this family are the only ones. `pg_get_viewdef` /
+`pg_get_functiondef` / `pg_get_expr` return DDL TEXT without executing it;
+`xpath`/`xmltable` take XML, not SQL; `format()` cannot execute; `EXECUTE`,
+`DO` and `CALL` are statements, refused by the top-level allowlist. MySQL's
+`PREPARE`/`EXECUTE` are likewise statements, and SQLite has no equivalent — so
+the fix is PostgreSQL-only.
+
 ## Validator corpus (Д6)
 
 `tests/corpus/*.yaml` is the public specification of what the validator
@@ -1266,15 +1627,19 @@ Rules: one case per `- query:` line (single-line queries only — semicolons
 are fine, block scalars are not supported); `verdict` is `allow` or `deny`;
 `deny` requires `reason` (one of `PARSE_FAILED`, `MULTI_STATEMENT`,
 `WRITE_OPERATION`, `TXN_CONTROL`, `LOCKING_CLAUSE`, `DENIED_FUNCTION`,
-`EXECUTABLE_COMMENT`, `EXPLAIN_ANALYZE`);
+`EXECUTABLE_COMMENT`, `EXPLAIN_ANALYZE`, `PII_COLUMN`);
 optional `warnings` on an allow case is the comma-joined list of expected
 warning codes (currently only `UNICODE_STRIPPED`) — allow cases without it
 must produce none, deny cases never carry warnings; optional `dialect`
 defaults from the **filename prefix** — `postgres_*.yaml` runs the PostgreSQL
 dialect + `Policy::postgres`, `mysql_*.yaml` the MySQL dialect + `Policy::mysql`
 (MariaDB is dialect-identical), everything else SQLite + `Policy::sqlite` — and a
-per-case `dialect: postgres|mysql|sqlite` still overrides. Unknown lines fail the run
-loudly. The runner (`validator::tests::golden_corpus`) reads every `*.yaml` in
+per-case `dialect: postgres|mysql|sqlite` still overrides. A `pii:` line placed
+BEFORE the first `- query:` sets the file-wide PII policy (comma-separated
+`table.column` rules, exactly what `[connections.X.pii] columns` holds), and a
+per-case `pii:` overrides it — `pii: none` turns it off for one case, so a file
+can pin both sides of the same query. Absent everywhere = no PII policy.
+Unknown lines fail the run loudly. The runner (`validator::tests::golden_corpus`) reads every `*.yaml` in
 the directory, so adding a case is: append it to a fitting file (or add a new
 file), run `cargo test golden_corpus`. The corpus runs with the default policy
 (`Policy::sqlite(&[], &[])` / `Policy::postgres(&[], &[])`); config-tuned policies are
@@ -1542,7 +1907,7 @@ config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
 |---|---|---|
 | `CONFIG_INVALID` | 3 | config not found / unreadable / bad TOML / unknown key / missing `${VAR}` / unknown alias / sqlite without `path` / unsupported `[defaults].format` / zero `row_limit`/`timeout_secs`. One code for the whole class — deliberate; details live in `message`. |
 | `DIR_NOT_ALLOWED` | 4 | alias exists but cwd is outside its `allowed_dirs` |
-| `NYET` | 5 | query refused by the validator; `error.reason` from the closed list `PARSE_FAILED` / `MULTI_STATEMENT` / `WRITE_OPERATION` / `TXN_CONTROL` / `LOCKING_CLAUSE` / `DENIED_FUNCTION` / `EXECUTABLE_COMMENT` / `EXPLAIN_ANALYZE` (owner: `src/validator.rs`) — **plus `EXPENSIVE_QUERY`, whose owner is NOT the validator** but the guardrail (`src/guardrail.rs` decides, `src/main.rs` builds the failure): the plan estimate was over the connection's threshold — or planning itself outran the guardrail's budget — so nothing ran. The threshold case is the only envelope with a top-level `estimate` object (append-only field); the budget case has no plan to attach |
+| `NYET` | 5 | query refused by the validator; `error.reason` from the closed list `PARSE_FAILED` / `MULTI_STATEMENT` / `WRITE_OPERATION` / `TXN_CONTROL` / `LOCKING_CLAUSE` / `DENIED_FUNCTION` / `EXECUTABLE_COMMENT` / `EXPLAIN_ANALYZE` / `PII_COLUMN` / `PII_UNPROVABLE` (owner: `src/validator.rs`; the two PII reasons are produced by both the pre-execution AST walk and the post-execution provenance check `validator::check_origins`, which the cli calls — see the PII section) — **plus `EXPENSIVE_QUERY`, whose owner is NOT the validator** but the guardrail (`src/guardrail.rs` decides, `src/main.rs` builds the failure): the plan estimate was over the connection's threshold — or planning itself outran the guardrail's budget — so nothing ran. The threshold case is the only envelope with a top-level `estimate` object (append-only field); the budget case has no plan to attach |
 | `CONNECTION_FAILED` | 6 | database unreachable (sqlite: file missing / unreadable / a directory; postgres/mysql: refused, auth failure, or a hung TCP handshake that exceeds the connect deadline — bounded separately inside each engine so a blackholed connect is 6, not 8) |
 | `DB_ERROR` | 7 | the database accepted the connection but rejected the query |
 | `TIMEOUT` | 8 | query did not finish within the per-query timeout (the future is dropped; a stuck sqlite worker may run until process exit). Postgres: the server `statement_timeout` (SQLSTATE 57014) maps here too, so the exit code is deterministic whichever timer fires; 57014 is `query_canceled` generally, so a manual `pg_cancel_backend` from another session also lands as TIMEOUT (rare, acceptable). MySQL/MariaDB: the server `max_execution_time`/`max_statement_time` (error 3024 / 1969) maps here too |

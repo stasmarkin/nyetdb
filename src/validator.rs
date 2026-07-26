@@ -8,7 +8,9 @@
 //! locking clauses, function denylist).
 
 use sqlparser::ast::{
-    Expr, ObjectName, Query, Select, Statement, TableFactor, UtilityOption, Visit, Visitor,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, JoinConstraint, JoinOperator,
+    ObjectName, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+    TableAlias, TableFactor, TableFunctionArgs, TableWithJoins, UtilityOption, Visit, Visitor,
 };
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -29,6 +31,14 @@ pub enum DenyReason {
     DeniedFunction,
     ExecutableComment,
     ExplainAnalyze,
+    /// A column the connection's `[pii]` policy protects would be exposed —
+    /// proven either by NAME before execution (net A) or by the driver's column
+    /// PROVENANCE after execution (net B).
+    PiiColumn,
+    /// The result carries a column whose origin the database would not state,
+    /// on a connection that protects columns as PII: nyet cannot prove the
+    /// value is not protected data, so it refuses (fail closed).
+    PiiUnprovable,
 }
 
 impl DenyReason {
@@ -42,6 +52,8 @@ impl DenyReason {
             DenyReason::DeniedFunction => "DENIED_FUNCTION",
             DenyReason::ExecutableComment => "EXECUTABLE_COMMENT",
             DenyReason::ExplainAnalyze => "EXPLAIN_ANALYZE",
+            DenyReason::PiiColumn => "PII_COLUMN",
+            DenyReason::PiiUnprovable => "PII_UNPROVABLE",
         }
     }
 }
@@ -94,6 +106,233 @@ pub struct Policy {
     /// (e.g. the `dblink*` and `pg_read_*` families, DESIGN §3 п.7) — fail
     /// closed on functions we did not enumerate by exact name.
     denied_prefixes: &'static [&'static str],
+    /// Catalogs of THIS engine that publish sampled data values (see
+    /// `*_VALUE_SAMPLING_CATALOGS`). Per-dialect like `denied_prefixes`: a
+    /// user table that merely shares a name with another engine's catalog is
+    /// not a catalog (finding 10).
+    value_sampling_catalogs: &'static [&'static str],
+    /// `[connections.X.pii] columns` — empty by default, so a connection
+    /// without the section behaves byte for byte as before (UX-5).
+    pii: PiiRules,
+}
+
+/// The connection's PII policy: which `table.column` pairs the config owner
+/// marked as personal data. Pure value object — the strings arrive from the
+/// config, the validator only matches names against them.
+///
+/// **Matching is case-insensitive and ignores any schema qualifier**: a rule
+/// may be written `schema.table.column` for readability, but only the
+/// `table.column` tail is compared (against the terminal component of whatever
+/// the query or the driver names). Both choices widen the deny surface, which
+/// is the only safe direction here — Postgres folds unquoted identifiers to
+/// lower case, MySQL's table-name case sensitivity is platform-dependent, and
+/// the same physical table can be reached under several qualifications.
+#[derive(Debug, Clone, Default)]
+pub struct PiiRules {
+    /// Lowercased (bare table, column) pairs — the ONE piece of state. Every
+    /// other view of the policy (which tables are protected, which columns of a
+    /// given table) is derived on the fly: a second, cached copy is exactly the
+    /// kind of state a later edit desynchronizes into a fail-OPEN net A.
+    pairs: BTreeSet<(String, String)>,
+}
+
+impl PiiRules {
+    /// Parse `["users.email", "app.users.phone"]`. Fail loud (Д3) on anything
+    /// that is not `table.column` / `schema.table.column` **or that cannot
+    /// possibly match an identifier**: a rule nyet accepts but can never match
+    /// is worse than a rejected one — the config owner believes the column is
+    /// protected while every query returns it (finding 7).
+    pub fn parse(rules: &[String]) -> Result<PiiRules, String> {
+        let mut out = PiiRules::default();
+        for raw in rules {
+            let parts: Vec<&str> = raw.split('.').map(str::trim).collect();
+            let bad = |why: &str| {
+                Err(format!(
+                    "\"{raw}\" is not a valid PII rule ({why}): write \"table.column\" \
+                     (or \"schema.table.column\"), one column per list entry — plain \
+                     identifiers, or double-quoted ones for a name that needs it \
+                     (\"users\".\"e-mail\")"
+                ))
+            };
+            if !matches!(parts.len(), 2 | 3) {
+                return bad("expected 2 or 3 dot-separated parts");
+            }
+            let mut names = Vec::with_capacity(parts.len());
+            for part in &parts {
+                match unquote(part) {
+                    // A fully double-quoted part is taken verbatim, so a name
+                    // that NEEDS quotes ("e-mail", "user data") can be protected
+                    // at all — and `"users"."email"`, the way psql/pg_dump print
+                    // identifiers, becomes a working rule.
+                    Some("") => return bad("empty quoted name component"),
+                    Some(inner) => names.push(inner.to_lowercase()),
+                    None => {
+                        if part.is_empty() {
+                            return bad("empty name component");
+                        }
+                        // Otherwise: identifier characters only. This is what
+                        // rejects a whole list crammed into one string
+                        // ("users.email, users.phone" — one forgotten comma),
+                        // which used to be accepted and could never match.
+                        if let Some(c) = part.chars().find(|c| !is_identifier_char(*c)) {
+                            return bad(&format!("{c:?} is not valid in an identifier"));
+                        }
+                        names.push(part.to_lowercase());
+                    }
+                }
+            }
+            let column = names.pop().unwrap_or_default();
+            let table = names.pop().unwrap_or_default();
+            out.pairs.insert((table, column));
+        }
+        Ok(out)
+    }
+
+    /// No rules = no PII policy on this connection (the historical behavior).
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Does this policy protect `column` of `table`? Both may be qualified
+    /// (`app.users`, `test.users`, `public.users`) — only the terminal
+    /// component is compared, see the type doc.
+    /// (The AST and the drivers both hand over the identifier VALUE without its
+    /// quotes, so a quoted rule matches the same way an unquoted one does.)
+    pub fn protects(&self, table: &str, column: &str) -> bool {
+        self.pairs
+            .contains(&(bare_name(table).to_lowercase(), column.to_lowercase()))
+    }
+
+    /// Is `table` (already lowercased and bare) protected at all?
+    fn protects_table(&self, table: &str) -> bool {
+        self.pairs.iter().any(|(t, _)| t == table)
+    }
+}
+
+/// The inside of a fully double-quoted part (`"e-mail"` -> `e-mail`), or None
+/// when the part is not quoted at all. A part that only opens or only closes a
+/// quote — or holds one in the middle — is neither, and fails validation below.
+/// A quoted name is still matched case-insensitively like every other rule
+/// (over-matching is the safe direction; documented).
+fn unquote(part: &str) -> Option<&str> {
+    let inner = part.strip_prefix('"')?.strip_suffix('"')?;
+    (!inner.contains('"')).then_some(inner)
+}
+
+/// What may appear in an unquoted SQL identifier. `is_alphanumeric` covers
+/// non-ASCII letters and digits, which PostgreSQL and MySQL both accept.
+fn is_identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// The terminal component of a possibly-qualified name (`s.t` -> `t`).
+fn bare_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Catalog objects of THIS engine that publish **sampled DATA VALUES**, not just
+/// statistics shapes: reading them hands out the very cells a PII rule protects,
+/// without ever naming the protected column. Denied wholesale on any connection
+/// that has at least one PII rule (name-matched on the terminal component, so
+/// the schema-qualified spellings — `pg_catalog.pg_stats`,
+/// `information_schema.column_statistics` — are covered too).
+///
+/// PostgreSQL: `pg_stats` / `pg_stats_ext` / `pg_stats_ext_exprs` expose
+/// `most_common_vals` and `histogram_bounds` (literal column values);
+/// `pg_statistic` / `pg_statistic_ext_data` are the raw tables behind them.
+const POSTGRES_VALUE_SAMPLING_CATALOGS: &[&str] = &[
+    "pg_stats",
+    "pg_stats_ext",
+    "pg_stats_ext_exprs",
+    "pg_statistic",
+    "pg_statistic_ext_data",
+];
+
+/// MySQL `information_schema.column_statistics` carries histogram buckets of
+/// real values; MariaDB's `mysql.column_stats` carries `min_value`/`max_value`.
+const MYSQL_VALUE_SAMPLING_CATALOGS: &[&str] = &["column_statistics", "column_stats"];
+
+/// `sqlite_stat3`/`sqlite_stat4` store sampled index-key values.
+/// `sqlite_stat1` holds only row counts, so it is deliberately NOT here.
+const SQLITE_VALUE_SAMPLING_CATALOGS: &[&str] = &["sqlite_stat3", "sqlite_stat4"];
+
+/// Where one column of a RESULT SET came from, as the driver reported it on the
+/// wire (net B). Mirrors `sqlx::ColumnOrigin` without depending on sqlx: the
+/// engines translate, this pure module judges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// The driver named the table and the original column.
+    Table { table: String, column: String },
+    /// The driver stated the value is computed, not a stored column.
+    Expression,
+    /// The driver would not say. Undetermined -> refused (fail closed).
+    Unknown,
+}
+
+/// A refusal without the Allow half of `Verdict` — what a check that can only
+/// ever refuse returns. Keeps the caller free of an unreachable Allow arm.
+#[derive(Debug)]
+pub struct Refusal {
+    pub reason: DenyReason,
+    pub message: String,
+    pub hint: String,
+}
+
+/// Net B: judge the RESULT of an executed query by the provenance the driver
+/// reported, before a single row reaches the agent.
+///
+/// `columns` are the result column labels (agent-chosen names, safe to echo); a
+/// column with no reported origin at all counts as `Unknown`. **No cell value is
+/// ever read here.**
+///
+/// **What this net is and is not.** It is a wire-level cross-check on what the
+/// database actually returned. `Expression` is accepted, and that is a
+/// deliberate, documented LIMIT — not a proof that the value is clean. An
+/// expression carries no provenance at all, so a computed column over an
+/// unlisted view (`contact || ''`) is invisible here even on SQLite, where the
+/// bare `contact` IS caught. Refusing every `Expression` would close that, and
+/// was rejected on cost, not on principle: it would refuse every aggregate,
+/// every computed column and every set operation on every PII connection
+/// (UX-1), and it is not the root fix for any known bypass — those live in net
+/// A and are fixed there. The boundary that holds for renaming layers is:
+/// list the view's own columns in the policy, and use column-level GRANTs
+/// (README).
+pub fn check_origins(rules: &PiiRules, columns: &[String], origins: &[Origin]) -> Option<Refusal> {
+    if rules.is_empty() {
+        return None;
+    }
+    for (i, label) in columns.iter().enumerate() {
+        match origins.get(i).unwrap_or(&Origin::Unknown) {
+            Origin::Expression => {}
+            Origin::Table { table, column } => {
+                if rules.protects(table, column) {
+                    return Some(Refusal {
+                        reason: DenyReason::PiiColumn,
+                        message: format!(
+                            "nyet: result column '{label}' resolves to '{}.{column}', which \
+                             this connection's PII policy protects — the query reached it \
+                             indirectly (through a view or a renaming layer), so nothing was \
+                             returned",
+                            bare_name(table)
+                        ),
+                        hint: pii_hint(),
+                    });
+                }
+            }
+            Origin::Unknown => {
+                return Some(Refusal {
+                    reason: DenyReason::PiiUnprovable,
+                    message: format!(
+                        "nyet: the database would not say where result column '{label}' comes \
+                         from, and this connection protects some columns as PII — nyet cannot \
+                         prove the value is not protected data"
+                    ),
+                    hint: pii_hint(),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Built-in SQLite denylist (rationale in docs/DEV.md). All defense in
@@ -133,6 +372,36 @@ const POSTGRES_DENIED_FUNCTIONS: &[&str] = &[
     "pg_logical_emit_message",
     "lo_import", // reads a server file into a large object
     "lo_export", // writes a large object to a server file
+    // The `*_to_xml` family (built into pg_catalog since 8.3, no extension, no
+    // DBA, available to a plain SELECT-only role). Two separate powers, both
+    // fatal to layer 1:
+    //   - `query_to_xml*` EXECUTES a SQL string the parser never sees, so it
+    //     re-enables everything the validator refuses — verified:
+    //     `query_to_xml('select pg_sleep(3)', ...)` slept 3s while `pg_sleep`
+    //     itself is denied. Same class as `dblink`, only built in.
+    //   - `table_to_xml*` / `schema_to_xml*` / `database_to_xml*` /
+    //     `cursor_to_xml*` dump a whole relation, schema or database WITHOUT
+    //     naming a single column, so net A has nothing to match and net B sees
+    //     an `Expression`.
+    // ENUMERATED rather than matched by substring: it reuses the existing
+    // mechanism (prefixes cannot express a shared SUFFIX), the family has been
+    // closed since 8.3, and enumeration keeps `validator.allow_functions` as
+    // the documented escape hatch for someone who really wants `table_to_xml`
+    // on a connection with no PII.
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "table_to_xml",
+    "table_to_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "schema_to_xml",
+    "schema_to_xmlschema",
+    "schema_to_xml_and_xmlschema",
+    "database_to_xml",
+    "database_to_xmlschema",
+    "database_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
 ];
 
 /// Prefix-matched denied families — fail closed on members we did not
@@ -181,6 +450,8 @@ impl Policy {
                 deny_functions,
             ),
             denied_prefixes: &[],
+            value_sampling_catalogs: SQLITE_VALUE_SAMPLING_CATALOGS,
+            pii: PiiRules::default(),
         }
     }
 
@@ -195,6 +466,8 @@ impl Policy {
                 deny_functions,
             ),
             denied_prefixes: POSTGRES_DENIED_PREFIXES,
+            value_sampling_catalogs: POSTGRES_VALUE_SAMPLING_CATALOGS,
+            pii: PiiRules::default(),
         }
     }
 
@@ -211,7 +484,24 @@ impl Policy {
                 deny_functions,
             ),
             denied_prefixes: &[],
+            value_sampling_catalogs: MYSQL_VALUE_SAMPLING_CATALOGS,
+            pii: PiiRules::default(),
         }
+    }
+
+    /// Attach the connection's PII policy (`[connections.X.pii] columns`).
+    /// A builder step rather than a fourth constructor argument: a connection
+    /// without the section keeps the default empty policy and every existing
+    /// call site — and behavior — unchanged (UX-5).
+    pub fn with_pii(mut self, pii: PiiRules) -> Policy {
+        self.pii = pii;
+        self
+    }
+
+    /// The connection's PII policy, for net B (`check_origins`) and for the
+    /// database-error redaction the cli applies when it is non-empty.
+    pub fn pii(&self) -> &PiiRules {
+        &self.pii
     }
 }
 
@@ -449,7 +739,23 @@ pub fn validate(sql: &str, policy: &Policy) -> Verdict {
     // Insert/Update/Delete/Merge, whose inner Statement is visited too) —
     // plus every Query (locking clauses, SELECT INTO) and every expression
     // (function denylist).
-    let mut checker = Checker { policy };
+    // Net A needs to know WHICH tables the statement touches before it can judge
+    // an unqualified column name, so the PII pass runs a cheap pre-scan of the
+    // table factors first (skipped entirely when the connection has no rules).
+    let pii = PiiScope::of(&policy.pii, &stmt);
+    // An alias COLUMN list renames a protected table's columns positionally
+    // (`users AS u (a, b, c)`); nyet does not know the real column order, so
+    // which alias hides the protected column is unprovable — refuse (finding 4).
+    if pii.alias_columns {
+        return pii_alias_columns_deny();
+    }
+    // A table source nyet could not classify at all: it may well be the
+    // protected table under a spelling the parser renders differently — every
+    // bypass found so far was exactly that.
+    if pii.unresolved {
+        return pii_unresolved_source_deny();
+    }
+    let mut checker = Checker { policy, pii };
     if let ControlFlow::Break(v) = stmt.visit(&mut checker) {
         return *v;
     }
@@ -474,6 +780,323 @@ pub fn validate(sql: &str, policy: &Policy) -> Verdict {
 
 struct Checker<'a> {
     policy: &'a Policy,
+    pii: PiiScope,
+}
+
+/// What the PII policy means for THIS statement (net A), computed from a
+/// pre-scan of every table factor in scope.
+///
+/// Scopes are deliberately NOT tracked per sub-select for COLUMN names: every
+/// protected table anywhere in the statement contributes to one flat set, so an
+/// unqualified `email` is refused wherever it appears. Without the database's
+/// schema nyet cannot prove which relation an unqualified name belongs to, and a
+/// `WHERE email LIKE 'a%'` oracle leaks the value one character at a time —
+/// over-denial is the only safe direction (UX-1). Wildcards are the exception:
+/// `*` expands exactly ONE source, so it is judged against a scope built from
+/// that select's own FROM (finding 9).
+#[derive(Default)]
+struct PiiScope {
+    /// Lowercased protected column names of the protected tables in scope.
+    columns: BTreeSet<String>,
+    /// Lowercased names that stand for a protected relation here: the table
+    /// names AND their aliases (`FROM users u` -> "users", "u").
+    handles: BTreeSet<String>,
+    /// Every relation name/alias in scope, protected or not — lets a qualified
+    /// wildcard prefix be told apart from an unresolvable one (fail closed).
+    relations: BTreeSet<String>,
+    /// A protected relation carried an alias COLUMN list (`users AS u (a,b,c)`),
+    /// which renames its columns positionally. nyet does not know the table's
+    /// real column order, so the rename is unprovable -> refuse (finding 4).
+    alias_columns: bool,
+    /// nyet could not classify a table factor. Deliberately distinct from "no
+    /// protected relation in scope": that is the same empty scope, and it means
+    /// the opposite.
+    unresolved: bool,
+}
+
+impl PiiScope {
+    /// The scope of a whole statement.
+    fn of(rules: &PiiRules, stmt: &Statement) -> PiiScope {
+        PiiScope::build(rules, |scan| {
+            // TableScan never breaks, so the ControlFlow is Continue by construction.
+            let _ = stmt.visit(scan);
+        })
+    }
+
+    /// The scope of ONE select's FROM — what a wilddcard in that select actually
+    /// expands. Deliberately NOT a visitor walk: recursing would drag in the
+    /// bodies of derived tables and the subqueries inside ON conditions, whose
+    /// columns this wildcard cannot reach (those are judged by their own
+    /// `pre_visit_select` and by the flat column scope).
+    fn of_from(rules: &PiiRules, from: &[TableWithJoins]) -> PiiScope {
+        PiiScope::build(rules, |scan| scan.push_sources(from))
+    }
+
+    fn build(rules: &PiiRules, walk: impl FnOnce(&mut TableScan)) -> PiiScope {
+        let mut scope = PiiScope::default();
+        if rules.is_empty() {
+            return scope;
+        }
+        let mut scan = TableScan::default();
+        walk(&mut scan);
+        scope.unresolved = scan.unresolved;
+        // An opaque source's alias resolves a qualifier without ever making it
+        // protected: `s.email` over `(SELECT ...) s` provably is not the
+        // protected table's column, because a derived table's columns can only
+        // come from its own body — which net A judges on its own.
+        scope.relations.extend(scan.opaque_aliases);
+        for relation in scan.relations {
+            scope.relations.insert(relation.table.clone());
+            scope.relations.extend(relation.alias.iter().cloned());
+            if !rules.protects_table(&relation.table) {
+                continue;
+            }
+            scope.columns.extend(
+                rules
+                    .pairs
+                    .iter()
+                    .filter(|(t, _)| *t == relation.table)
+                    .map(|(_, c)| c.clone()),
+            );
+            // The alias becomes a handle only once the PHYSICAL table is known
+            // to be protected: `FROM orders AS users` is orders, whatever it is
+            // called here.
+            scope.handles.insert(relation.table);
+            scope.handles.extend(relation.alias);
+            scope.alias_columns |= relation.alias_columns;
+        }
+        scope
+    }
+
+    /// True when at least one protected relation is in scope — or when a source
+    /// could not be classified at all, which is NOT the same thing and must not
+    /// read as "nothing to protect here".
+    fn active(&self) -> bool {
+        !self.handles.is_empty() || self.unresolved
+    }
+
+    /// Can `prefix` (of `prefix.*` or `prefix.col`) be shown to name a
+    /// NON-protected source? Unknown prefixes fail closed while a protected
+    /// relation is in scope.
+    fn prefix_is_safe(&self, prefix: &str) -> bool {
+        !self.handles.contains(prefix) && self.relations.contains(prefix)
+    }
+}
+
+/// One relation in a FROM clause: its PHYSICAL name (the terminal component of
+/// the parsed table name), the alias it also answers to here, and whether that
+/// alias renamed its columns.
+struct ScannedRelation {
+    table: String,
+    alias: Option<String>,
+    alias_columns: bool,
+}
+
+/// Pre-pass: every plain table in scope. A `TableFactor::Table` carrying `args`
+/// is a function call, not a table, and is left to the function denylist.
+#[derive(Default)]
+struct TableScan {
+    relations: Vec<ScannedRelation>,
+    /// Aliases of sources that are not named relations (derived tables, table
+    /// functions, ...). They make a qualifier resolvable, never protected.
+    opaque_aliases: Vec<String>,
+    /// A factor nyet could not classify at all. Kept apart from "no protected
+    /// relation here": the two states used to be the same empty scope, and the
+    /// second one switches net A off.
+    unresolved: bool,
+}
+
+impl TableScan {
+    /// Classify ONE table factor. **Exhaustive on purpose** (no `_` arm): a
+    /// factor nyet silently ignored used to leave `PiiScope` empty, and an
+    /// empty scope means "no protected relation here", which switched net A off
+    /// wholesale — columns, wildcards, USING/NATURAL, whole-row and the catalog
+    /// denylist at once. Every bypass found across three review rounds
+    /// (`FROM ONLY t`, `FROM ONLY (t)`, `SetExpr::Table`, a parenthesised join)
+    /// was an instance of that one default. Without an `_` arm, a new
+    /// `TableFactor` in a future sqlparser breaks the BUILD instead of quietly
+    /// opening the hole again.
+    ///
+    /// Three outcomes, and nothing else:
+    /// - a NAMED relation -> `ScannedRelation` (its columns can be judged);
+    /// - a WRAPPER around another factor -> recurse (the inner one decides);
+    /// - an OPAQUE row source (derived table, table function, UNNEST, JSON/XML
+    ///   table) -> only its alias is remembered, as a resolvable prefix, never
+    ///   as a protected handle. Their columns come from their own body or
+    ///   arguments, which the rest of net A judges; what a *server-side* opaque
+    ///   source returns is the documented view limitation (README).
+    fn push_factor(&mut self, table_factor: &TableFactor) {
+        match table_factor {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => match relation_name(name, args.as_ref(), alias.as_ref()) {
+                Some(table) => self.relations.push(ScannedRelation {
+                    alias: alias.as_ref().map(|a| a.name.value.to_lowercase()),
+                    table,
+                    alias_columns: alias.as_ref().is_some_and(|a| !a.columns.is_empty()),
+                }),
+                // A real table function: opaque, like a derived table.
+                None if args.is_some() => self.push_opaque(alias.as_ref()),
+                // A plain table whose NAME could not be read. That is the one
+                // "cannot classify" left, and it fails closed.
+                None => self.unresolved = true,
+            },
+            // Wrappers: the relation is one level in. `push_sources` recurses
+            // for the local (wildcard) scope; the visitor reaches them too, so
+            // the global scope sees them either way.
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                self.push_opaque(alias.as_ref());
+                self.push_sources(std::slice::from_ref(&**table_with_joins));
+            }
+            TableFactor::Pivot { table, alias, .. }
+            | TableFactor::Unpivot { table, alias, .. }
+            | TableFactor::MatchRecognize { table, alias, .. } => {
+                self.push_opaque(alias.as_ref());
+                self.push_factor(table);
+            }
+            // Opaque row sources. Their alias is a resolvable prefix (so
+            // `s.email` over a derived table is provably not the protected
+            // table's column) but never a handle.
+            TableFactor::Derived { alias, .. }
+            | TableFactor::TableFunction { alias, .. }
+            | TableFactor::Function { alias, .. }
+            | TableFactor::UNNEST { alias, .. }
+            | TableFactor::JsonTable { alias, .. }
+            | TableFactor::OpenJsonTable { alias, .. }
+            | TableFactor::XmlTable { alias, .. }
+            | TableFactor::SemanticView { alias, .. } => self.push_opaque(alias.as_ref()),
+        }
+    }
+
+    /// A source with no name nyet can reason about: remember the alias only.
+    fn push_opaque(&mut self, alias: Option<&TableAlias>) {
+        if let Some(alias) = alias {
+            self.opaque_aliases.push(alias.name.value.to_lowercase());
+        }
+    }
+
+    /// The sources of a FROM clause and nothing below them: the joined
+    /// relations plus, recursively, the ones inside wrapping factors.
+    fn push_sources(&mut self, from: &[TableWithJoins]) {
+        for item in from {
+            for factor in
+                std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation))
+            {
+                self.push_factor(factor);
+            }
+        }
+    }
+}
+
+/// The physical relation a `TableFactor::Table` names, lowercased and bare.
+/// `None` = this is a table FUNCTION, not a named relation.
+///
+/// PostgreSQL's `FROM ONLY tbl` (do not descend into inheritance children) has
+/// no representation in sqlparser, and it arrives in two disguises, both of
+/// which the server nonetheless runs as a plain read of `tbl`:
+/// `ONLY tbl` becomes a table called `ONLY` aliased `tbl`, and `ONLY (tbl)`
+/// becomes a *table function* called `ONLY` with `tbl` as its argument. Undo
+/// both here, in the one place every caller (the scan and the catalog denylist)
+/// resolves a name.
+fn relation_name(
+    name: &ObjectName,
+    args: Option<&TableFunctionArgs>,
+    alias: Option<&TableAlias>,
+) -> Option<String> {
+    let bare = terminal_ident(name)?.value.to_lowercase();
+    match args {
+        // `ONLY tbl`: the real relation landed in the ALIAS slot.
+        None if bare == "only" => Some(alias.map_or(bare, |a| a.name.value.to_lowercase())),
+        None => Some(bare),
+        Some(args) if bare == "only" => match args.args.as_slice() {
+            [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => match expr {
+                Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
+                Expr::CompoundIdentifier(parts) => Some(parts.last()?.value.to_lowercase()),
+                _ => None,
+            },
+            _ => None,
+        },
+        Some(_) => None,
+    }
+}
+
+impl Visitor for TableScan {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
+        self.push_factor(table_factor);
+        ControlFlow::Continue(())
+    }
+
+    /// `TABLE t` (a whole-relation read) keeps its name as a plain `String`
+    /// inside `SetExpr`, not as a `TableFactor` — invisible to the hook above
+    /// and to every other visitor hook.
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        for name in set_expr_tables(&query.body) {
+            self.relations.push(ScannedRelation {
+                table: name,
+                alias: None,
+                alias_columns: false,
+            });
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Every `TABLE <name>` reachable from a query body without going through a
+/// nested `Query` (those get their own `pre_visit_query`). Returns the terminal
+/// component, lowercased.
+fn set_expr_tables(body: &SetExpr) -> Vec<String> {
+    fn walk(body: &SetExpr, out: &mut Vec<String>) {
+        match body {
+            SetExpr::Table(table) => {
+                if let Some(name) = &table.table_name {
+                    out.push(bare_name(name).to_lowercase());
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(body, &mut out);
+    out
+}
+
+/// The join's column constraint, when it has one. The arms without a constraint
+/// (CROSS/OUTER APPLY, ClickHouse ARRAY JOIN) carry no column names at all.
+fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+    match op {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c)
+        | JoinOperator::AsOf { constraint: c, .. } => Some(c),
+        _ => None,
+    }
+}
+
+/// The terminal component of a (maybe qualified) object name — the thing the
+/// name actually refers to (`pg_catalog.pg_stats` -> `pg_stats`).
+fn terminal_ident(name: &ObjectName) -> Option<&Ident> {
+    name.0.last().and_then(|p| p.as_ident())
 }
 
 impl Visitor for Checker<'_> {
@@ -557,6 +1180,20 @@ impl Visitor for Checker<'_> {
     }
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        // `TABLE t` reads the WHOLE relation and hides its name in a plain
+        // String inside SetExpr, where no other hook reaches it. Judged here
+        // like the wildcard it is (`TABLE users` == `SELECT * FROM users`), and
+        // the statistics catalogs are closed on the same path.
+        if !self.policy.pii.is_empty() {
+            for name in set_expr_tables(&query.body) {
+                if self.policy.value_sampling_catalogs.contains(&name.as_str()) {
+                    return break_deny(pii_catalog_deny(&name));
+                }
+                if self.policy.pii.protects_table(&name) {
+                    return break_deny(pii_wildcard_deny());
+                }
+            }
+        }
         // DESIGN §3 п.6: SELECT ... FOR UPDATE / FOR SHARE takes row locks —
         // not a plain read. (Layer 2 would refuse it too; this error is
         // clearer.)
@@ -584,11 +1221,63 @@ impl Visitor for Checker<'_> {
                 "nyet is read-only; remove the data-modifying part and keep only the SELECT",
             ));
         }
+        if !self.policy.pii.is_empty() {
+            // A wildcard expands exactly ONE source, so it is judged against
+            // THIS select's own FROM — not the whole statement. Refusing
+            // `SELECT * FROM orders WHERE uid IN (SELECT id FROM users)` would
+            // be a false alarm: no protected column can come back (finding 9).
+            let local = PiiScope::of_from(&self.policy.pii, &select.from);
+            for item in &select.projection {
+                let refused = match item {
+                    SelectItem::Wildcard(_) => local.active(),
+                    // A QUALIFIED wildcard names its own source, so it is
+                    // judged against the WHOLE statement, not this select's
+                    // FROM. A correlated sub-select has an empty FROM, which
+                    // made the local scope read as "nothing to protect" while
+                    // `LATERAL (SELECT u.*)` copied every protected column of
+                    // the OUTER `users u` into a derived table — a working
+                    // count oracle that cleared both nets.
+                    SelectItem::QualifiedWildcard(kind, _) => match kind {
+                        SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                            !self.qualified_wildcard_is_safe(name, &self.pii)
+                        }
+                        // `expr.*` over something that is not a plain name:
+                        // nyet cannot resolve the source at all. (Unreachable
+                        // today — only BigQuery/Snowflake parse it — kept as a
+                        // fail-closed default.)
+                        SelectItemQualifiedWildcardKind::Expr(_) => self.pii.active(),
+                    },
+                    _ => false,
+                };
+                if refused {
+                    return break_deny(pii_wildcard_deny());
+                }
+            }
+            self.check_joins(&select.from, &local)?;
+        }
         ControlFlow::Continue(())
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        // Net A, applied to EVERY expression in the tree — projection, WHERE,
+        // JOIN ON, GROUP BY, HAVING, ORDER BY, subqueries and CTE bodies alike.
+        // A protected column is refused wherever it is mentioned, not only where
+        // it is returned: `WHERE email LIKE 'a%'` plus the row count is a
+        // character-by-character oracle over the very value being protected.
+        if self.pii.active() {
+            if let Some(verdict) = self.check_pii_expr(expr) {
+                return break_deny(verdict);
+            }
+        }
         if let Expr::Function(f) = expr {
+            // `f(t.*)` expands the whole row inside a call (PostgreSQL
+            // `json_agg(u.*)`), and it is a FunctionArgExpr — neither a
+            // SelectItem nor an Expr, so neither wildcard check above sees it
+            // (finding 5). A bare `*` argument is NOT this: `count(*)` counts
+            // rows without reading a column, and must keep working.
+            if let FunctionArguments::List(list) = &f.args {
+                self.check_function_args(&list.args)?;
+            }
             return self.check_function_name(&f.name);
         }
         ControlFlow::Continue(())
@@ -603,19 +1292,169 @@ impl Visitor for Checker<'_> {
     /// pre_visit_expr covers them. Plain table names (Table without args)
     /// never match by accident.
     fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        // Catalogs that publish sampled DATA VALUES are closed on any connection
+        // with a PII policy, whatever the query asks of them: they hand out the
+        // protected cells without ever naming the protected column.
+        if !self.policy.pii.is_empty() {
+            if let TableFactor::Table {
+                name, args, alias, ..
+            } = table_factor
+            {
+                // Resolved the same way the scan resolves it, so `ONLY (pg_stats)`
+                // cannot slip past a check that only knew the plain spelling.
+                if let Some(table) = relation_name(name, args.as_ref(), alias.as_ref()) {
+                    if self
+                        .policy
+                        .value_sampling_catalogs
+                        .contains(&table.as_str())
+                    {
+                        return break_deny(pii_catalog_deny(&table));
+                    }
+                }
+            }
+        }
         match table_factor {
+            // A parenthesised join keeps its own joins one level down and
+            // produces no Select of its own — so the constraint check has to
+            // happen HERE, where the visitor hands us the nested node. Between
+            // this arm and pre_visit_select every TableWithJoins in the
+            // statement is checked exactly once.
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                if !self.policy.pii.is_empty() {
+                    let from = std::slice::from_ref(&**table_with_joins);
+                    let local = PiiScope::of_from(&self.policy.pii, from);
+                    self.check_joins(from, &local)?;
+                }
+                ControlFlow::Continue(())
+            }
+            // A function in TABLE-SOURCE position carries its arguments here,
+            // not in an Expr::Function node — the other side of the AST for the
+            // same `f(t.*)` row expansion.
             TableFactor::Table {
                 name,
-                args: Some(_),
+                args: Some(args),
                 ..
+            } => {
+                self.check_function_args(&args.args)?;
+                self.check_function_name(name)
             }
-            | TableFactor::Function { name, .. } => self.check_function_name(name),
+            TableFactor::Function { name, args, .. } => {
+                self.check_function_args(args)?;
+                self.check_function_name(name)
+            }
             _ => ControlFlow::Continue(()),
         }
     }
 }
 
 impl Checker<'_> {
+    /// Net A's per-expression rule. Only identifier-shaped expressions can name
+    /// a column; everything else (function calls, casts, operators) is reached
+    /// through its own sub-expressions, which the visitor also passes here — so
+    /// `substr(email, 1, 3)`, `CAST(email AS TEXT)` and `email || 'x'` are all
+    /// caught by the inner `email`.
+    ///
+    /// The column name is matched against the protected columns of the tables
+    /// THIS statement touches, qualifier or not: without the database's schema
+    /// nyet cannot prove that an unqualified `email` belongs to `orders` rather
+    /// than to the `users` in the same FROM, so it refuses (fail closed).
+    /// A `prefix.*` is safe only when `prefix` provably names a relation that
+    /// carries no rules. An unknown prefix inside a scope that holds a protected
+    /// relation fails closed.
+    fn qualified_wildcard_is_safe(&self, name: &ObjectName, scope: &PiiScope) -> bool {
+        if !scope.active() {
+            return true;
+        }
+        terminal_ident(name).is_some_and(|ident| scope.prefix_is_safe(&ident.value.to_lowercase()))
+    }
+
+    /// `USING (col)` and `NATURAL` name join columns OUTSIDE the `Expr` tree —
+    /// `JoinConstraint::Using` holds `ObjectName`s and `Natural` holds nothing
+    /// at all — so `pre_visit_expr` never sees them. Both are a working equality
+    /// oracle over the protected value (the agent brings its own dictionary).
+    /// `from` is ONE level of joins; the callers between them cover every level.
+    fn check_joins(&self, from: &[TableWithJoins], local: &PiiScope) -> ControlFlow<Box<Verdict>> {
+        for item in from {
+            for join in &item.joins {
+                match join_constraint(&join.join_operator) {
+                    Some(JoinConstraint::Using(names)) => {
+                        for name in names {
+                            if let Some(ident) = terminal_ident(name) {
+                                let lower = ident.value.to_lowercase();
+                                if self.pii.columns.contains(&lower) {
+                                    return break_deny(pii_column_deny(&lower));
+                                }
+                            }
+                        }
+                    }
+                    // NATURAL joins on every same-named column pair, which nyet
+                    // cannot enumerate without the schema.
+                    Some(JoinConstraint::Natural) if local.active() => {
+                        return break_deny(pii_natural_join_deny())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Function ARGUMENTS, wherever the function sits: an expression
+    /// (`SELECT json_agg(u.*)`) or a table source (`FROM f(u.*)`,
+    /// `FROM LATERAL f(u.*)`). `FunctionArgExpr` is neither a `SelectItem` nor
+    /// an `Expr`, so neither wildcard check reaches it. A bare `*` argument is
+    /// NOT this: `count(*)` counts rows without reading a column.
+    fn check_function_args(&self, args: &[FunctionArg]) -> ControlFlow<Box<Verdict>> {
+        if !self.pii.active() {
+            return ControlFlow::Continue(());
+        }
+        for arg in args {
+            let arg_expr = match arg {
+                FunctionArg::Unnamed(e) => e,
+                FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => arg,
+            };
+            if let FunctionArgExpr::QualifiedWildcard(name) = arg_expr {
+                if !self.qualified_wildcard_is_safe(name, &self.pii) {
+                    return break_deny(pii_wildcard_deny());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn check_pii_expr(&self, expr: &Expr) -> Option<Verdict> {
+        let name = match expr {
+            // `SELECT *` inside an expression position (rare, but it exists);
+            // `count(*)` is a FunctionArgExpr, not an Expr, so it never lands here.
+            Expr::Wildcard(_) | Expr::QualifiedWildcard(..) => return Some(pii_wildcard_deny()),
+            Expr::Identifier(ident) => &ident.value,
+            Expr::CompoundIdentifier(parts) => {
+                // A qualifier that provably names an unruled source settles
+                // ownership — the same proof `prefix.*` already relies on.
+                // Without it the strict rule forbade `o.email` while allowing
+                // `o.*`, which returns that very column.
+                let qualifier = parts.len().checked_sub(2).and_then(|i| parts.get(i));
+                if qualifier.is_some_and(|q| self.pii.prefix_is_safe(&q.value.to_lowercase())) {
+                    return None;
+                }
+                &parts.last()?.value
+            }
+            _ => return None,
+        };
+        let lower = name.to_lowercase();
+        if self.pii.columns.contains(&lower) {
+            return Some(pii_column_deny(&lower));
+        }
+        // A bare table name or alias used as a VALUE is a whole-row composite
+        // (`SELECT u FROM users u` in PostgreSQL) — every column at once.
+        if self.pii.handles.contains(&lower) {
+            return Some(pii_whole_row_deny(&lower));
+        }
+        None
+    }
+
     /// Case-insensitive denylist match on the TERMINAL component of a (maybe
     /// qualified) function name — that component IS the function name. So
     /// `pg_catalog.pg_read_file` matches (terminal `pg_read_file`), but
@@ -725,6 +1564,101 @@ fn pragma_deny() -> Verdict {
     )
 }
 
+/// The one hint every PII refusal carries (Д10: what to do instead). It must
+/// also close the door on the obvious next move — there is no flag, and asking
+/// nyet again in another shape will not help; the policy belongs to whoever owns
+/// the config file, exactly like the guardrail's ceiling.
+fn pii_hint() -> String {
+    "this connection's config marks some columns as personal data in \
+     [connections.<alias>.pii]; nyet refuses the whole query rather than \
+     returning or filtering on them, and there is no CLI flag to override it — \
+     the policy belongs to whoever owns the config file. Name the columns you \
+     actually need instead of `*`, and keep the protected ones out of every \
+     clause (SELECT, WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY and subqueries \
+     all count — filtering on a protected column leaks it one character at a \
+     time). Use `nyet schema <alias>` to see which columns exist, and ask the \
+     config owner if you genuinely need the protected data."
+        .to_string()
+}
+
+fn pii_column_deny(column: &str) -> Verdict {
+    deny(
+        DenyReason::PiiColumn,
+        format!(
+            "the query references '{column}', which this connection's PII policy protects \
+             on one of the tables it reads"
+        ),
+        &pii_hint(),
+    )
+}
+
+fn pii_wildcard_deny() -> Verdict {
+    deny(
+        DenyReason::PiiColumn,
+        "the query projects a whole row ('*', 'alias.*' or 'f(alias.*)') from a source that \
+         either has columns this connection's PII policy protects, or that nyet cannot \
+         resolve to a source without them — so it could return the protected columns"
+            .to_string(),
+        &pii_hint(),
+    )
+}
+
+fn pii_whole_row_deny(handle: &str) -> Verdict {
+    deny(
+        DenyReason::PiiColumn,
+        format!(
+            "'{handle}' is used as a whole-row value, which expands to every column of a \
+             table this connection's PII policy protects"
+        ),
+        &pii_hint(),
+    )
+}
+
+fn pii_natural_join_deny() -> Verdict {
+    deny(
+        DenyReason::PiiColumn,
+        "a NATURAL JOIN silently joins on every column the two relations share, and one of \
+         them has columns this connection's PII policy protects — whether a protected column \
+         is part of the join condition cannot be told without the schema"
+            .to_string(),
+        &pii_hint(),
+    )
+}
+
+fn pii_alias_columns_deny() -> Verdict {
+    deny(
+        DenyReason::PiiColumn,
+        "the query renames the columns of a table this connection's PII policy protects with \
+         an alias column list (`table AS t (a, b, c)`), which maps names by POSITION — nyet \
+         cannot tell which alias now stands for the protected column"
+            .to_string(),
+        &pii_hint(),
+    )
+}
+
+fn pii_unresolved_source_deny() -> Verdict {
+    deny(
+        DenyReason::PiiUnprovable,
+        "nyet could not work out what one of the query's table sources is, and this \
+         connection protects some columns as PII — an unidentified source may well be the \
+         protected table under a spelling nyet reads differently"
+            .to_string(),
+        &pii_hint(),
+    )
+}
+
+fn pii_catalog_deny(catalog: &str) -> Verdict {
+    deny(
+        DenyReason::PiiColumn,
+        format!(
+            "'{catalog}' publishes sampled column VALUES (most common values, histogram \
+             bounds), so reading it would expose the data this connection's PII policy \
+             protects — without naming a protected column"
+        ),
+        &pii_hint(),
+    )
+}
+
 fn deny(reason: DenyReason, message: String, hint: &str) -> Verdict {
     Verdict::Deny {
         reason,
@@ -758,6 +1692,13 @@ mod tests {
         verdict: String,
         reason: Option<String>,
         warnings: Option<String>,
+        /// Comma-separated `[connections.X.pii] columns` rules for this case. A
+        /// `pii:` line BEFORE the first `- query:` sets the file-wide default
+        /// (a whole file of PII cases shares one policy); a per-case `pii:`
+        /// overrides it, and `pii: none` turns the policy off for that one case
+        /// (so a file can pin both sides of the same query). Absent everywhere =
+        /// no PII policy, as before.
+        pii: String,
     }
 
     fn parse_corpus(file: &Path) -> Vec<Case> {
@@ -774,6 +1715,7 @@ mod tests {
         };
         let text = std::fs::read_to_string(file).unwrap();
         let mut cases: Vec<Case> = Vec::new();
+        let mut default_pii = String::new();
         for (idx, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -788,7 +1730,15 @@ mod tests {
                     verdict: String::new(),
                     reason: None,
                     warnings: None,
+                    pii: default_pii.clone(),
                 });
+                continue;
+            }
+            if cases.is_empty() {
+                let p = line
+                    .strip_prefix("pii: ")
+                    .unwrap_or_else(|| panic!("{name}:{}: key before first '- query:'", idx + 1));
+                default_pii = p.to_string();
                 continue;
             }
             let case = cases
@@ -802,6 +1752,8 @@ mod tests {
                 case.dialect = d.to_string();
             } else if let Some(w) = line.strip_prefix("warnings: ") {
                 case.warnings = Some(w.to_string());
+            } else if let Some(p) = line.strip_prefix("pii: ") {
+                case.pii = p.to_string();
             } else {
                 panic!("{name}:{}: unrecognized corpus line: {raw}", idx + 1);
             }
@@ -824,12 +1776,21 @@ mod tests {
             for case in parse_corpus(&file) {
                 total += 1;
                 let at = format!("{}:{} {:?}", case.file, case.line, case.query);
-                let verdict = match case.dialect.as_str() {
-                    "sqlite" => validate(&case.query, &Policy::sqlite(&[], &[])),
-                    "postgres" => validate(&case.query, &Policy::postgres(&[], &[])),
-                    "mysql" => validate(&case.query, &Policy::mysql(&[], &[])),
+                let rules: Vec<String> = case
+                    .pii
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty() && *r != "none")
+                    .map(str::to_string)
+                    .collect();
+                let pii = PiiRules::parse(&rules).unwrap_or_else(|e| panic!("{at}: {e}"));
+                let policy = match case.dialect.as_str() {
+                    "sqlite" => Policy::sqlite(&[], &[]),
+                    "postgres" => Policy::postgres(&[], &[]),
+                    "mysql" => Policy::mysql(&[], &[]),
                     other => panic!("{at}: unknown dialect {other:?}"),
                 };
+                let verdict = validate(&case.query, &policy.with_pii(pii));
                 match verdict {
                     Verdict::Allow { warnings, .. } => {
                         assert_eq!(case.verdict, "allow", "{at}: got allow");
@@ -867,7 +1828,7 @@ mod tests {
         }
         // Tripwire against accidental corpus loss (a whole file or a large
         // chunk vanishing must fail loudly). Raise as the corpus grows.
-        assert!(total >= 200, "corpus suspiciously small: {total} cases");
+        assert!(total >= 350, "corpus suspiciously small: {total} cases");
     }
 
     #[test]
@@ -1155,6 +2116,145 @@ mod tests {
             validate_default("SELECT pragmatic FROM words"),
             Verdict::Allow { .. }
         ));
+    }
+
+    #[test]
+    fn pii_rules_parse_normalizes_and_rejects_garbage() {
+        // table.column and schema.table.column; case and schema are ignored.
+        let rules = PiiRules::parse(&[
+            "Users.Email".to_string(),
+            "app.customers.SSN".to_string(),
+            " users . phone ".to_string(),
+        ])
+        .unwrap();
+        assert!(rules.protects("users", "email"));
+        assert!(rules.protects("USERS", "EMAIL"));
+        assert!(rules.protects("public.users", "email"));
+        assert!(rules.protects("customers", "ssn"));
+        // the schema in the RULE is not required in the query either way
+        assert!(rules.protects("app.customers", "ssn"));
+        assert!(rules.protects("users", "phone"));
+        // and nothing else
+        assert!(!rules.protects("users", "id"));
+        assert!(!rules.protects("orders", "email"));
+        // no rules at all = the historical behavior
+        assert!(PiiRules::parse(&[]).unwrap().is_empty());
+        // garbage fails loud, naming the offender (Д3/Д10)
+        for bad in [
+            "",
+            "email",
+            "users.",
+            ".email",
+            "a.b.c.d",
+            "users..email",
+            "   ",
+        ] {
+            let err = PiiRules::parse(&[bad.to_string()]).unwrap_err();
+            assert!(err.contains("table.column"), "{bad:?}: {err}");
+        }
+    }
+
+    /// Both spellings of PostgreSQL's `FROM ONLY` resolve to the real relation.
+    /// sqlparser renders them completely differently — `ONLY t` as a table
+    /// called ONLY aliased `t`, `ONLY (t)` as a table FUNCTION called ONLY —
+    /// and each one, left unresolved, emptied the scope and switched net A off.
+    #[test]
+    fn only_resolves_to_the_real_relation_in_both_spellings() {
+        let policy =
+            Policy::postgres(&[], &[]).with_pii(PiiRules::parse(&["users.email".into()]).unwrap());
+        for sql in [
+            "SELECT email FROM ONLY users",
+            "SELECT email FROM ONLY (users)",
+            "SELECT email FROM ONLY(users)",
+            "SELECT email FROM ONLY (public.users)",
+            "SELECT * FROM ONLY (users)",
+            "SELECT count(*) FROM ONLY (users) WHERE email LIKE 'a%'",
+        ] {
+            assert!(
+                matches!(
+                    validate(sql, &policy),
+                    Verdict::Deny {
+                        reason: DenyReason::PiiColumn,
+                        ..
+                    }
+                ),
+                "{sql} must be denied"
+            );
+        }
+        // A real table function is NOT the ONLY form and stays usable.
+        assert!(matches!(
+            validate("SELECT * FROM generate_series(1, 3)", &policy),
+            Verdict::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn net_b_judges_the_reported_provenance() {
+        let rules = PiiRules::parse(&["users.email".to_string()]).unwrap();
+        let cols = vec!["x".to_string()];
+        let table = |t: &str, c: &str| {
+            vec![Origin::Table {
+                table: t.to_string(),
+                column: c.to_string(),
+            }]
+        };
+        // A protected column reached through a rename/view -> PII_COLUMN.
+        for (t, c) in [("users", "email"), ("public.users", "EMAIL")] {
+            match check_origins(&rules, &cols, &table(t, c)) {
+                Some(Refusal { reason, hint, .. }) => {
+                    assert_eq!(reason, DenyReason::PiiColumn);
+                    assert!(hint.contains("config"), "{hint}");
+                }
+                _ => panic!("{t}.{c} must be denied"),
+            }
+        }
+        // An unmarked column and a computed value pass.
+        assert!(check_origins(&rules, &cols, &table("users", "id")).is_none());
+        assert!(check_origins(&rules, &cols, &[Origin::Expression]).is_none());
+        // An origin the driver would not state, and a MISSING origin, both fail
+        // closed with PII_UNPROVABLE.
+        for origins in [vec![Origin::Unknown], Vec::new()] {
+            match check_origins(&rules, &cols, &origins) {
+                Some(Refusal { reason, hint, .. }) => {
+                    assert_eq!(reason, DenyReason::PiiUnprovable);
+                    assert!(!hint.is_empty());
+                }
+                _ => panic!("{origins:?} must be denied"),
+            }
+        }
+        // No PII policy -> net B is a no-op, whatever the driver says.
+        let none = PiiRules::default();
+        assert!(check_origins(&none, &cols, &table("users", "email")).is_none());
+        assert!(check_origins(&none, &cols, &[Origin::Unknown]).is_none());
+    }
+
+    #[test]
+    fn pii_refusals_say_there_is_no_override() {
+        // Д10 + the guardrail's rule: an agent that can lift its own limit does
+        // not have one, so every PII hint must close that door explicitly.
+        let policy = Policy::postgres(&[], &[])
+            .with_pii(PiiRules::parse(&["users.email".to_string()]).unwrap());
+        for sql in [
+            "SELECT email FROM users",
+            "SELECT * FROM users",
+            "SELECT u FROM users u",
+            "SELECT * FROM pg_stats",
+        ] {
+            let Verdict::Deny {
+                reason,
+                message,
+                hint,
+            } = validate(sql, &policy)
+            else {
+                panic!("{sql} must be denied")
+            };
+            assert_eq!(reason, DenyReason::PiiColumn, "{sql}");
+            assert!(!message.is_empty(), "{sql}");
+            assert!(hint.contains("no CLI flag"), "{sql}: {hint}");
+            assert!(hint.contains("config file"), "{sql}: {hint}");
+            // A refusal must never echo data; it names schema only.
+            assert!(!message.contains('@'), "{sql}: {message}");
+        }
     }
 
     #[test]

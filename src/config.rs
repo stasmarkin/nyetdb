@@ -85,6 +85,21 @@ pub struct Connection {
     pub validator: Option<Validator>,
     pub ssh: Option<Ssh>,
     pub guardrail: Option<Guardrail>,
+    pub pii: Option<Pii>,
+}
+
+/// `[connections.X.pii]`: the columns the config owner declares to be personal
+/// data. nyet refuses (NYET, exit 5) any query that could expose them; it never
+/// masks or filters values (that is a later step). Absent section or
+/// `columns = []` = no PII policy, byte-for-byte the historical behavior (UX-5).
+/// POLICY, so `${VAR}` inside a rule is rejected like `allowed_dirs` — the agent
+/// controls the environment and would otherwise unprotect its own targets.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pii {
+    /// `["users.email", "app.customers.ssn"]` — `table.column`, optionally
+    /// schema-qualified. Parsed and validated by `validator::PiiRules::parse`.
+    pub columns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +167,9 @@ pub enum ConfigError {
     /// (e.g. an option-injection host after `${VAR}` substitution). Caught at
     /// parse (fail-fast) rather than as a runtime tunnel error.
     SshInvalid { alias: String, message: String },
+    /// A `[connections.X.pii] columns` entry that is not `table.column` or
+    /// `schema.table.column`. Fail loud rather than silently protecting nothing.
+    PiiRuleInvalid { alias: String, message: String },
     /// `${VAR}` in `[audit] path`: like the per-connection policy values, the
     /// audit path is security-relevant and the agent controls the environment,
     /// so substitution there would let it redirect or disable its own audit
@@ -209,6 +227,7 @@ pub fn parse(text: &str, env: EnvLookup) -> Result<Config, ConfigError> {
         )?;
         validate_ssh(alias, conn)?;
         guardrail(alias, conn)?;
+        pii(alias, conn)?;
     }
     Ok(config)
 }
@@ -328,6 +347,21 @@ pub fn guardrail(
     )
 }
 
+/// The connection's effective PII policy — the ONE place it is resolved.
+/// `parse` calls it so a malformed rule is a loud config error (exit 3) before
+/// anything connects, and the cli calls it again to build the validator policy.
+pub fn pii(alias: &str, conn: &Connection) -> Result<crate::validator::PiiRules, ConfigError> {
+    let columns = conn
+        .pii
+        .as_ref()
+        .and_then(|p| p.columns.as_deref())
+        .unwrap_or(&[]);
+    crate::validator::PiiRules::parse(columns).map_err(|message| ConfigError::PiiRuleInvalid {
+        alias: alias.to_string(),
+        message,
+    })
+}
+
 /// Zero limits are footguns: row_limit = 0 returns nothing (looking like an
 /// empty table), timeout_secs = 0 times every query out.
 fn reject_zero(value: Option<u64>, key: &str) -> Result<(), ConfigError> {
@@ -400,6 +434,16 @@ fn reject_env_vars_in_policy(value: &toml::Value) -> Result<(), ConfigError> {
                     name,
                 )?;
             }
+        }
+        for rule in conn
+            .get("pii")
+            .and_then(|p| p.get("columns"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+        {
+            literal("pii.columns", rule)?;
         }
         if let Some(mode) = conn
             .get("guardrail")
@@ -1092,6 +1136,100 @@ mod tests {
             &env_of(&[])
         )
         .is_ok());
+    }
+
+    #[test]
+    fn pii_section_parses_and_bad_rules_fail_loud() {
+        // The section reaches the connection and resolves to real rules.
+        let text = "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                    [connections.a.pii]\ncolumns = [\"users.email\", \"app.customers.ssn\"]";
+        let cfg = parse(text, &env_of(&[])).unwrap();
+        let rules = pii("a", &cfg.connections["a"]).unwrap();
+        assert!(rules.protects("users", "email"));
+        assert!(rules.protects("customers", "ssn"));
+        assert!(!rules.protects("users", "id"));
+
+        // Quoted identifiers work: the way psql/pg_dump print a name, and the
+        // only way to name a column that CANNOT be written unquoted. The AST
+        // hands over the value without quotes, so matching lines up.
+        let text = "[connections.a]\nengine = \"sqlite\"\npath = \"x.db\"\n\
+                    [connections.a.pii]\ncolumns = ['\"users\".\"e-mail\"', '\"user data\".x']";
+        let cfg = parse(text, &env_of(&[])).unwrap();
+        let rules = pii("a", &cfg.connections["a"]).unwrap();
+        assert!(rules.protects("users", "e-mail"));
+        assert!(rules.protects("user data", "x"));
+
+        // No section, and an explicitly empty list, both mean "no policy" —
+        // the historical behavior, byte for byte (UX-5).
+        for body in ["", "[connections.a.pii]\ncolumns = []"] {
+            let text = format!("[connections.a]\nengine = \"sqlite\"\npath = \"x.db\"\n{body}");
+            let cfg = parse(&text, &env_of(&[])).unwrap();
+            assert!(
+                pii("a", &cfg.connections["a"]).unwrap().is_empty(),
+                "{body}"
+            );
+        }
+
+        // A rule nyet cannot parse — or accepts but could never MATCH — would
+        // silently protect nothing while the owner believes it is protected.
+        // Both shapes below were reproduced returning the value on exit 0.
+        for rule in [
+            "email",
+            "users.",
+            ".email",
+            "a.b.c.d",
+            "",
+            // half-quoted / quote in the middle is neither an identifier nor a
+            // quoted name
+            "\"users.email\"",
+            "\"users.email",
+            "us\"ers.email",
+            // a whole list crammed into one string (one forgotten comma)
+            "users.email, users.phone",
+            // stray syntax that can never be an identifier
+            "users.email;",
+            "users.*",
+            "users email",
+        ] {
+            // TOML literal string ('...'): the rules under test contain quotes.
+            let text = format!(
+                "[connections.a]\nengine = \"sqlite\"\npath = \"x.db\"\n\
+                 [connections.a.pii]\ncolumns = ['{rule}']"
+            );
+            match parse(&text, &env_of(&[])).unwrap_err() {
+                ConfigError::PiiRuleInvalid { alias, message } => {
+                    assert_eq!(alias, "a");
+                    assert!(message.contains("table.column"), "{rule}: {message}");
+                }
+                other => panic!("expected PiiRuleInvalid for {rule:?}, got {other:?}"),
+            }
+        }
+
+        // Unknown keys inside the section fail loudly (the convention).
+        let text = "[connections.a]\nengine = \"sqlite\"\npath = \"x.db\"\n\
+                    [connections.a.pii]\ncolumn = [\"users.email\"]";
+        assert!(matches!(
+            parse(text, &env_of(&[])).unwrap_err(),
+            ConfigError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn env_var_in_pii_columns_is_rejected_literal_only() {
+        // Same class as allowed_dirs / allow_functions / guardrail.mode: the
+        // agent owns the environment, so ${VAR} here would let it unprotect its
+        // own target. Rejected BEFORE substitution, so an unset var fails too.
+        for env in [env_of(&[("C", "users.email")]), env_of(&[])] {
+            let text = "[connections.a]\nengine = \"sqlite\"\npath = \"x.db\"\n\
+                        [connections.a.pii]\ncolumns = [\"${C}\"]";
+            match parse(text, &env).unwrap_err() {
+                ConfigError::EnvVarInPolicy { alias, key, .. } => {
+                    assert_eq!(alias, "a");
+                    assert_eq!(key, "pii.columns");
+                }
+                other => panic!("expected EnvVarInPolicy(pii.columns), got {other:?}"),
+            }
+        }
     }
 
     #[test]

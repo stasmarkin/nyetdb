@@ -262,17 +262,29 @@ enum Db {
 }
 
 impl Db {
+    /// The ONE way rows leave the engine layer — and therefore the one place
+    /// net B (PII provenance) is applied. Putting the check here rather than in
+    /// a command body means a future rows-returning command cannot inherit the
+    /// hole by forgetting to call it (finding 6); `QueryOutcome::PiiRefused`
+    /// then forces every caller to handle the refusal.
     async fn execute(
         &self,
         sql: &str,
         fetch_limit: u64,
         guardrail: &guardrail::Guardrail,
+        pii: &validator::PiiRules,
     ) -> Result<engine::QueryOutcome, engine::EngineError> {
-        match self {
+        let outcome = match self {
             Db::Sqlite(e) => e.execute(sql, fetch_limit, guardrail).await,
             Db::Postgres(e) => e.execute(sql, fetch_limit, guardrail).await,
             Db::Mysql(e) => e.execute(sql, fetch_limit, guardrail).await,
+        }?;
+        if let engine::QueryOutcome::Ran { result, .. } = &outcome {
+            if let Some(refusal) = validator::check_origins(pii, &result.columns, &result.origins) {
+                return Ok(engine::QueryOutcome::PiiRefused(Box::new(refusal)));
+            }
         }
+        Ok(outcome)
     }
 
     async fn estimate(
@@ -295,6 +307,18 @@ impl Db {
             Db::Postgres(pg) => pg.host_override = Some(over),
             Db::Mysql(my) => my.host_override = Some(over),
             Db::Sqlite(_) => {}
+        }
+    }
+
+    /// Ask the engine for column PROVENANCE on the next query (net B). Only
+    /// PostgreSQL pays for it (an extra DESCRIBE round trip), and only when the
+    /// connection has a PII policy: MySQL and SQLite report origins on the wire
+    /// for free, so they need no switch. Exhaustive match — a future engine must
+    /// state its answer rather than silently returning unprovable columns.
+    fn resolve_column_origins(&mut self) {
+        match self {
+            Db::Postgres(pg) => pg.resolve_column_origins = true,
+            Db::Mysql(_) | Db::Sqlite(_) => {}
         }
     }
 
@@ -641,6 +665,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             let raw_sql = query.clone();
             let cwd_str = cwd.display().to_string();
             let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
+            let redact_db_errors = session.redact_db_errors();
             // The whole command as ONE Result so both success and every failure
             // path (validator/guardrail refusal, DB error) flow through
             // audit_finish — the log is written before the result is released.
@@ -665,11 +690,15 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // forwards never accumulate. Fetch limit+1 to detect truncation
                 // without reading everything.
                 let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
-                let (outcome, duration_ms) = run_db(session.db.execute(
-                    &query,
-                    limit.saturating_add(1),
-                    &guardrail,
-                ))?;
+                let (outcome, duration_ms) = run_db(
+                    redact_db_errors,
+                    session.db.execute(
+                        &query,
+                        limit.saturating_add(1),
+                        &guardrail,
+                        session.policy.pii(),
+                    ),
+                )?;
 
                 let (mut rs, estimate) = match outcome {
                     // The guardrail refused: nothing ran, and the envelope carries
@@ -695,6 +724,12 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                             hint,
                             estimate: None,
                         });
+                    }
+                    // Net B refused the result: the rows exist but are never
+                    // formatted, logged or emitted (the check runs inside
+                    // Db::execute, before this match).
+                    engine::QueryOutcome::PiiRefused(refusal) => {
+                        return Err(refusal_failure(*refusal))
                     }
                     engine::QueryOutcome::Ran { result, estimate } => (result, estimate),
                 };
@@ -806,9 +841,11 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             let engine = conn.engine.clone();
             let cwd_str = cwd.display().to_string();
             let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
+            let redact_db_errors = session.redact_db_errors();
             let outcome = (|| -> Result<Emitted, Failure> {
                 let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
-                let (schema, duration_ms) = run_db(session.db.schema(table.as_deref()))?;
+                let (schema, duration_ms) =
+                    run_db(redact_db_errors, session.db.schema(table.as_deref()))?;
 
                 // An explicit [table] that matched nothing: the catalog answered,
                 // the object simply is not there. DB_ERROR (exit 7) with the way
@@ -894,6 +931,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             let raw_sql = query.clone();
             let cwd_str = cwd.display().to_string();
             let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
+            let redact_db_errors = session.redact_db_errors();
             let outcome = (|| -> Result<Emitted, Failure> {
                 // The very same layer 1 as `nyet query` — planning a write is
                 // refused (exit 5) before anything is sent to the database.
@@ -911,7 +949,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 let (plan, duration_ms) = match is_query {
                     true => {
                         let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
-                        run_db(session.db.estimate(&query))?
+                        run_db(redact_db_errors, session.db.estimate(&query))?
                     }
                     false => {
                         warnings.push(no_plan_warning());
@@ -1028,8 +1066,19 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     let timeout_secs = cfg.timeout_secs(conn, None);
                     let (mut db, _policy) = build_engine(&alias, conn, timeout_secs)?;
                     audit_id = Some((alias.clone(), conn.engine.clone()));
-                    let (diagnosis, duration_ms) =
+                    let (mut diagnosis, duration_ms) =
                         diagnose_connection(conn, timeout_secs, &mut db)?;
+                    // doctor never goes through run_db/engine_failure, so the
+                    // redaction has to be applied to the FACTS it collected:
+                    // ConnectFact::Failed and the probe `detail` carry the
+                    // driver's verbatim message (finding 8). The promise in
+                    // README/DESIGN is unconditional, so it holds here too.
+                    if !config::pii(&alias, conn)
+                        .map_err(|e| config_failure(e, &path))?
+                        .is_empty()
+                    {
+                        redact_diagnosis(&mut diagnosis);
+                    }
                     let input = output::DoctorInput {
                         engine: engine_kind(&conn.engine),
                         diagnosis,
@@ -1163,11 +1212,11 @@ fn validate(
             reason,
             message,
             hint,
-        } => Err(Failure::new(
-            ErrorCode::Nyet(reason.as_str()),
+        } => Err(refusal_failure(validator::Refusal {
+            reason,
             message,
             hint,
-        )),
+        })),
         validator::Verdict::Allow {
             sql,
             warnings,
@@ -1184,6 +1233,11 @@ fn validate(
                 .collect(),
         )),
     }
+}
+
+/// One validator refusal -> one NYET failure (exit 5).
+fn refusal_failure(r: validator::Refusal) -> Failure {
+    Failure::new(ErrorCode::Nyet(r.reason.as_str()), r.message, r.hint)
 }
 
 /// The guardrail asked for a plan and got nothing it could judge. Д10 — what
@@ -1244,6 +1298,15 @@ struct Session {
     insecure_transport: bool,
 }
 
+impl Session {
+    /// The ONE answer to "may this connection show raw database error text?".
+    /// It used to be re-derived in each command body, and `doctor` — which
+    /// builds its engine without a Session — simply missed it (finding 8).
+    fn redact_db_errors(&self) -> bool {
+        !self.policy.pii().is_empty()
+    }
+}
+
 fn open_session<'a>(
     cfg: &'a config::Config,
     path: &Path,
@@ -1255,12 +1318,19 @@ fn open_session<'a>(
     let conn = lookup_alias(cfg, path, alias)?;
     check_scope(alias, conn, cwd, allowed(conn))?;
     let timeout_secs = cfg.timeout_secs(conn, timeout_flag);
-    let (db, policy) = build_engine(alias, conn, timeout_secs)?;
+    let (mut db, policy) = build_engine(alias, conn, timeout_secs)?;
+    // The PII policy is resolved here (once) and lives inside the validator
+    // Policy: net A reads it during validation, and the cli reads it back for
+    // net B and for the database-error redaction.
+    let pii = config::pii(alias, conn).map_err(|e| config_failure(e, path))?;
+    if !pii.is_empty() {
+        db.resolve_column_origins();
+    }
     Ok((
         conn,
         Session {
             db,
-            policy,
+            policy: policy.with_pii(pii),
             timeout_secs,
             insecure_transport: insecure_transport(conn),
         },
@@ -1276,6 +1346,7 @@ fn open_session<'a>(
 /// effective per-query timeout (-> exit 8), which keeps the exit code
 /// deterministic even when `--timeout` is smaller than a legitimate connect.
 fn run_db<T>(
+    redact_db_errors: bool,
     operation: impl std::future::Future<Output = Result<T, engine::EngineError>>,
 ) -> Result<(T, u64), Failure> {
     let rt = runtime()?;
@@ -1285,7 +1356,10 @@ fn run_db<T>(
     // background shutdown lets the process exit instead of joining it.
     rt.shutdown_background();
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Ok((result.map_err(engine_failure)?, duration_ms))
+    Ok((
+        result.map_err(|e| engine_failure(e, redact_db_errors))?,
+        duration_ms,
+    ))
 }
 
 /// alias -> connection, with the known-alias hint (CONFIG_INVALID, exit 3).
@@ -1407,6 +1481,9 @@ fn build_engine(
                     host_override: None,
                     // Production: the generous connect_deadline floor.
                     connect_timeout_ms: None,
+                    // Turned on by open_session when the connection has a PII
+                    // policy; off here so a connection without one pays nothing.
+                    resolve_column_origins: false,
                 }),
                 validator::Policy::postgres(v_allow, v_deny),
             ))
@@ -1510,11 +1587,12 @@ fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
 /// in-process timer and a server-side statement_timeout (Postgres 57014 /
 /// MySQL 3024 / MariaDB 1969) surface as `Timeout` -> exit 8, deterministic
 /// whichever fires.
-fn engine_failure(e: engine::EngineError) -> Failure {
+fn engine_failure(e: engine::EngineError, redact_db_errors: bool) -> Failure {
     match e {
         engine::EngineError::Connect { message, hint } => {
             Failure::new(ErrorCode::ConnectionFailed, message, hint)
         }
+        engine::EngineError::Db { .. } if redact_db_errors => db_error_withheld(),
         engine::EngineError::Db { message, hint } => {
             Failure::new(ErrorCode::DbError, message, hint)
         }
@@ -1522,6 +1600,52 @@ fn engine_failure(e: engine::EngineError) -> Failure {
             Failure::new(ErrorCode::Timeout, message, hint)
         }
     }
+}
+
+/// The `doctor` twin of `db_error_withheld`: replace the verbatim server text
+/// in the facts that were produced by RUNNING A STATEMENT. The VERDICTS are
+/// untouched — which check failed, and whether the role is read-only, is
+/// diagnosis, not data.
+///
+/// `ConnectFact::Failed` is deliberately LEFT ALONE, for symmetry with
+/// `engine_failure`, which also passes `EngineError::Connect` through verbatim
+/// on a PII connection: a refused handshake ("password authentication failed
+/// for user ...") happens before any row exists and cannot quote a cell, while
+/// doctor's whole job is telling the human honestly why the connection is
+/// broken. Only the write PROBE runs a statement against real data, so only its
+/// `detail` can carry a server message about values.
+fn redact_diagnosis(diagnosis: &mut output::Diagnosis) {
+    const WITHHELD: &str = "details withheld by this connection's PII policy (a database \
+                            message can quote cell values); see the database's own log";
+    if let Some(server) = &mut diagnosis.server {
+        match &mut server.probe {
+            output::ProbeFact::Blocked { detail, .. } | output::ProbeFact::Unknown { detail } => {
+                *detail = WITHHELD.to_string()
+            }
+            output::ProbeFact::Wrote { .. } => {}
+        }
+    }
+}
+
+/// A connection with a PII policy never hands the RAW database error text to the
+/// agent. PostgreSQL and MySQL quote the offending CELL VALUE in their messages
+/// — `SELECT email::int FROM users` answers *invalid input syntax for type
+/// integer: "alice@example.com"* — which is an exfiltration channel one cell per
+/// query, straight past every filter on the result. Filtering the text with
+/// patterns would be theatre (UX-7): the whole message is withheld, and the
+/// agent is told where the real one lives (Д10). Connections without a PII
+/// policy are untouched — they keep the verbatim, actionable error.
+fn db_error_withheld() -> Failure {
+    Failure::new(
+        ErrorCode::DbError,
+        "the database rejected this query; its error text is withheld because this \
+         connection has a PII policy, and a database error message can quote the very \
+         cell values that caused it",
+        "check the query against the real schema with `nyet schema <alias>` (types and \
+         column names are not withheld), and simplify it one clause at a time to find \
+         what the database dislikes; the full server message is in the database's own \
+         log — ask whoever owns this connection if you need it",
+    )
 }
 
 /// The flag the user passed on `--format` (if any), normalized to `Format`.
@@ -1742,9 +1866,9 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
             format!(
                 "{key} must be a literal value; ${{VAR}} substitution is not allowed in \
                  policy settings (allowed_dirs, validator.allow_functions / deny_functions, \
-                 guardrail.mode) because the environment is controlled by the calling agent \
-                 — it could otherwise widen its own scope, un-deny a function or switch the \
-                 guardrail off"
+                 guardrail.mode, pii.columns) because the environment is controlled by the \
+                 calling agent — it could otherwise widen its own scope, un-deny a function, \
+                 switch the guardrail off or unprotect a PII column"
             ),
         ),
         config::ConfigError::InvalidAllowedDir { alias, dir } => (
@@ -1800,6 +1924,18 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
              remote is host:port with safe characters — values that could be read as ssh \
              options (a leading '-', or a ${VAR} that expands to one) are rejected"
                 .to_string(),
+        ),
+        config::ConfigError::PiiRuleInvalid { alias, message } => (
+            format!(
+                "config file {}: connection '{alias}' has an invalid [pii] rule: {message}",
+                path.display()
+            ),
+            format!(
+                "each entry of [connections.{alias}.pii] columns names one column as \
+                 \"table.column\" (or \"schema.table.column\"), e.g. \
+                 columns = [\"users.email\", \"users.phone\"]; matching is \
+                 case-insensitive and any schema qualifier is ignored"
+            ),
         ),
         config::ConfigError::AuditPathEnvVar { value } => (
             format!(
@@ -1889,6 +2025,50 @@ fn warn_loose_permissions(path: &Path, what: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 2, finding H: the PII redaction covers the fact a STATEMENT
+    /// produced (the write probe's server message) and deliberately leaves the
+    /// connect diagnosis alone — a refused handshake cannot quote a cell, and
+    /// doctor's whole job is saying honestly why the connection is broken.
+    #[test]
+    fn redact_diagnosis_hides_probe_detail_but_not_the_connect_reason() {
+        let mut d = output::Diagnosis {
+            connect: output::ConnectFact::Failed {
+                message: "password authentication failed for user \"nyet_ro\"".to_string(),
+                hint: "h".to_string(),
+            },
+            server: None,
+        };
+        redact_diagnosis(&mut d);
+        match &d.connect {
+            output::ConnectFact::Failed { message, .. } => {
+                assert!(message.contains("authentication"), "{message}")
+            }
+            _ => panic!("connect fact replaced"),
+        }
+        // The probe DOES run a statement against real data, so its detail goes.
+        let mut d = output::Diagnosis {
+            connect: output::ConnectFact::Ok { via_tunnel: false },
+            server: Some(output::ServerFacts {
+                read_only_note: None,
+                probe: output::ProbeFact::Unknown {
+                    detail: "value \"alice@example.com\" out of range".to_string(),
+                },
+                superuser: output::SuperuserFact::Unknown("x".to_string()),
+            }),
+        };
+        redact_diagnosis(&mut d);
+        let Some(server) = &d.server else {
+            panic!("server facts dropped")
+        };
+        match &server.probe {
+            output::ProbeFact::Unknown { detail } => {
+                assert!(detail.contains("withheld"), "{detail}");
+                assert!(!detail.contains("alice@example.com"), "{detail}");
+            }
+            _ => panic!("probe fact replaced"),
+        }
+    }
 
     #[test]
     fn broken_pipe_is_the_only_graceful_write_error() {

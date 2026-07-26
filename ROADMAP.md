@@ -114,7 +114,13 @@ introspection, auto-guardrail через EXPLAIN). Ниша подтвержде
       MongoDB)
 - [ ] `nyet mcp` — MCP-режим из того же бинарника
 - [ ] `nyet sample <alias> <table>` — сэмплирование данных
-- [ ] PII-маскирование (per-connection колонки/regex)
+- [~] PII-защита (per-connection колонки) — **в работе**. Шаг PII-1 сделан:
+      секция `[connections.X.pii] columns = ["users.email", ...]`, отказ всего
+      запроса (`NYET`/`PII_COLUMN`/`PII_UNPROVABLE`, exit 5) по имени до
+      выполнения и по провенансу колонок результата после; текст ошибки БД на
+      таком коннекшене агенту не отдаётся. Шаг PII-2 (маскирование значений
+      вместо отказа, `mode`, warning `PII_MASKED`, пометка PII в `nyet schema`)
+      — отдельно; regex-автодетект по значениям/именам пока не планируется
 - [ ] Writes с opt-in: `allow_writes = true` в конфиге + `--unsafe-allow-writes`
 - [ ] Кэш схемы
 
