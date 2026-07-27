@@ -2247,6 +2247,12 @@ fn deny(reason: DenyReason, message: String, hint: &str) -> Verdict {
 #[cfg(test)]
 mod property;
 
+/// Differential companion to both: the same corpus and the same generator, but
+/// the verdict comes from a live server held read-only (see the module doc).
+/// Needs Docker for two of its three dialects — excluded from `just test-fast`.
+#[cfg(test)]
+mod differential;
+
 #[cfg(test)]
 mod tests {
     use super::*;

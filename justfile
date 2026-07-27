@@ -6,7 +6,10 @@ export DOCKER_HOST := if docker_host != '' { docker_host } else if path_exists(c
 
 # The unit tests in src/engine.rs that start containers — the rest of --bins and
 # all of --test cli need no Docker. Add yours here if you write another.
-container_units := '--skip postgres_layer2_types_and_timeout ' + \
+# `differential_` is a prefix skip: it also drops the SQLite differential test,
+# which needs no Docker — the three are one experiment and belong in one run.
+container_units := '--skip differential_ ' + \
+  '--skip postgres_layer2_types_and_timeout ' + \
   '--skip pg_collapsed_guardrail_arming_keeps_its_invariants ' + \
   '--skip mysql_layer2_types_and_timeout ' + \
   '--skip mysql8_caching_sha2_password_over_tls ' + \

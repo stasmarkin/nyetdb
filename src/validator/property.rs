@@ -144,7 +144,12 @@ const STATEMENT_WRAPPERS: &[(&str, &str)] = &[("EXPLAIN ", "")];
 
 const DIALECTS: &[&str] = &["sqlite", "postgres", "mysql"];
 
-fn policy(dialect: &str) -> Policy {
+/// `pub(super)` here and on `Node`/`statement` below: the differential test
+/// (`super::differential`) draws from this same generator, so the two tests
+/// judge the SAME shapes — one against the invariant, one against a live
+/// server. Sharing the generator is the point; duplicating it would let the
+/// two drift.
+pub(super) fn policy(dialect: &str) -> Policy {
     match dialect {
         "sqlite" => Policy::sqlite(&[], &[]),
         "postgres" => Policy::postgres(&[], &[]),
@@ -167,7 +172,7 @@ fn denied_calls(dialect: &str) -> &'static [&'static str] {
 /// doc. The leaves carry their own text so a minimized counterexample prints as
 /// readable SQL fragments rather than as indexes.
 #[derive(Debug, Clone)]
-enum Node {
+pub(super) enum Node {
     Read(&'static str),
     Write(&'static str),
     /// A denied-function call, resolved against the dialect at render time.
@@ -189,7 +194,7 @@ impl Node {
         }
     }
 
-    fn render(&self, dialect: &str) -> String {
+    pub(super) fn render(&self, dialect: &str) -> String {
         match self {
             Node::Read(sql) | Node::Write(sql) => (*sql).to_string(),
             // Modulo rather than a per-dialect strategy: the three lists have
@@ -229,7 +234,7 @@ fn query_fragment() -> impl Strategy<Value = Node> {
 
 /// A whole statement: a query fragment, a statement-only write, or either of
 /// those under scaffolding that takes a statement (EXPLAIN, `a; b`).
-fn statement() -> impl Strategy<Value = Node> {
+pub(super) fn statement() -> impl Strategy<Value = Node> {
     let leaf = prop_oneof![
         3 => query_fragment(),
         1 => select(STATEMENT_ONLY_WRITE_LEAVES).prop_map(Node::Write),
