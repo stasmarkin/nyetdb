@@ -1,0 +1,28 @@
+# Config for `typos` (the spellchecker, run in CI).
+#
+# Excludes are test-data corpora, not prose: binary/hex-named fuzz seeds and the
+# golden SQL corpus (deliberately malformed input, non-ASCII/Cyrillic payloads).
+# Spellchecking them is all false positives. The accepted words below are domain
+# tokens, not misspellings: halves of unicode-smuggling escapes from the tests
+# (SEL<ZWJ>ECT -> ECT, SELEC), the Mongo `$nin` operator, and "ALLOWlists".
+#
+# Compromise (accepted): extend-words is global and case-insensitive, so `ECT`
+# also masks a real `ect`->`etc` typo tree-wide. typos has no inline-ignore and
+# per-file exclude is blunter, so global acceptance is the least-bad option here.
+
+[files]
+extend-exclude = [
+  "fuzz/seeds/**",
+  "fuzz/corpus/**",
+  "tests/corpus/**",
+]
+
+[default.extend-words]
+# MongoDB query operator ($nin), not a misspelling of "min"/"nine".
+nin = "nin"
+# Halves of SELECT split by a zero-width joiner in the unicode-smuggling
+# examples and tests (`SEL<ZWJ>ECT`, "SELECTed"); typos tokenizes each half.
+ECT = "ECT"
+SELEC = "SELEC"
+# "ALLOWlists" — stylized "allowlists"; typos splits the leading uppercase run.
+ALLO = "ALLO"

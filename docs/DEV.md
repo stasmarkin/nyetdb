@@ -1701,7 +1701,7 @@ and it keeps one mental model with `nyet list`. Determinism: connections are
 sorted by alias (the cli passes them from a `BTreeMap`, and `skill::skill` sorts
 again so the pure function does not depend on the caller) for a stable snapshot.
 
-**Degradation, not failure.** A missing / unreadable / unparseable config, or an
+**Degradation, not failure.** A missing / unreadable / unparsable config, or an
 unresolvable cwd, degrades the dynamic section to a hint (`Connections::
 Unavailable`) — `agent-setup` still emits the full instruction and exits 0. It
 is never an exit-3 config error: the command's value is teaching the agent

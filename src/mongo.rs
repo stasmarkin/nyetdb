@@ -665,7 +665,7 @@ fn parse(text: &str) -> Result<Request, Refusal> {
         p.skip_ws()?;
         let name = p.ident();
         // Same rule as the method: the name decides first, so `.forEach(...)`
-        // is refused as a method nyet does not run rather than as unparseable
+        // is refused as a method nyet does not run rather than as unparsable
         // JavaScript.
         check_chain(&name)?;
         let args = parse_args(&mut p, 0)?;

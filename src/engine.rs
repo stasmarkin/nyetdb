@@ -2030,7 +2030,7 @@ fn pg_connect_error(e: sqlx::Error) -> EngineError {
 /// server offers it and otherwise silently falls back to plaintext). Static —
 /// it parses the url only, no server round-trip — so over-warning against a
 /// server that happens to negotiate TLS is accepted: we report the *guarantee*,
-/// not the runtime outcome. SQLite and unparseable urls -> false (the cli gates
+/// not the runtime outcome. SQLite and unparsable urls -> false (the cli gates
 /// this on a server engine, and a bad url fails later at connect anyway).
 pub fn transport_below_require(engine: &str, url: &str) -> bool {
     match engine {
