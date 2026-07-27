@@ -338,9 +338,12 @@ warnings`, `cargo deny` (закрытый allowlist лицензий, `yanked = 
 - **Provenance — встроенный в dist, а не свой.** `github-attestations` в
   `dist-workspace.toml` плюс права `id-token`/`attestations` в `release.yml`;
   точное имя опции для dist 0.28.7 — **сверить** по докам, память тут не аргумент.
-- **CodeQL — по факту, а не по вере.** Проверить статус Rust-поддержки: GA —
-  заводим scheduled-джобу, preview — откладываем до GA. Решение автоматическое,
-  обсуждать нечего.
+- **CodeQL — по факту, а не по вере.** ✅ Rust в CodeQL — GA с 2025-10-14
+  (CodeQL CLI 2.23.3+, changelog GitHub), проверено 2026-07-27. Заведён
+  `.github/workflows/codeql.yml`: `push` на main + `pull_request` + weekly
+  `schedule`, `languages: rust` / `build-mode: none`, `github/codeql-action`
+  init+analyze запинены на SHA (v4.37.3), `security-events: write` только в этой
+  джобе.
 - **`cargo-mutants` на валидатор — разовый эксперимент вне CI.** Он покажет,
   какие мутации граничной логики тесты не замечают; по результату решим, нужно ли
   расписание.
