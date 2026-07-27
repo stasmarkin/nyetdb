@@ -3216,75 +3216,102 @@ timeout_secs = 1
     )
 }
 
+/// Every layer-1 refusal, with the reason it must carry. Shared by `query` and
+/// `explain`: whatever one refuses, the other refuses identically, or `explain`
+/// would be the documented way around the allowlist.
+const MONGO_REFUSALS: &[(&str, &str)] = &[
+    ("db.users.insertOne({a: 1})", "WRITE_OPERATION"),
+    (
+        "db.users.aggregate([{$match: {}}, {$out: \"copy\"}])",
+        "WRITE_OPERATION",
+    ),
+    ("db.users.find({$where: \"1\"})", "DENIED_FUNCTION"),
+    (
+        "db.users.mapReduce(\"f\", \"f\", {out: \"r\"})",
+        "DENIED_FUNCTION",
+    ),
+    (
+        "db.users.aggregate([{$_internalApplyOplogUpdate: {}}])",
+        "DENIED_OPERATOR",
+    ),
+    ("db.users.find({a: {$brandNew: 1}})", "DENIED_OPERATOR"),
+    ("db.runCommand({ping: 1})", "DENIED_COMMAND"),
+    ("db.users.count()", "DENIED_COMMAND"),
+    (
+        "db.small.aggregate([{$lookup: {from: \"system.js\", pipeline: [], as: \"j\"}}])",
+        "DENIED_COMMAND",
+    ),
+    ("SELECT * FROM users", "PARSE_FAILED"),
+    ("db.users.find({a: 1, a: 2})", "PARSE_FAILED"),
+];
+
 #[test]
 fn mongo_layer1_refuses_before_touching_the_network() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = write_config(tmp.path(), &mongo_config(tmp.path()));
-    // (query, expected reason). The url points at a closed port, so anything
-    // that reached the network would answer CONNECTION_FAILED (exit 6)
-    // instead — which is exactly what makes this a test of layer 1.
-    let cases = [
-        ("db.users.insertOne({a: 1})", "WRITE_OPERATION"),
-        (
-            "db.users.aggregate([{$match: {}}, {$out: \"copy\"}])",
-            "WRITE_OPERATION",
-        ),
-        ("db.users.find({$where: \"1\"})", "DENIED_FUNCTION"),
-        (
-            "db.users.mapReduce(\"f\", \"f\", {out: \"r\"})",
-            "DENIED_FUNCTION",
-        ),
-        (
-            "db.users.aggregate([{$_internalApplyOplogUpdate: {}}])",
-            "DENIED_OPERATOR",
-        ),
-        ("db.users.find({a: {$brandNew: 1}})", "DENIED_OPERATOR"),
-        ("db.runCommand({ping: 1})", "DENIED_COMMAND"),
-        ("db.users.count()", "DENIED_COMMAND"),
-        ("SELECT * FROM users", "PARSE_FAILED"),
-        ("db.users.find({a: 1, a: 2})", "PARSE_FAILED"),
-    ];
-    for (query, reason) in cases {
-        let out = nyet(tmp.path())
-            .args(["query", "mongo", query, "--config"])
-            .arg(&cfg)
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(5), "{query}: {}", stdout(&out));
-        let v = error_envelope(&out);
-        assert_eq!(v["error"]["code"], "NYET", "{query}");
-        assert_eq!(v["error"]["reason"], reason, "{query}");
+    // The url points at a closed port, so anything that reached the network
+    // would answer CONNECTION_FAILED (exit 6) instead — which is exactly what
+    // makes this a test of layer 1. `explain` runs the SAME layer 1, and a
+    // plan is not an exemption: `db.c.aggregate([{$out: ...}])` is refused
+    // whichever command asks for it.
+    for command in ["query", "explain"] {
+        for (query, reason) in MONGO_REFUSALS {
+            let out = nyet(tmp.path())
+                .args([command, "mongo", query, "--config"])
+                .arg(&cfg)
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(5),
+                "{command} {query}: {}",
+                stdout(&out)
+            );
+            let v = error_envelope(&out);
+            assert_eq!(v["error"]["code"], "NYET", "{command} {query}");
+            assert_eq!(v["error"]["reason"], *reason, "{command} {query}");
+            assert!(
+                v["error"]["hint"].as_str().is_some_and(|h| !h.is_empty()),
+                "{command} {query}: a refusal without a way forward is not a refusal (Д10)"
+            );
+        }
     }
 }
 
 #[test]
-fn mongo_says_honestly_what_it_does_not_support_yet() {
+fn the_mongodb_only_doctor_check_is_emitted_for_mongodb_only() {
+    // `server_side_js` is a MongoDB question; a `na` line about it on every
+    // other engine would be noise (UX-4). The MongoDB side of this check —
+    // including the fail-closed verdicts without a server — is pinned purely in
+    // src/output.rs and end to end in tests/mongo.rs, because a dead MongoDB
+    // connect costs ten seconds of server selection and this gate is the fast
+    // one (Д9).
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = write_config(tmp.path(), &mongo_config(tmp.path()));
-    // schema/explain/doctor are step 2: an honest NOT_IMPLEMENTED (exit 1)
-    // that names `nyet query` as the way forward — never a crash and never a
-    // half-answer.
-    for args in [
-        vec!["schema", "mongo"],
-        vec!["explain", "mongo", "db.users.find({})"],
-        vec!["doctor", "mongo", "--format", "json"],
-    ] {
-        let out = nyet(tmp.path())
-            .args(&args)
-            .args(["--config"])
-            .arg(&cfg)
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stdout(&out));
-        let v = error_envelope(&out);
-        assert_eq!(v["error"]["code"], "NOT_IMPLEMENTED", "{args:?}");
-        assert!(
-            v["error"]["hint"].as_str().unwrap().contains("nyet query"),
-            "{args:?}: the hint must point at what DOES work"
-        );
-    }
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connections.db]\nengine = \"sqlite\"\npath = \"{}/x.db\"\n\
+             allowed_dirs = [\"{}\"]\n",
+            tmp.path().display(),
+            tmp.path().display()
+        ),
+    );
+    let out = nyet(tmp.path())
+        .args(["doctor", "db", "--format", "json", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert!(
+        !v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "server_side_js"),
+        "server-side JavaScript is a MongoDB question only: {v}"
+    );
 }
 
 #[test]

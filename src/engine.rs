@@ -7,11 +7,12 @@
 
 use crate::guardrail::{CostEstimate, Guardrail};
 use crate::output::{
-    build_table, ConnectFact, Diagnosis, KeyPart, PiiAccess, ProbeFact, Schema, SchemaColumn,
-    SchemaFk, SchemaIndex, SchemaTable, ServerFacts, SuperuserFact,
+    build_table, ConnectFact, Diagnosis, JsFact, KeyPart, PiiAccess, ProbeFact, Schema,
+    SchemaColumn, SchemaFk, SchemaIndex, SchemaTable, ServerFacts, SuperuserFact,
 };
 use crate::validator::Origin;
 use futures_util::TryStreamExt;
+use mongodb::bson::{Bson, Document};
 use mongodb::options::{ClientOptions, ServerAddress, Tls};
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlRow, MySqlSslMode};
@@ -465,6 +466,7 @@ fn listing(objects: Vec<(String, TableParts)>) -> Schema {
                 columns: None,
                 indexes: Vec::new(),
                 fks: Vec::new(),
+                ..SchemaTable::default()
             })
             .collect(),
     )
@@ -827,6 +829,10 @@ async fn sqlite_columns(
             pk: false,
             unique: false,
             default,
+            // A catalog IS the schema: no provenance marker (that is a
+            // MongoDB question, where the fields are inferred).
+            source: None,
+            seen: None,
             pii: None,
         });
     }
@@ -1309,6 +1315,8 @@ impl Engine for Postgres {
         let server = match tokio::time::timeout(deadline, pg_diagnose(&mut conn)).await {
             Ok(facts) => facts,
             Err(_elapsed) => ServerFacts {
+                // Server-side JavaScript is a MongoDB question only.
+                js: None,
                 superuser: SuperuserFact::Unknown(
                     "the privilege query did not finish within the timeout".to_string(),
                 ),
@@ -1402,6 +1410,8 @@ async fn pg_diagnose(conn: &mut sqlx::PgConnection) -> ServerFacts {
     };
     let probe = pg_probe(conn).await;
     ServerFacts {
+        // Server-side JavaScript is a MongoDB question only.
+        js: None,
         superuser,
         read_only_note,
         probe,
@@ -1765,6 +1775,8 @@ async fn pg_schema(
             unique: false,
             default: row.try_get("default").map_err(pg_error)?,
             pii: None,
+            source: None,
+            seen: None,
         });
     }
 
@@ -2640,6 +2652,8 @@ impl Engine for Mysql {
                 Ok(m) => m,
                 Err(_elapsed) => {
                     return with_server(ServerFacts {
+                        // Server-side JavaScript is a MongoDB question only.
+                        js: None,
                         superuser: SuperuserFact::Unknown(
                             "the privilege queries did not finish within the timeout".to_string(),
                         ),
@@ -2677,6 +2691,8 @@ impl Engine for Mysql {
                     };
                 drop(conn);
                 with_server(ServerFacts {
+                    // Server-side JavaScript is a MongoDB question only.
+                    js: None,
                     superuser,
                     read_only_note,
                     probe,
@@ -2686,6 +2702,8 @@ impl Engine for Mysql {
             // is dropped (not closed) on return — poisoned on a timeout, unneeded
             // otherwise.
             Err(detail) => with_server(ServerFacts {
+                // Server-side JavaScript is a MongoDB question only.
+                js: None,
                 superuser,
                 read_only_note,
                 probe: ProbeFact::Unknown {
@@ -3138,6 +3156,8 @@ async fn mysql_schema(
                     .then(|| "auto_increment".to_string())
             }),
             pii: None,
+            source: None,
+            seen: None,
         });
     }
 
@@ -3583,7 +3603,7 @@ impl Engine for Mongo {
             hint: r.hint,
         })?;
         let (client, database) = self.open().await?;
-        let command = request.command(fetch_limit, self.query_timeout_ms);
+        let command = request.command(Some(fetch_limit), self.query_timeout_ms);
         let deadline = Duration::from_millis(self.query_timeout_ms);
         let reply =
             match tokio::time::timeout(deadline, client.database(&database).run_command(command))
@@ -3615,31 +3635,357 @@ impl Engine for Mongo {
         })
     }
 
-    /// Not implemented for MongoDB (step 2). The cli refuses `nyet explain` for
-    /// this engine before it gets here, so this is only the honest fallback —
-    /// a refusal, never a panic (Д3).
-    async fn estimate(&self, _sql: &str) -> Result<Option<CostEstimate>, EngineError> {
-        Err(mongo_not_implemented("explain"))
+    /// The query PLAN, and nothing else: `explain` in `queryPlanner` verbosity
+    /// does not execute the query (measured: 1 ms on a pipeline that took 4 s
+    /// under `executionStats`), while the verbosities that publish numbers RUN
+    /// it — so nyet asks for the one that cannot, and reports no cost or row
+    /// estimate rather than inventing one (the guardrail stays `off`, see the
+    /// type docs).
+    ///
+    /// Layer 1 runs here too, on the same text, for the same reason `execute`
+    /// re-runs it: `explain` must never be the way around the allowlist.
+    async fn estimate(&self, sql: &str) -> Result<Option<CostEstimate>, EngineError> {
+        let request = revalidate(sql)?;
+        let (client, database) = self.open().await?;
+        let db = client.database(&database);
+        // No outer deadline around the pair: `run` bounds each command on its
+        // own, and the plan must not be thrown away because the best-effort
+        // count that comes AFTER it ran out of a shared budget — the heavy
+        // schema where planning is slow is exactly where the plan is wanted.
+        let reply = self
+            .run(&db, request.explain_command(self.query_timeout_ms))
+            .await?;
+        // The collection's own document count, best effort: it is what turns
+        // "COLLSCAN" into "COLLSCAN over 40 million documents". A role that may
+        // not read it simply does not get that line.
+        let documents = self.count_of(&db, &request.collection).await;
+        Ok(Some(CostEstimate {
+            plan: crate::mongo::meta::plan(&reply, documents),
+            // MongoDB's queryPlanner publishes neither, and nyet does not
+            // manufacture what the database does not say (UX-7).
+            cost: None,
+            rows: None,
+            lower_bound: false,
+        }))
     }
 
-    async fn schema(&self, _table: Option<&str>) -> Result<Schema, EngineError> {
-        Err(mongo_not_implemented("schema"))
+    /// MongoDB has no schema, so this answers what it CAN prove and marks
+    /// everything else as the guess it is (`crate::mongo::meta`). Without a
+    /// collection name it lists names and kinds only — describing every
+    /// collection would mean sampling every collection, one round trip per
+    /// aspect per collection, for an answer no agent asked for (UX-4).
+    async fn schema(&self, table: Option<&str>) -> Result<Schema, EngineError> {
+        let (client, database) = self.open().await?;
+        let db = client.database(&database);
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, self.collect_schema(&db, table)).await {
+            Ok(schema) => schema,
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
+        }
     }
 
+    /// **No probe write.** MongoDB is the one engine where layer 3 can be
+    /// proven by ASKING: `connectionStatus {showPrivileges: true}` lists every
+    /// action these credentials hold on every resource of the cluster, so
+    /// doctor learns whether a direct client could write without writing
+    /// anything itself — and it checks the WHOLE cluster, because a role that
+    /// may write in another database is a way out for this one's data
+    /// (`$out: {db: ..., coll: ...}`, measured).
     async fn diagnose(&self, _pii: &[(String, String)]) -> Diagnosis {
-        let (message, hint) = error_parts(mongo_not_implemented("doctor"));
+        let (client, database) = match self.open().await {
+            Ok(open) => open,
+            Err(e) => {
+                let (message, hint) = error_parts(e);
+                return Diagnosis {
+                    connect: ConnectFact::Failed { message, hint },
+                    server: None,
+                    // No `[pii]` on a MongoDB connection (config error).
+                    pii: Vec::new(),
+                };
+            }
+        };
+        let db = client.database(&database);
+        let status = mongodb::bson::doc! { "connectionStatus": 1, "showPrivileges": true };
+        let (probe, superuser) = match self.run(&db, status).await {
+            Ok(reply) => match reply.get("authInfo").and_then(Bson::as_document) {
+                Some(auth) => (
+                    match crate::mongo::meta::grants(auth, &database) {
+                        Some(grants) => ProbeFact::Grants(Box::new(grants)),
+                        // The server answered but published no privilege list:
+                        // not a pass (UX-1), a "could not verify".
+                        None => ProbeFact::Unknown {
+                            detail: "the server did not report this connection's privileges, so \
+                                     nyet cannot tell whether these credentials may write"
+                                .to_string(),
+                        },
+                    },
+                    crate::mongo::meta::superuser(auth),
+                ),
+                None => (
+                    ProbeFact::Unknown {
+                        detail: "the server's connectionStatus reply carried no `authInfo`"
+                            .to_string(),
+                    },
+                    SuperuserFact::Unknown(
+                        "the server's connectionStatus reply carried no `authInfo`".to_string(),
+                    ),
+                ),
+            },
+            Err(e) => {
+                let (detail, _) = error_parts(e);
+                (
+                    ProbeFact::Unknown {
+                        detail: detail.clone(),
+                    },
+                    SuperuserFact::Unknown(detail),
+                )
+            }
+        };
         Diagnosis {
-            connect: ConnectFact::Failed { message, hint },
-            server: None,
+            connect: ConnectFact::Ok {
+                via_tunnel: self.host_override.is_some(),
+            },
+            server: Some(ServerFacts {
+                superuser,
+                read_only_note: None,
+                probe,
+                js: Some(self.javascript(&client).await),
+            }),
             pii: Vec::new(),
         }
     }
 }
 
-fn mongo_not_implemented(command: &str) -> EngineError {
+/// How long the best-effort `$collStats` count may take. It reads collection
+/// METADATA (no scan), so a second is already generous; the point of the cap is
+/// that a slow one cannot cost the caller an answer it already has.
+const COUNT_BUDGET_MS: u64 = 1_000;
+
+impl Mongo {
+    /// One command, under BOTH halves of the timeout: `maxTimeMS` on the wire
+    /// and the in-process deadline around it, exactly like `execute`. It is per
+    /// command rather than only around the sequence because `diagnose` must
+    /// never hang — a doctor that never answers is worse than a `warn`.
+    async fn run(
+        &self,
+        db: &mongodb::Database,
+        mut command: Document,
+    ) -> Result<Document, EngineError> {
+        if !command.contains_key("maxTimeMS") {
+            command.insert(
+                "maxTimeMS",
+                i32::try_from(self.query_timeout_ms).unwrap_or(i32::MAX),
+            );
+        }
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        match tokio::time::timeout(deadline, db.run_command(command)).await {
+            Ok(reply) => reply.map_err(mongo_error),
+            Err(_elapsed) => Err(client_timeout(self.query_timeout_ms)),
+        }
+    }
+
+    /// `cursor.firstBatch` of a command reply as documents. A cursor the server
+    /// left OPEN is reported by the caller that cares (`meta::collections`);
+    /// here a missing batch is simply nothing.
+    fn batch(reply: &Document) -> Vec<Document> {
+        reply
+            .get("cursor")
+            .and_then(Bson::as_document)
+            .and_then(|c| c.get("firstBatch"))
+            .and_then(Bson::as_array)
+            .map(|docs| docs.iter().filter_map(Bson::as_document).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The collection's document count from its own metadata. Best effort by
+    /// design: a role that may not read `$collStats` (or a view, which has no
+    /// count of its own) just does not get the number — better a missing line
+    /// than a failed command.
+    ///
+    /// **On its own short budget**, not the query's: this is an extra line on
+    /// an answer that is already in hand (a plan, a schema), so it must never
+    /// be the reason that answer turns into a TIMEOUT.
+    async fn count_of(&self, db: &mongodb::Database, collection: &str) -> Option<u64> {
+        let budget = Duration::from_millis(COUNT_BUDGET_MS.min(self.query_timeout_ms));
+        let command = mongodb::bson::doc! {
+            "aggregate": collection,
+            "pipeline": [ { "$collStats": { "count": {} } } ],
+            "cursor": {},
+            "maxTimeMS": i32::try_from(budget.as_millis()).unwrap_or(i32::MAX),
+        };
+        let reply = tokio::time::timeout(budget, self.run(db, command))
+            .await
+            .ok()?
+            .ok()?;
+        crate::mongo::meta::count(&Self::batch(&reply))
+    }
+
+    async fn collect_schema(
+        &self,
+        db: &mongodb::Database,
+        table: Option<&str>,
+    ) -> Result<Schema, EngineError> {
+        let Some(name) = table else {
+            let reply = self
+                .run(db, Self::authorized_collections(None))
+                .await
+                .map_err(listing_refused)?;
+            let objects = crate::mongo::meta::collections(&reply).map_err(reply_error)?;
+            return Ok(Schema {
+                tables: crate::mongo::meta::listing(objects),
+            });
+        };
+        // The FULL listCollections carries `options.validator` — the declared
+        // $jsonSchema, the only real schema MongoDB has. A role restricted to a
+        // view may not run it at all (measured), so nyet falls back to the form
+        // that needs no privilege beyond reading the collection itself, and
+        // then simply has no validator to report (it does not claim there is
+        // none — see the SCHEMA_SAMPLED warning).
+        let (info, listed) = match self.run(db, Self::list_collections(name)).await {
+            Ok(reply) => (
+                crate::mongo::meta::collections(&reply).map_err(reply_error)?,
+                true,
+            ),
+            Err(_) => match self.run(db, Self::authorized_collections(Some(name))).await {
+                Ok(reply) => (
+                    crate::mongo::meta::collections(&reply).map_err(reply_error)?,
+                    true,
+                ),
+                Err(_) => (Vec::new(), false),
+            },
+        };
+        let info = info.into_iter().find(|c| c.name == name);
+        let kind = info.as_ref().map_or("collection", |c| c.kind);
+        // The catalog answered and this name is not in it: the cli turns an
+        // empty schema into "not found" with the way forward, exactly as it
+        // does for a table. Note there is no cheaper probe for this — a `find`
+        // on a collection that does not exist SUCCEEDS in MongoDB and returns
+        // nothing (which is why `nyet query` reports it as an empty result).
+        // When the listing itself was refused, nyet cannot tell "missing" from
+        // "invisible to this role", so it samples and lets the answer say
+        // `sampled: 0` rather than claiming the collection is not there.
+        if listed && info.is_none() {
+            return Ok(Schema { tables: Vec::new() });
+        }
+        let sample = mongodb::bson::doc! {
+            "aggregate": name,
+            "pipeline": [ { "$sample": { "size": i64::from(crate::mongo::meta::SAMPLE_SIZE) } } ],
+            "cursor": { "batchSize": i64::from(crate::mongo::meta::SAMPLE_SIZE) },
+        };
+        let sample = Self::batch(&self.run(db, sample).await?);
+        // A view has no indexes and no count of its own; asking would only earn
+        // an error to swallow.
+        let (indexes, count) = match kind {
+            "view" => (Vec::new(), None),
+            _ => (
+                match self
+                    .run(db, mongodb::bson::doc! { "listIndexes": name })
+                    .await
+                {
+                    Ok(reply) => crate::mongo::meta::indexes(&reply),
+                    Err(_) => Vec::new(),
+                },
+                self.count_of(db, name).await,
+            ),
+        };
+        Ok(Schema {
+            tables: vec![crate::mongo::meta::table(
+                name.to_string(),
+                kind,
+                info.as_ref().and_then(|c| c.options.as_ref()),
+                &sample,
+                indexes,
+                count,
+            )],
+        })
+    }
+
+    /// The FULL `listCollections`, the only form that carries
+    /// `options.validator` — and the one a role restricted to a view may not
+    /// run at all (measured: `Unauthorized`).
+    fn list_collections(name: &str) -> Document {
+        mongodb::bson::doc! { "listCollections": 1, "filter": { "name": name } }
+    }
+
+    /// `nameOnly` + `authorizedCollections`: the form that needs no privilege
+    /// beyond being allowed to read the collections it names, so the LISTING
+    /// answers what this role can actually reach (measured: it is all a
+    /// view-scoped role gets) instead of failing outright. It carries no
+    /// options, hence no validator — the honest consequence, said out loud in
+    /// the SCHEMA_SAMPLED warning.
+    fn authorized_collections(name: Option<&str>) -> Document {
+        let mut cmd = mongodb::bson::doc! {
+            "listCollections": 1,
+            "nameOnly": true,
+            "authorizedCollections": true,
+        };
+        if let Some(name) = name {
+            cmd.insert("filter", mongodb::bson::doc! { "name": name });
+        }
+        cmd
+    }
+
+    /// Whether the SERVER evaluates JavaScript, from its startup options —
+    /// the only honest source (MongoDB publishes no runtime parameter for it,
+    /// measured), and read WITHOUT sending a line of JavaScript: probing by
+    /// running `$where` would be nyet doing the exact thing it refuses to do.
+    /// A role that may not read them gets an honest "could not check".
+    async fn javascript(&self, client: &mongodb::Client) -> JsFact {
+        let admin = client.database("admin");
+        match self
+            .run(&admin, mongodb::bson::doc! { "getCmdLineOpts": 1 })
+            .await
+        {
+            Ok(reply) => crate::mongo::meta::javascript(&reply),
+            // Minus the echo of the command document: MongoDB quotes it back
+            // in an `Unauthorized`, and here it is always the same three words
+            // of nyet's own (UX-4).
+            Err(e) => JsFact::Unknown(without_command_echo(error_parts(e).0)),
+        }
+    }
+}
+
+/// Layer 1, re-run on the text the cli already classified — same reason as in
+/// `execute`: what nyet sends is what was classified, with no second
+/// representation in between. `nyet explain` must not be a way around it.
+fn revalidate(sql: &str) -> Result<crate::mongo::Request, EngineError> {
+    crate::mongo::check(sql).map_err(|r| EngineError::Db {
+        message: format!("nyet refused this query on re-validation: {}", r.message),
+        hint: r.hint,
+    })
+}
+
+/// The driver's message up to the point where the server starts quoting the
+/// command document back. Used only where that document is nyet's OWN and
+/// carries nothing the reader needs (the doctor probes).
+fn without_command_echo(message: String) -> String {
+    match message.find(" { ") {
+        Some(cut) => message[..cut].trim_end().to_string(),
+        None => message,
+    }
+}
+
+fn reply_error(message: String) -> EngineError {
     EngineError::Db {
-        message: format!("nyet {command} does not support MongoDB yet"),
-        hint: "MongoDB currently supports `nyet query` only".to_string(),
+        message,
+        hint: "this is a server/driver mismatch rather than a problem with the request; \
+               report it if it persists"
+            .to_string(),
+    }
+}
+
+/// The listing is the one MongoDB metadata read with no fallback: without it
+/// nyet does not know what is there, and answering with an empty list would be
+/// "this database has no collections" (UX-1).
+fn listing_refused(e: EngineError) -> EngineError {
+    let (message, _) = error_parts(e);
+    let message = without_command_echo(message);
+    EngineError::Db {
+        message: format!("nyet could not list the collections of this database: {message}"),
+        hint: "a role that may not run listCollections can still be asked about one collection \
+               by name: nyet schema <alias> <collection> — it then reports the fields it can \
+               infer from a sample of that collection"
+            .to_string(),
     }
 }
 

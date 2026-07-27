@@ -21,6 +21,11 @@
 //! docs/DEV.md), so this module is the only thing between the agent and the
 //! server other than the credentials' own privileges (layer 3).
 
+/// Reading the server's METADATA replies (schema/explain/doctor). Split out on
+/// purpose: this file is the security boundary and stays about the boundary,
+/// while `meta` is about presenting what the server said. Both are pure.
+pub mod meta;
+
 use mongodb::bson::{Bson, Decimal128, Document, Regex};
 use std::str::FromStr;
 
@@ -1886,8 +1891,14 @@ impl Request {
     /// truncation), `singleBatch` keeps a `find` to ONE round trip with a
     /// server-closed cursor, and `maxTimeMS` is the server-side half of the
     /// timeout. None of them can be set by the agent (see `NYET_OWNED`).
-    pub fn command(&self, fetch_limit: u64, max_time_ms: u64) -> Document {
-        let fetch = i64::try_from(fetch_limit).unwrap_or(i64::MAX).max(1);
+    ///
+    /// `fetch_limit` is `None` for one caller only — [`explain_command`], which
+    /// describes the query's SHAPE and fetches nothing, so nyet's own row limit
+    /// would appear in the plan as a `LIMIT` stage the agent never wrote.
+    ///
+    /// [`explain_command`]: Self::explain_command
+    pub fn command(&self, fetch_limit: Option<u64>, max_time_ms: u64) -> Document {
+        let fetch = fetch_limit.map(|n| i64::try_from(n).unwrap_or(i64::MAX).max(1));
         let max_time = i32::try_from(max_time_ms).unwrap_or(i32::MAX);
         let mut cmd = Document::new();
         match &self.op {
@@ -1911,7 +1922,14 @@ impl Request {
                 }
                 // The agent's own limit never RAISES nyet's: the connection's
                 // row_limit is the config owner's word.
-                cmd.insert("limit", limit.map_or(fetch, |n| n.min(fetch)));
+                let effective = match (fetch, limit) {
+                    (Some(fetch), Some(n)) => Some(fetch.min(*n)),
+                    (Some(fetch), None) => Some(fetch),
+                    (None, agent) => *agent,
+                };
+                if let Some(n) = effective {
+                    cmd.insert("limit", n);
+                }
                 // `batchSize`, NOT `singleBatch`. Both keep the read to one
                 // round trip, but `singleBatch` makes the server close the
                 // cursor whatever happened — and the server cuts a batch at
@@ -1923,17 +1941,23 @@ impl Request {
                 // as truncation. Without a batch size the first batch would be
                 // the protocol default of 101 documents, which would truncate
                 // at 101 instead of at the row limit.
-                cmd.insert("batchSize", limit.map_or(fetch, |n| n.min(fetch)));
+                if let Some(n) = effective {
+                    cmd.insert("batchSize", n);
+                }
             }
             Op::Aggregate { pipeline } => {
                 let mut stages = pipeline.clone();
-                let mut limit = Document::new();
-                limit.insert("$limit", fetch);
-                stages.push(Bson::Document(limit));
+                if let Some(fetch) = fetch {
+                    let mut limit = Document::new();
+                    limit.insert("$limit", fetch);
+                    stages.push(Bson::Document(limit));
+                }
                 cmd.insert("aggregate", self.collection.clone());
                 cmd.insert("pipeline", stages);
                 let mut cursor = Document::new();
-                cursor.insert("batchSize", fetch);
+                if let Some(fetch) = fetch {
+                    cursor.insert("batchSize", fetch);
+                }
                 cmd.insert("cursor", cursor);
             }
             Op::Count { filter } => {
@@ -1985,25 +2009,57 @@ impl Request {
                 sort.insert("_id", 1_i32);
                 let mut sort_stage = Document::new();
                 sort_stage.insert("$sort", sort);
-                let mut limit_stage = Document::new();
-                limit_stage.insert("$limit", fetch);
+                let mut pipeline = vec![
+                    Bson::Document(match_stage),
+                    Bson::Document(unwind_stage),
+                    Bson::Document(group_stage),
+                    Bson::Document(sort_stage),
+                ];
+                if let Some(fetch) = fetch {
+                    let mut limit_stage = Document::new();
+                    limit_stage.insert("$limit", fetch);
+                    pipeline.push(Bson::Document(limit_stage));
+                }
                 cmd.insert("aggregate", self.collection.clone());
-                cmd.insert(
-                    "pipeline",
-                    vec![
-                        Bson::Document(match_stage),
-                        Bson::Document(unwind_stage),
-                        Bson::Document(group_stage),
-                        Bson::Document(sort_stage),
-                        Bson::Document(limit_stage),
-                    ],
-                );
+                cmd.insert("pipeline", pipeline);
                 let mut cursor = Document::new();
-                cursor.insert("batchSize", fetch);
+                if let Some(fetch) = fetch {
+                    cursor.insert("batchSize", fetch);
+                }
                 cmd.insert("cursor", cursor);
             }
         }
         cmd.insert("maxTimeMS", max_time);
+        cmd
+    }
+
+    /// The `explain` of the command [`command`](Self::command) would run —
+    /// same collection, same filter, same pipeline, same `.sort()`/`.skip()`
+    /// and the agent's own `.limit(n)`.
+    ///
+    /// **Deliberately NOT the same bounds:** nyet's own row limit is left out
+    /// (`command(None, ..)`). It is how the ANSWER is cut, not part of the
+    /// query the agent wrote, and inside a plan it would show up as a `LIMIT`
+    /// stage carrying a number the agent never chose. The plan is therefore
+    /// the un-limited — that is, the worst-case — shape of the read.
+    ///
+    /// **`verbosity` is hard-coded to `queryPlanner`, and this is the security
+    /// property of the whole command:** `executionStats` and
+    /// `allPlansExecution` RUN the query (measured: a pipeline that took 1 ms
+    /// in `queryPlanner` ran for 4 s in `executionStats`), so `explain` would
+    /// otherwise be a way to execute a statement while calling it "just a
+    /// plan". Nothing in the agent's input can reach this field: nyet builds
+    /// the whole document, and the parser refuses an options document anyway.
+    ///
+    /// `maxTimeMS` rides on the OUTER document, where it bounds the explain
+    /// itself — the inner command is the thing being described, not run.
+    pub fn explain_command(&self, max_time_ms: u64) -> Document {
+        let mut inner = self.command(None, max_time_ms);
+        inner.remove("maxTimeMS");
+        let mut cmd = Document::new();
+        cmd.insert("explain", inner);
+        cmd.insert("verbosity", "queryPlanner");
+        cmd.insert("maxTimeMS", i32::try_from(max_time_ms).unwrap_or(i32::MAX));
         cmd
     }
 
@@ -2380,7 +2436,7 @@ mod tests {
     /// an agent's own `.limit()` can only LOWER the effective limit.
     #[test]
     fn the_command_carries_nyets_own_bounds() {
-        let cmd = allow("db.users.find({a: 1})").command(1001, 30_000);
+        let cmd = allow("db.users.find({a: 1})").command(Some(1001), 30_000);
         assert_eq!(cmd.get_str("find").unwrap(), "users");
         assert_eq!(cmd.get_i64("limit").unwrap(), 1001);
         // batchSize, NOT singleBatch: singleBatch closes the cursor whatever
@@ -2390,18 +2446,18 @@ mod tests {
         assert_eq!(cmd.get_i32("maxTimeMS").unwrap(), 30_000);
 
         // The agent asked for fewer rows than nyet allows: its number wins.
-        let cmd = allow("db.users.find({}).limit(5)").command(1001, 1000);
+        let cmd = allow("db.users.find({}).limit(5)").command(Some(1001), 1000);
         assert_eq!(cmd.get_i64("limit").unwrap(), 5);
         // ... and asking for more than nyet allows does NOT raise the ceiling.
-        let cmd = allow("db.users.find({}).limit(500000)").command(1001, 1000);
+        let cmd = allow("db.users.find({}).limit(500000)").command(Some(1001), 1000);
         assert_eq!(cmd.get_i64("limit").unwrap(), 1001);
         // findOne is a find with limit 1.
-        let cmd = allow("db.users.findOne({})").command(1001, 1000);
+        let cmd = allow("db.users.findOne({})").command(Some(1001), 1000);
         assert_eq!(cmd.get_i64("limit").unwrap(), 1);
 
         // An aggregation gets the limit as a trailing stage plus a batch size
         // that keeps the reply to ONE round trip with a closed cursor.
-        let cmd = allow("db.users.aggregate([{$match: {a: 1}}])").command(11, 5000);
+        let cmd = allow("db.users.aggregate([{$match: {a: 1}}])").command(Some(11), 5000);
         let pipeline = cmd.get_array("pipeline").unwrap();
         assert_eq!(pipeline.len(), 2);
         assert_eq!(
@@ -2421,14 +2477,14 @@ mod tests {
         );
 
         // countDocuments is an aggregation, like mongosh's own implementation.
-        let cmd = allow("db.users.countDocuments({a: 1})").command(11, 5000);
+        let cmd = allow("db.users.countDocuments({a: 1})").command(Some(11), 5000);
         assert_eq!(cmd.get_str("aggregate").unwrap(), "users");
         assert_eq!(cmd.get_array("pipeline").unwrap().len(), 3);
 
         // distinct is a BOUNDED aggregation, not the `distinct` command: that
         // command takes no limit at all, so the whole distinct set crossed the
         // network however small --limit was.
-        let cmd = allow("db.users.distinct(\"status\", {a: 1})").command(11, 5000);
+        let cmd = allow("db.users.distinct(\"status\", {a: 1})").command(Some(11), 5000);
         assert_eq!(cmd.get_str("aggregate").unwrap(), "users");
         assert!(!cmd.contains_key("distinct"));
         let pipeline = cmd.get_array("pipeline").unwrap();

@@ -119,16 +119,100 @@ async fn start_and_seed() -> (ContainerAsync<Mongo>, u16) {
         .await
         .unwrap();
 
-    // Layer 3: the account nyet uses may only READ.
-    root.database("test")
-        .run_command(doc! {
-            "createUser": "app",
-            "pwd": PW,
-            "roles": [ { "role": "read", "db": "test" } ],
-        })
+    // A collection with a DECLARED $jsonSchema validator: the one thing in
+    // MongoDB that is a real schema, and the only source `nyet schema` is
+    // allowed to present as one.
+    db.run_command(doc! {
+        "create": "validated",
+        "validator": { "$jsonSchema": {
+            "bsonType": "object",
+            "required": ["email"],
+            "properties": {
+                "email": { "bsonType": "string" },
+                "age": { "bsonType": ["int", "null"] },
+            },
+        }},
+    })
+    .await
+    .unwrap();
+    db.collection::<Document>("validated")
+        .insert_many(vec![
+            doc! { "email": "a@b.c", "age": 30, "note": "only in some documents" },
+            doc! { "email": "d@e.f" },
+        ])
         .await
         .unwrap();
+    db.run_command(doc! {
+        "createIndexes": "validated",
+        "indexes": [ { "key": { "email": 1 }, "name": "email_1", "unique": true } ],
+    })
+    .await
+    .unwrap();
+    // A view plus a role scoped to it: the README's own recipe for exposing a
+    // curated slice, and the setup where `listCollections` is Unauthorized.
+    db.run_command(doc! { "create": "small_view", "viewOn": "small", "pipeline": [] })
+        .await
+        .unwrap();
+    db.run_command(doc! {
+        "createRole": "viewonly",
+        "privileges": [ { "resource": { "db": "test", "collection": "small_view" },
+                          "actions": ["find"] } ],
+        "roles": [],
+    })
+    .await
+    .unwrap();
+
+    // Layer 3: the account nyet uses may only READ.
+    for (user, roles) in [
+        ("app", vec![doc! { "role": "read", "db": "test" }]),
+        // Read here, WRITE somewhere else in the same cluster: the role doctor
+        // must not call read-only (measured: `$out: {db: "scratch"}` copies a
+        // collection out of `test` with exactly these grants).
+        (
+            "app_rw",
+            vec![
+                doc! { "role": "read", "db": "test" },
+                doc! { "role": "readWrite", "db": "scratch" },
+            ],
+        ),
+        ("app_view", vec![doc! { "role": "viewonly", "db": "test" }]),
+    ] {
+        root.database("test")
+            .run_command(doc! { "createUser": user, "pwd": PW, "roles": roles })
+            .await
+            .unwrap();
+    }
     (container, port)
+}
+
+/// A config naming a specific account, for the doctor/schema cases that are
+/// about the ROLE rather than about the query.
+fn write_config_as(dir: &Path, port: u16, user: &str) -> std::path::PathBuf {
+    let path = dir.join(format!("config_{user}.toml"));
+    std::fs::write(
+        &path,
+        format!(
+            "[connections.mg]\nengine = \"mongodb\"\n\
+             url = \"mongodb://{user}@127.0.0.1:{port}/test\"\n\
+             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    path
+}
+
+/// The status of one doctor check, by name.
+fn check_status(v: &serde_json::Value, name: &str) -> String {
+    v["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no checks in {v}"))
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} check in {v}"))["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 fn write_config(dir: &Path, port: u16, extra: &str) -> std::path::PathBuf {
@@ -469,6 +553,274 @@ fn mongo_query_end_to_end() {
         assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
         assert_eq!(envelope(&out)["meta"]["row_count"], 0);
 
+        schema_says_what_is_a_schema_and_what_is_a_guess(tmp.path(), &cfg);
+        explain_shows_the_plan_without_running_the_query(tmp.path(), &cfg, port);
+        doctor_proves_read_only_from_privileges(tmp.path(), port);
+
         drop(container);
     });
+}
+
+/// `nyet schema` on a real server: the listing, a collection with a declared
+/// validator, one without, and a view — with the provenance of every line.
+fn schema_says_what_is_a_schema_and_what_is_a_guess(home: &Path, cfg: &Path) {
+    // 1) Without a collection name: names and kinds, one round trip, and a
+    //    warning that says why there is nothing more.
+    let out = run(home, cfg, &["schema", "mg"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = envelope(&out);
+    let kinds: Vec<(String, String)> = v["schema"]["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["name"].as_str().unwrap().to_string(),
+                t["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(
+        kinds.contains(&("small".to_string(), "collection".to_string())),
+        "{v}"
+    );
+    assert!(
+        kinds.contains(&("small_view".to_string(), "view".to_string())),
+        "{v}"
+    );
+    // The internal catalogs layer 1 refuses to read are not advertised either.
+    assert!(!kinds.iter().any(|(n, _)| n.starts_with("system.")), "{v}");
+    assert!(v["schema"]["tables"][0].get("columns").is_none(), "{v}");
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "SCHEMA_TRUNCATED"),
+        "{v}"
+    );
+
+    // 2) A collection with a DECLARED validator: those fields are a real rule
+    //    the server enforces, and they say so. A field the validator does not
+    //    mention is still shown — as the guess it is.
+    let out = run(home, cfg, &["schema", "mg", "validated"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = envelope(&out);
+    let table = &v["schema"]["tables"][0];
+    assert_eq!(table["kind"], "collection");
+    assert_eq!(table["count"], 2, "the count comes from $collStats: {v}");
+    assert_eq!(table["sampled"], 2);
+    let column = |name: &str| {
+        table["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} column in {v}"))
+            .clone()
+    };
+    assert_eq!(column("email")["source"], "validator");
+    assert_eq!(column("email")["type"], "string");
+    // A single-column unique index folds into the column flag, as everywhere.
+    assert_eq!(column("email")["unique"], true);
+    assert_eq!(column("age")["type"], "int|null");
+    assert_eq!(column("note")["source"], "sample");
+    assert_eq!(column("note")["seen"], 1, "seen in one of the two: {v}");
+    assert_eq!(column("_id")["pk"], true);
+    // The whole answer carries the marker: part of it is an inference (UX-7).
+    let sampled = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "SCHEMA_SAMPLED")
+        .unwrap_or_else(|| panic!("no SCHEMA_SAMPLED warning in {v}"))
+        .clone();
+    assert!(sampled["message"].as_str().unwrap().contains("$sample"));
+
+    // 3) A collection with no validator at all: every field is a guess, nested
+    //    paths are dotted (the spelling a filter takes), and the document count
+    //    is the collection's own.
+    let out = run(home, cfg, &["schema", "mg", "small"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = envelope(&out);
+    let table = &v["schema"]["tables"][0];
+    assert_eq!(table["count"], 5);
+    let columns = table["columns"].as_array().unwrap();
+    assert!(
+        columns.iter().all(|c| c["source"] == "sample"),
+        "nothing here is a schema: {v}"
+    );
+    let city = columns
+        .iter()
+        .find(|c| c["name"] == "profile.city")
+        .unwrap_or_else(|| panic!("no dotted path in {v}"));
+    assert_eq!(city["type"], "string");
+    assert_eq!(city["seen"], 1);
+    assert_eq!(
+        columns.iter().find(|c| c["name"] == "tags").unwrap()["type"],
+        "array"
+    );
+
+    // 4) A view is named as a view and sampled like anything else.
+    let out = run(home, cfg, &["schema", "mg", "small_view"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = envelope(&out);
+    assert_eq!(v["schema"]["tables"][0]["kind"], "view");
+    assert_eq!(v["schema"]["tables"][0]["sampled"], 5);
+
+    // 5) A collection that is not there is exit 7 with the way forward, like a
+    //    missing table on the SQL engines.
+    let out = run(home, cfg, &["schema", "mg", "nope"]);
+    assert_eq!(out.status.code(), Some(7), "{}", stdout(&out));
+    let v = envelope(&out);
+    assert_eq!(v["error"]["code"], "DB_ERROR");
+    assert!(v["error"]["hint"].as_str().unwrap().contains("nyet schema"));
+}
+
+/// `nyet explain`: the plan, no numbers invented — and, the point of the whole
+/// command, WITHOUT running the query.
+fn explain_shows_the_plan_without_running_the_query(home: &Path, cfg: &Path, port: u16) {
+    // An indexed lookup and an unindexed one, which is the difference the
+    // agent actually needs (there is no cost number to compare).
+    let out = run(
+        home,
+        cfg,
+        &["explain", "mg", "db.validated.find({email: \"a@b.c\"})"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = envelope(&out);
+    let plan = &v["estimate"]["plan"];
+    assert_eq!(plan["namespace"], "test.validated");
+    assert!(
+        plan["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("IXSCAN")),
+        "{v}"
+    );
+    assert_eq!(plan["indexes"][0], "email_1");
+    assert_eq!(plan["collection_documents"], 2);
+    // No cost, no row estimate: MongoDB publishes neither, and nyet does not
+    // invent one (the guardrail is off for this engine).
+    assert_eq!(v["estimate"]["mode"], "off");
+    assert_eq!(v["estimate"]["verdict"], "no_estimate");
+    assert!(v["estimate"].get("cost").is_none(), "{v}");
+    assert!(v["estimate"].get("rows").is_none(), "{v}");
+
+    let out = run(
+        home,
+        cfg,
+        &["explain", "mg", "db.small.find({name: \"ann\"})"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = envelope(&out);
+    assert_eq!(v["estimate"]["plan"]["stages"][0], "COLLSCAN");
+    assert!(v["estimate"]["plan"].get("indexes").is_none(), "{v}");
+
+    // THE claim: `explain` does not execute. This is the very pipeline that
+    // times out under `--timeout 1` when it is RUN (case 4 above); planning it
+    // answers in milliseconds, so a success here is the proof.
+    let heavy = "db.many.aggregate([{$lookup: {from: \"many\", as: \"x\", let: {v: \"$n\"}, \
+                 pipeline: [{$match: {$expr: {$eq: [\"$m\", \"$$v\"]}}}]}}, \
+                 {$group: {_id: null, n: {$sum: {$size: \"$x\"}}}}])";
+    // The one-second budget is the server's too (maxTimeMS rides on the
+    // explain), so a plan that turned into an execution would come back as
+    // TIMEOUT (exit 8) instead of a plan. No timing assertion, no flake.
+    let second = write_config(home, port, "timeout_secs = 1\n");
+    let out = run(home, &second, &["explain", "mg", heavy]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "explain must PLAN, not run: {}",
+        stdout(&out)
+    );
+    assert_eq!(envelope(&out)["estimate"]["plan"]["namespace"], "test.many");
+}
+
+/// `nyet doctor`: layer 3 proven from the privileges the server publishes, with
+/// no probe write anywhere — and honest about what it could not check.
+fn doctor_proves_read_only_from_privileges(home: &Path, port: u16) {
+    let json = |cfg: &Path| -> serde_json::Value {
+        let out = run(home, cfg, &["doctor", "mg", "--format", "json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        assert_no_password_leak(&out);
+        envelope(&out)
+    };
+
+    // The recommended setup: role `read` on this database and nothing else.
+    let v = json(&write_config_as(home, port, "app"));
+    assert_eq!(check_status(&v, "connectivity"), "ok");
+    assert_eq!(check_status(&v, "read_only_role"), "ok", "{v}");
+    assert_eq!(check_status(&v, "not_superuser"), "ok", "{v}");
+    // Scripting cannot be checked under a read-only role, and doctor says that
+    // instead of passing (UX-1) — nyet will not probe by RUNNING JavaScript.
+    assert_eq!(check_status(&v, "server_side_js"), "warn", "{v}");
+    // Plaintext connection: not a pass either.
+    assert_eq!(check_status(&v, "transport_encrypted"), "warn", "{v}");
+
+    // Read here, write in another database of the same cluster: honest warning
+    // that names WHERE, because `$out` from here into there is a way out.
+    let v = json(&write_config_as(home, port, "app_rw"));
+    assert_eq!(check_status(&v, "read_only_role"), "warn", "{v}");
+    let message = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "read_only_role")
+        .unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("scratch"), "{message}");
+
+    // And with no server at all: doctor still exits 0 (a broken connection is
+    // a diagnosis), and every check that needed the server says so instead of
+    // passing. Lives here rather than in tests/cli.rs because a dead MongoDB
+    // connect costs ten seconds of server selection, and that gate is the fast
+    // one (Д9).
+    let dead = home.join("config_dead.toml");
+    std::fs::write(
+        &dead,
+        format!(
+            "[connections.mg]\nengine = \"mongodb\"\n\
+             url = \"mongodb://nobody@127.0.0.1:1/test\"\n\
+             allowed_dirs = [\"{}\"]\ntimeout_secs = 1\n",
+            home.display()
+        ),
+    )
+    .unwrap();
+    let out = run(home, &dead, &["doctor", "mg", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v = envelope(&out);
+    assert_eq!(check_status(&v, "connectivity"), "fail", "{v}");
+    for name in ["read_only_role", "not_superuser", "server_side_js"] {
+        assert_eq!(check_status(&v, name), "warn", "{name} must not read as ok");
+    }
+
+    // A role scoped to one view: `listCollections` is Unauthorized, so the
+    // LISTING still answers (nameOnly + authorizedCollections) and the
+    // collection it may not see is simply not there.
+    let cfg = write_config_as(home, port, "app_view");
+    let v = json(&cfg);
+    assert_eq!(check_status(&v, "read_only_role"), "ok", "{v}");
+    let out = run(home, &cfg, &["schema", "mg"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v = envelope(&out);
+    let tables = v["schema"]["tables"].as_array().unwrap();
+    assert_eq!(tables.len(), 1, "only what this role may read: {v}");
+    assert_eq!(tables[0]["name"], "small_view");
+    // And the view itself can still be described, from a sample alone.
+    let out = run(home, &cfg, &["schema", "mg", "small_view"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v = envelope(&out);
+    assert_eq!(v["schema"]["tables"][0]["sampled"], 5, "{v}");
+    assert!(
+        v["schema"]["tables"][0]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["source"] == "sample"),
+        "{v}"
+    );
 }

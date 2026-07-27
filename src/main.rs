@@ -910,9 +910,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // (there is no agent SQL here, and a catalog read has nothing to
             // estimate).
             let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
-            if session.db.is_mongo() {
-                return Err(mongo_not_implemented("schema", &alias));
-            }
+            let is_mongo = session.db.is_mongo();
             let engine = conn.engine.clone();
             let cwd_str = cwd.display().to_string();
             let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
@@ -934,25 +932,63 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // out (Д10) — no new error code for it.
                 if let Some(name) = &table {
                     if schema.tables.is_empty() {
+                        let what = if is_mongo { "collection" } else { "table" };
+                        // MongoDB answers `listCollections` per ROLE: a name
+                        // the role may not see comes back exactly like a name
+                        // that does not exist, and nyet must not claim to know
+                        // which (UX-7 — the SQL catalogs are privilege-filtered
+                        // the same way, but there `nyet schema` is the only
+                        // reader and the distinction never came up).
+                        let missing = match is_mongo {
+                            true => format!(
+                                "collection '{name}' not found in {alias} (or not visible to \
+                                 this connection's role)"
+                            ),
+                            false => format!("table '{name}' not found in {alias}"),
+                        };
                         return Err(Failure::new(
                             ErrorCode::DbError,
-                            format!("table '{name}' not found in {alias}"),
-                            format!("run nyet schema {alias} to list available tables"),
+                            missing,
+                            format!("run nyet schema {alias} to list available {what}s"),
                         ));
                     }
                 }
 
                 let mut warnings: Vec<output::Warning> = Vec::new();
                 if schema.is_listing() {
-                    warnings.push(output::Warning {
-                        code: "SCHEMA_TRUNCATED",
-                        message: format!(
-                            "schema listing truncated to names: {} objects exceed the {}-object \
-                             detail limit; run nyet schema {alias} <table> for one table's details",
-                            schema.tables.len(),
-                            output::DETAIL_LIMIT
-                        ),
+                    warnings.push(match is_mongo {
+                        // Not a truncation for the same reason: MongoDB cannot
+                        // describe a collection without sampling it, so the
+                        // listing lists (one round trip) and the agent asks
+                        // about the one it cares about. Same contract code —
+                        // "you got names only" is what it means (Д7).
+                        true => output::Warning {
+                            code: "SCHEMA_TRUNCATED",
+                            message: format!(
+                                "names and kinds only: MongoDB has no schema to list, so \
+                                 describing a collection means SAMPLING it — run nyet schema \
+                                 {alias} <collection> for one collection's fields, indexes and \
+                                 document count"
+                            ),
+                        },
+                        false => output::Warning {
+                            code: "SCHEMA_TRUNCATED",
+                            message: format!(
+                                "schema listing truncated to names: {} objects exceed the {}-object \
+                                 detail limit; run nyet schema {alias} <table> for one table's details",
+                                schema.tables.len(),
+                                output::DETAIL_LIMIT
+                            ),
+                        },
                     });
+                }
+                // The provenance marker is not decoration: everything a
+                // MongoDB answer says about FIELDS is either the collection's
+                // own declared validator or nyet's guess from a sample, and an
+                // agent that reads a guess as a schema will write queries
+                // against fields that most documents do not have (UX-1/UX-7).
+                if let Some(sampled) = schema.tables.first().and_then(|t| t.sampled) {
+                    warnings.push(sampled_schema_warning(sampled));
                 }
                 if session.insecure_transport {
                     warnings.push(insecure_transport_warning());
@@ -1009,9 +1045,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // PLAN instead of the execution. Nothing runs: the EXPLAIN is never
             // ANALYZE, so `nyet explain` cannot be a way to execute anything.
             let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
-            if session.db.is_mongo() {
-                return Err(mongo_not_implemented("explain", &alias));
-            }
+            let is_mongo = session.db.is_mongo();
             let engine = conn.engine.clone();
             let raw_sql = query.clone();
             let cwd_str = cwd.display().to_string();
@@ -1022,12 +1056,24 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // refused (exit 5) before anything is sent to the database.
                 // `explain` returns a plan and no rows, so net B never runs and
                 // the mask promise is irrelevant here (net A alone applies).
-                let (query, is_query, mut warnings, _) = validate(&query, &session.policy)?;
+                // MongoDB brings its own layer 1 here too — `explain` must not
+                // be the way past the allowlist, so the very same parser and
+                // allowlist that refuse `db.c.aggregate([{$out: ...}])` for
+                // `query` refuse it here, before any connect (exit 5).
+                let (query, is_query, mut warnings, _) = match is_mongo {
+                    true => validate_mongo(&query)?,
+                    false => validate(&query, &session.policy)?,
+                };
                 // The verdict is informational here, but it is measured against this
                 // connection's own guardrail, so `explain` answers exactly what
                 // `query` would decide.
                 let guardrail =
                     config::guardrail(&alias, conn).map_err(|e| config_failure(e, &path))?;
+                // `validate_mongo` answers `is_query = false` (the guardrail is
+                // `off` for MongoDB and there is nothing to estimate), but a
+                // MongoDB read DOES have a plan to show — one without a cost or
+                // a row count, which is exactly what its `estimate` returns.
+                let is_query = is_query || is_mongo;
 
                 // A metadata statement (SHOW/DESCRIBE, or an EXPLAIN the agent wrote
                 // itself) has no plan to ask for: wrapping it in another EXPLAIN
@@ -1152,9 +1198,6 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     let conn = lookup_alias(&cfg, &path, &alias)?;
                     let timeout_secs = cfg.timeout_secs(conn, None);
                     let (mut db, _policy) = build_engine(&alias, conn, timeout_secs)?;
-                    if db.is_mongo() {
-                        return Err(mongo_not_implemented("doctor", &alias));
-                    }
                     audit_id = Some((alias.clone(), conn.engine.clone()));
                     // The policy is needed twice here: the engine asks the
                     // server about these very columns, and the redaction below
@@ -1706,27 +1749,6 @@ fn build_engine(
     }
 }
 
-/// `nyet schema` / `explain` / `doctor` do not support MongoDB yet. An honest
-/// refusal (NOT_IMPLEMENTED, exit 1 — the code that already means "this build
-/// cannot do that") rather than a half-answer or a crash: `schema` would have
-/// to sample documents to guess a shape, `explain` has no estimate to report
-/// (see the guardrail note), and `doctor`'s write probe needs a per-engine
-/// read-only proof that does not exist for MongoDB yet.
-fn mongo_not_implemented(command: &str, alias: &str) -> Failure {
-    Failure::new(
-        ErrorCode::NotImplemented,
-        format!(
-            "nyet {command} does not support engine \"mongodb\" yet \
-             (connection '{alias}')"
-        ),
-        format!(
-            "MongoDB currently supports reads only: \
-             nyet query {alias} 'db.<collection>.find({{}}).limit(5)' — and \
-             nyet query {alias} 'db.<collection>.aggregate([...])' for anything richer"
-        ),
-    )
-}
-
 /// Open the SSH tunnel (if the connection has one) and point the engine at its
 /// local end. A tunnel failure is CONNECTION_FAILED (exit 6). sqlite + ssh was
 /// already rejected at config parse, so only the server engines reach here.
@@ -1821,7 +1843,10 @@ fn redact_diagnosis(diagnosis: &mut output::Diagnosis) {
             output::ProbeFact::Blocked { detail, .. } | output::ProbeFact::Unknown { detail } => {
                 *detail = WITHHELD.to_string()
             }
-            output::ProbeFact::Wrote { .. } => {}
+            // MongoDB reaches neither: a `[pii]` section on a MongoDB
+            // connection is a config error, and its grants carry action and
+            // resource NAMES only — never a value from a document.
+            output::ProbeFact::Wrote { .. } | output::ProbeFact::Grants(_) => {}
         }
     }
 }
@@ -1879,6 +1904,7 @@ fn engine_kind(engine: &str) -> output::EngineKind {
     match engine {
         "sqlite" => output::EngineKind::Sqlite,
         "postgres" => output::EngineKind::Postgres,
+        "mongodb" => output::EngineKind::Mongo,
         // mysql | mariadb — one driver, one dialect.
         _ => output::EngineKind::Mysql,
     }
@@ -1982,10 +2008,32 @@ fn insecure_transport_warning() -> output::Warning {
     output::Warning {
         code: "INSECURE_TRANSPORT",
         message: "this connection's transport is not guaranteed encrypted or \
-                  verified (sslmode below require and no ssh tunnel); set \
-                  sslmode=verify-full (Postgres) or ssl-mode=VERIFY_IDENTITY \
-                  (MySQL) in the url, or route through an ssh tunnel"
+                  verified (sslmode/ssl-mode/tls below require and no ssh tunnel); \
+                  set sslmode=verify-full (Postgres), ssl-mode=VERIFY_IDENTITY \
+                  (MySQL) or tls=true (MongoDB) in the url, or route through an \
+                  ssh tunnel"
             .to_string(),
+    }
+}
+
+/// MongoDB `schema`: the answer contains an INFERENCE, and the agent has to be
+/// told in the same breath (UX-1/UX-7). New contract code `SCHEMA_SAMPLED`,
+/// append-only (Д7) — it means "part of this schema payload is a guess", which
+/// no existing code says.
+fn sampled_schema_warning(sampled: u32) -> output::Warning {
+    output::Warning {
+        code: "SCHEMA_SAMPLED",
+        message: format!(
+            "MongoDB has no schema: every field marked source=\"sample\" below was inferred \
+             from {sampled} document(s) drawn at random ($sample), and `seen` says in how many \
+             of them it appeared — a field absent from the sample is missing from this answer \
+             entirely, and a field in it may be absent from the rest of the collection. Only \
+             source=\"validator\" is a real rule the server enforces; nyet can report one only \
+             when the role may read the collection's options, so its absence does not mean \
+             there is none. At most {} inferred fields are listed, rarest dropped first, and \
+             paths go at most 3 levels deep",
+            mongo::meta::MAX_FIELDS
+        ),
     }
 }
 
@@ -2294,6 +2342,7 @@ mod tests {
             pii: Vec::new(),
             connect: output::ConnectFact::Ok { via_tunnel: false },
             server: Some(output::ServerFacts {
+                js: None,
                 read_only_note: None,
                 probe: output::ProbeFact::Unknown {
                     detail: "value \"alice@example.com\" out of range".to_string(),

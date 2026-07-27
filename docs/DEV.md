@@ -221,8 +221,14 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 ├─ resolver  (src/resolver.rs)  — pure: (cwd, allowed_dirs) -> allowed?; canonicalize injected
 ├─ mongo     (src/mongo.rs)     — pure: (mongosh text) -> Request | Refusal;
 │                                 the MongoDB layer 1 (parser + closed
-│                                 allowlist) and the wire command it builds;
-│                                 depends ONLY on mongodb::bson (+std)
+│                                 allowlist) and the wire commands it builds
+│                                 (query and explain); depends ONLY on
+│                                 mongodb::bson (+std)
+│  └─ meta   (src/mongo/meta.rs) — pure: (server metadata replies) -> the
+│                                 schema/plan/doctor structures of `output`;
+│                                 bson + serde_json + output. Split off so the
+│                                 security boundary above stays about the
+│                                 boundary (Д4)
 ├─ validator (src/validator.rs) — pure: (SQL text, Policy) -> Allow{sql,warnings} |
 │                                 Deny{reason,message,hint}; also owns the PII
 │                                 policy (PiiRules + PiiMode) and the
@@ -259,7 +265,8 @@ about clap or each other; file reading, env access, cwd/realpath, the tokio
 runtime and the query timeout live in the cli layer. The edges between "leaf"
 modules are `engine -> output`, `engine -> guardrail`, `engine -> validator`
 (only for the pure `Origin` type it fills in from the driver's column metadata),
-`guardrail -> output`, `config -> guardrail` and `config -> validator` (the guardrail owns the judging and its own config
+`mongo::meta -> output` (the same contract shapes, filled in from MongoDB's
+metadata replies instead of a catalog), `guardrail -> output`, `config -> guardrail` and `config -> validator` (the guardrail owns the judging and its own config
 resolution — `config::guardrail` is the single entry point, called at parse time
 to fail loud and again by the cli to get the value; output owns the serialized
 shapes; the engines only run the EXPLAIN and hand the result over). The first
@@ -468,6 +475,11 @@ No new dependency: each engine reads its own catalog with the driver it
 already has, and the cli path is the query path minus the validator (there is
 no agent SQL) — same read-only session, same `timeout_secs`, same SSH tunnel,
 same exit codes 6/7/8.
+
+**MongoDB is the exception and has its own section** ("MongoDB" below): there
+is no catalog to read, so the answer is part declared validator and part
+inference from a sample, and every field says which — the two payload fields
+`source`/`seen` and the `SCHEMA_SAMPLED` warning exist for that.
 
 **The `[table]` argument is agent input and never reaches SQL.**
 
@@ -1279,11 +1291,190 @@ which is the point of the shape.
   both change the meaning of a contract code (Д7) and tax every single call
   (UX-4) — SQLite, which is in the same position, does not warn either. The
   honest statement lives in the README and in the config error.
-- **No `schema` / `explain` / `doctor`** yet: they answer `NOT_IMPLEMENTED`
-  (exit 1) with a hint pointing at `nyet query`. `schema` would have to guess a
-  shape from sampled documents, `explain` has no estimate to report, and
-  `doctor`'s write probe needs a per-engine read-only proof that does not exist
-  yet.
+- **No schema.** `nyet schema` answers anyway (see below), but nothing in that
+  answer may present an inference as a schema — which is why every field
+  carries a `source` and the envelope carries `SCHEMA_SAMPLED`.
+
+### Metadata: `schema`, `explain`, `doctor` (`src/mongo/meta.rs`)
+
+Same split as layer 1: `src/mongo/meta.rs` is **pure** (server documents in,
+contract structures out) and `engine::Mongo` only does the round trips. It is
+its own file rather than more of `src/mongo.rs` because that file is the
+security boundary and should stay about the boundary (Д4).
+
+**`nyet schema` — the honesty rule.** MongoDB has no schema, so no line of the
+answer may read like one. Every field carries `source`:
+
+- `"validator"` — the collection's declared `$jsonSchema`
+  (`listCollections` -> `options.validator.$jsonSchema`). That is a real rule:
+  the server enforces it on every write.
+- `"sample"` — inferred by nyet from `$sample` documents, with `seen` = in how
+  many of the `sampled` documents the field appeared. A field in 3 of 100
+  documents is not a column, and the agent must be able to tell.
+
+A validator-declared field ALSO gets `seen` when the sample saw it, and its
+`nullable` is widened when the documents disagree with the declaration — a
+validator only ever applied to writes made after it was created, so that
+disagreement is a real property of the data.
+
+Decisions worth writing down:
+
+- **Sample size 100, not configurable** (Д5, like `output::DETAIL_LIMIT`): one
+  batch, one round trip, and enough to see a field present in ~3% of the
+  collection. The escape hatch is honest about being one —
+  `nyet query <alias> 'db.c.aggregate([{$sample: {size: 1000}}])'`. `$sample`
+  above 5% of a collection degrades to a random sort server-side, which is
+  another reason not to raise it silently.
+- **The listing is names + kinds only, always** — not past a limit like the SQL
+  engines. Describing a MongoDB collection means SAMPLING it (3 round trips
+  each), so a 40-collection database would cost 120 round trips for an answer
+  nobody asked for (UX-4). The cli emits `SCHEMA_TRUNCATED` with a MongoDB
+  wording; same code, same meaning ("you got names only"), no new contract code.
+- **Two `listCollections` forms.** The FULL one carries `options.validator` and
+  is the only way to see a declared schema; a role scoped to a view may not run
+  it at all (measured: `Unauthorized`). So the LISTING always uses
+  `nameOnly + authorizedCollections` (which such a role may run, and which
+  answers with exactly what it can read), and a NAMED collection tries the full
+  form first and falls back. When it falls back there is no validator to
+  report — hence the rule in the `SCHEMA_SAMPLED` message: the absence of
+  `source: "validator"` never means "there is no validator".
+- **Not found vs invisible.** `find` on a collection that does not exist
+  SUCCEEDS in MongoDB and returns nothing, so existence cannot be probed with a
+  read. If `listCollections` answered and the name is not in it -> empty schema
+  -> the cli's `DB_ERROR` (exit 7), whose MongoDB wording is **"not found (or
+  not visible to this connection's role)"**: the `authorizedCollections`
+  fallback answers per ROLE, so a collection a view-scoped role may not see
+  comes back exactly like one that is not there, and nyet does not claim to
+  know which. If `listCollections` itself was refused outright, nyet samples
+  instead and lets `sampled: 0` say what it saw.
+- **Paths are dotted and array elements fold into the array's path**
+  (`items.sku`) — the spelling a filter takes. `seen` counts DOCUMENTS, not
+  occurrences, so an array of 3 sub-documents is one sighting. Depth 3
+  segments; deeper structure is still visible as a leaf of type `object`.
+- **Bounds:** at most 100 INFERRED fields per collection, rarest dropped first (the
+  "field names are user ids" collection would otherwise burn the context), and
+  the rule is stated in the warning so a list of exactly 100 is not mistaken
+  for the whole truth. DECLARED fields are all kept even past that number: a
+  validator IS the schema, and truncating a schema to save tokens is the wrong
+  trade (untested against a validator with more than 100 `properties`).
+- `_id` is the pk (MongoDB guarantees it), the `_id_` index is dropped like
+  the index backing a PRIMARY KEY on the SQL engines, and `unique` is kept only
+  for an UNCONDITIONAL unique index (a `partialFilterExpression`/`sparse` one
+  is unique for some documents only). `count` comes from
+  `$collStats {count: {}}` — metadata, not a scan; absent for views and for a
+  role that may not read it.
+- **`$collStats` is on nyet's own refusal list for AGENT queries** (cluster
+  introspection) and used here anyway: nyet builds the stage itself with
+  `{count: {}}` and nothing else, so it returns a number and no other session's
+  data. The refusal protects against a stage nyet did not write.
+
+**`nyet explain` — a plan and no invented numbers.** `verbosity` is hard-coded
+to `queryPlanner` in `Request::explain_command`: `executionStats` and
+`allPlansExecution` RUN the query (measured: 1 ms in `queryPlanner` against 4 s
+in `executionStats` for the same pipeline), which is the one thing explain must
+never do. The agent cannot reach that field — nyet builds the whole document,
+and the parser refuses options documents anyway. **The same layer 1 runs**
+(`revalidate`), so `explain` is not a way around the allowlist; `tests/cli.rs`
+runs the whole refusal corpus through BOTH `query` and `explain`.
+
+The published plan is `queryPlanner` distilled: `namespace`, the winning plan's
+`stages` (outermost first — `COLLSCAN` says "no index was usable" more plainly
+than any number would), the `indexes` it used, the `rejected` plans as
+stage/index summaries, and the winning plan VERBATIM (`indexBounds` included:
+"why did my regex not use the index" is answered there and nowhere else). The
+walk that finds `queryPlanner` is recursive because an aggregation nests it
+under `stages[0].$cursor` while a find carries it at the top level, and it
+skips `filter`/`indexBounds`/`keyPattern` when collecting stage names so a
+document field literally called `stage` cannot appear as something the planner
+said. A reply with no `queryPlanner` at all hands over the server's own reply
+minus the noise (`serverInfo`, `serverParameters`, the echo of the command)
+rather than an empty plan that would read like "nothing to do".
+
+`collection_documents` is `$collStats`'s count, named so it cannot be read as
+an estimate of the QUERY: it is a property of the collection, and it is what
+turns "COLLSCAN" into "COLLSCAN over 40 million documents". It is fetched on
+its **own one-second budget** (`count_of`), after the plan and outside it: an
+extra line must never be the reason an answer already in hand turns into a
+TIMEOUT — and the heavy schema where planning is slow is exactly where the plan
+is wanted. The explained command carries NO nyet row limit
+(`command(None, ...)`) — the limit is how the answer is cut, and a `LIMIT`
+stage with nyet's number in it would be a stage the agent never wrote, so the
+plan shown is the un-limited (worst-case) shape of the read.
+
+*Proposal, deliberately NOT implemented (out of scope):* those two facts
+together WOULD make an honest `rows`-mode guardrail possible — a `COLLSCAN`
+provably examines every document, so the collection's count is a true lower
+bound on documents examined, and refusing a COLLSCAN over a collection larger
+than `max_rows` would be a real check rather than theatre. It is a guess for
+IXSCAN plans (index bounds are not row counts), so the rule would have to be
+"COLLSCAN only", which is a design decision, not an implementation detail.
+
+**`nyet doctor` — read-only proven by asking, not by writing.** MongoDB is the
+one engine where layer 3 can be checked WITHOUT a probe write:
+`connectionStatus {showPrivileges: true}` lists every action these credentials
+hold on every resource (measured: the `read` role is exactly `changeStream,
+collStats, dbHash, dbStats, find, killCursors, listCollections, listIndexes,
+listSearchIndexes, planCacheRead, performRawDataOperations`). `ProbeFact` gained
+a `Grants` variant for it; the pg/mysql probe is untouched.
+
+- **Every resource of the cluster is checked, not just this database.**
+  Measured: a role that is `read` on `app` and `readWrite` on `scratch` copies a
+  collection out of `app` with `$out: {db: "scratch", coll: "exfil"}`. nyet's
+  layer 1 refuses `$out`, but doctor is about the SETUP, and a role wider than
+  the reads it serves is a finding either way. Writes on this database (or on
+  `cluster`/`anyResource`/all databases) -> `fail`; writes only elsewhere ->
+  `warn` that names where.
+- **Three-way classification, fail closed.** `READ_ACTIONS` is an allowlist,
+  `WRITE_ACTIONS` a denylist for a precise message, and anything on neither is
+  reported as "nyet cannot classify" (`warn`) rather than assumed harmless — the
+  action list grows with every MongoDB release, and a denylist alone would turn
+  a new write action into a false `ok`. Both counts (`write_count`,
+  `unknown_count`) are honest totals; only the NAMES shown are capped, and the
+  write names are ordered so the recognisable ones (`remove`, `insert`,
+  `update`, `dropCollection`, ...) come before the exotica — cut
+  alphabetically, a `readWrite` role reported four `…StructuredEncryption…`
+  actions and hid `insert` behind "+10 more", which is the opposite of what the
+  human reads that line for.
+  **Open risk, stated rather than papered over:** `READ_ACTIONS` cannot be
+  verified against a complete list, because the server publishes none (no
+  command returns the action vocabulary), so it was built from the built-in
+  roles' privileges. A read action nyet forgot costs a false `warn`; the
+  dangerous direction — a WRITE action landing in `READ_ACTIONS` — is guarded
+  only by review, and the disjointness test only proves the two lists do not
+  overlap. The one entry worth naming is `performRawDataOperations` (new in
+  8.x): the built-in `read` role carries it (measured), and it is a MODIFIER
+  that lets a command run with `rawData: true` rather than a right to write —
+  the write itself still needs `insert`/`update`/`remove`. Not cross-checked
+  against the manual; if that reading is ever shown to be wrong, it moves to
+  `WRITE_ACTIONS` and every `read`-role setup starts reporting `warn`.
+  Untested: mongos/sharded clusters, replica-set-only roles, and
+  `clusterManager`/`hostManager`.
+- **No authenticated user -> `fail`**, not "could not verify": there is provably
+  no read-only role in place, and a server that serves an unauthenticated
+  client is one where any client can write. A reply with no privilege list at
+  all (an older server, a proxy) IS "could not verify" (`warn`).
+- **`not_superuser`** reads `authenticatedUserRoles` against a list of
+  administrative roles (`root`, `__system`, `dbOwner`, `userAdminAnyDatabase`,
+  `backup`, `restore`, `clusterAdmin`, ...) — they can grant themselves
+  anything, so nothing below them holds.
+- **`server_side_js` (MongoDB-only check).** `$where`/`$function`/`$accumulator`
+  run arbitrary code in the database process, the plain `read` role may use
+  them, and `maxTimeMS` does NOT budget them (measured: 8 s and 12 s under a
+  500 ms limit). nyet refuses them in layer 1 — for queries going through nyet.
+  MongoDB publishes **no runtime parameter**: `getParameter javascriptEnabled`
+  answers "no option found to get" (measured). So doctor reads the startup
+  options instead: `getCmdLineOpts` -> `parsed.security.javascriptEnabled ==
+  false` or `--noscripting` in `argv` -> `ok` (measured on 8.2.12: with
+  scripting ON the key is simply ABSENT, so absence reads as enabled). That
+  command needs a privilege the recommended read-only role does not have, and
+  then the answer is `warn` **"could not check"** with the reason. **nyet does
+  not probe by running JavaScript** — a `$where` probe would be nyet doing the
+  exact thing it refuses to send, and it would execute in the database process.
+  This is the check that exists to say something nyet cannot fix.
+- A failed connect leaves `server: None`, and every server-dependent check
+  (including this one) reads `warn` "could not verify" — pinned by a cli test,
+  because "could not verify" reading as `ok` is the failure mode this whole
+  command exists to avoid (UX-1).
 
 ### Error codes (Д7: append-only)
 
@@ -1318,19 +1509,42 @@ different operator", and a single code would make both hints vague.
   split (exit 6, not 8), a url without a database, a password without a user, an
   invalid url that echoes nothing, the engine's re-validation, the transport
   warning rule, and the server-message trimming.
+- **Metadata unit tests** (`src/mongo/meta.rs`, pure, no Docker): every reply
+  shape it reads — `listCollections` (including a cursor the server left open,
+  which is an ERROR, and entries with no name / not a document), `listIndexes`
+  (the `_id_` index, a partial unique one, an entry with no key), `$collStats`
+  in every integer shape, the sampled inference (provenance, `seen` counting
+  DOCUMENTS not occurrences, dotted paths, the field cap), the validator merge
+  (declared-but-missing fields, a `bsonType` list, a validator that is a query
+  expression and therefore not a schema), the explain distillation (find,
+  aggregate, a reply with no `queryPlanner`, a user field called `stage`), and
+  the privilege classification (the real `read` action list, a write grant in
+  another database, an action nyet does not know, a reply with no privileges,
+  `getCmdLineOpts` both ways).
 - **CLI e2e** (`tests/cli.rs`, no Docker): layer 1 refusals reaching the agent as
   `NYET` + reason with exit 5 **against a closed port** (so anything that
-  reached the network would fail differently), the `NOT_IMPLEMENTED` answers for
-  schema/explain/doctor, and the two config errors (`[pii]`, `guardrail.mode`).
+  reached the network would fail differently) — run through BOTH `query` and
+  `explain`, because explain must refuse exactly what query refuses; doctor
+  against a dead connection reading `fail`/`warn` and never `ok`; the
+  MongoDB-only check not appearing on other engines; and the two config errors
+  (`[pii]`, `guardrail.mode`).
 - **Container e2e** (`tests/mongo.rs`, `mongo:8` digest-pinned, ONE container
-  with auth enabled and a `read`-role account): the read shapes and the union
-  of document keys, the row limit + `truncated`, the timeout (an un-indexed
-  self-join over 20k documents under `--timeout 1`), a write refused by layer 1
-  with the collection provably not created, the SAME `$out` refused by the
-  SERVER for that role (layer 3 is really underneath), and a DB error keeping
-  exit 7. Readiness is polled with a real `ping` rather than trusted to the log
-  line, because the official image restarts mongod once while applying the root
-  credentials.
+  with auth enabled, three accounts — `read`, `read` + `readWrite` elsewhere,
+  and a role scoped to a view): the read shapes and the union of document keys,
+  the row limit + `truncated`, the timeout (an un-indexed self-join over 20k
+  documents under `--timeout 1`), a write refused by layer 1 with the
+  collection provably not created, the SAME `$out` refused by the SERVER for
+  that role (layer 3 is really underneath), and a DB error keeping exit 7. Then
+  the step-2 commands: the listing and one collection with a declared validator
+  (provenance per field, the count, the unique fold) and one without, a view, a
+  missing collection (exit 7); explain over an index and without one, and —
+  the claim of the whole command — the pipeline that TIMES OUT when it is run
+  answering in milliseconds under a one-second budget, which is the proof that
+  nothing was executed; doctor `ok` under `read`, `warn` naming the other
+  database under `read`+`readWrite`, and the view-scoped role still getting a
+  listing and a sampled description. Readiness is polled with a real `ping`
+  rather than trusted to the log line, because the official image restarts
+  mongod once while applying the root credentials.
 
 ## Round trips (the control statements, per engine)
 
@@ -1508,6 +1722,11 @@ and builds the verdicts (fixture-free, unit-tested), and the cli orchestrates an
 formats. The envelope carries a new append-only field `checks: [{name, status,
 message, hint?}]`; `status` is a **closed list** (`ok` | `warn` | `fail` | `na`),
 and doctor is always `ok: true` (it ran — the verdicts are per-check).
+
+**MongoDB gathers its facts differently and has its own section** ("MongoDB"
+above): no probe write at all — layer 3 is read from
+`connectionStatus {showPrivileges: true}` — plus one extra check
+(`server_side_js`) emitted for that engine only.
 
 **Exit codes: doctor lives in 0/3 only.** It exits 0 whenever it *ran*, even when
 checks find problems — a failed *connection* is a `fail` check, NOT exit 6:
@@ -2906,7 +3125,13 @@ transport not guaranteed encrypted/verified; static from config+url, so it
 over-warns against a server that happens to negotiate TLS — we report the
 guarantee, not the runtime outcome), `SCHEMA_TRUNCATED` (`nyet schema` past
 `DETAIL_LIMIT` objects: names and kinds only; the message names the
-`nyet schema <alias> <table>` way out), `GUARDRAIL_SKIPPED` (the guardrail got no
+`nyet schema <alias> <table>` way out — MongoDB's listing is ALWAYS names-only
+and carries the same code with its own wording),
+`SCHEMA_SAMPLED` (MongoDB only: part of that schema payload is an INFERENCE
+from sampled documents, not a schema. New rather than folded into
+`SCHEMA_TRUNCATED`, which means "you got less than the whole" — this one means
+"some of what you got is a guess", and the agent's reaction differs),
+`GUARDRAIL_SKIPPED` (the guardrail got no
 number it could judge — an unreadable plan, a recursive CTE under the limit, or
 an EXPLAIN the database refused — so the query ran unguarded. An EXPLAIN that
 outran its BUDGET is NOT in this list: that refuses the query, exit 5. On
@@ -2923,7 +3148,9 @@ Codes are append-only; renaming/removing one is a breaking change (bump `v`).
 Every error must carry an actionable `hint` (Д10) — tests enforce it.
 
 `nyet doctor` adds no error/warning code — it exits 0/3 only (see the doctor
-section above). It introduces one append-only envelope field, `checks:
+section above). Check NAMES are append-only too: `server_side_js` is the
+newest, emitted for MongoDB connections only (a `na` line on every other engine
+would be noise, UX-4). It introduces one append-only envelope field, `checks:
 [{name, status, message, hint?}]`, whose `status` is a **closed list**
 (`ok` | `warn` | `fail` | `na`); the check `name`s and the status list follow the
 same append-only rule as the codes above (renaming/removing = bump `v`).

@@ -115,7 +115,15 @@ introspection, auto-guardrail через EXPLAIN). Ниша подтвержде
 ### v0.4 — NoSQL
 
 - [ ] Redis (COMMAND INFO как классификатор write-команд)
-- [ ] MongoDB (своя классификация команд)
+- [x] MongoDB (своя классификация команд): `query` — парсер подмножества
+      mongosh + закрытый allowlist (шаг 1); `schema`/`explain`/`doctor` —
+      шаг 2. Схемы в MongoDB нет, поэтому `schema` помечает происхождение
+      каждого поля (`validator` — объявленный `$jsonSchema`, `sample` — догадка
+      по выборке); `explain` строго в режиме `queryPlanner` (остальные
+      ВЫПОЛНЯЮТ запрос) и без выдуманных оценок; `doctor` доказывает read-only
+      по списку привилегий, без пробной записи. Чего нет и о чём сказано
+      прямо: слоя 2 (read-only сессии в MongoDB не существует), `[pii]`,
+      guardrail'а.
 - [ ] ClickHouse (`readonly=1`)
 
 ### v0.5 — экосистема

@@ -93,10 +93,12 @@ impl Schema {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct SchemaTable {
     pub name: String,
-    /// `"table"` or `"view"`.
+    /// `"table"` or `"view"` — and `"collection"` for MongoDB, which has no
+    /// tables and where calling one a table would be the first small lie of an
+    /// answer that is already an inference (UX-7).
     pub kind: &'static str,
     /// `None` in the names-only listing; views carry columns but never
     /// indexes/fks (the engines do not collect either for a view).
@@ -106,16 +108,29 @@ pub struct SchemaTable {
     pub indexes: Vec<SchemaIndex>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fks: Vec<SchemaFk>,
+    /// MongoDB only: how many documents the collection holds, from the
+    /// collection's own metadata (`$collStats`), not from a scan. Absent when
+    /// the role may not read it, and for views (which have no count of their
+    /// own).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    /// MongoDB only: how many documents were actually sampled to infer the
+    /// fields below. Its presence is the marker that some of this answer is a
+    /// GUESS: read it together with each column's `source`/`seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampled: Option<u32>,
 }
 
 /// `nullable` is always explicit (an agent writing a query needs it); the flags
 /// are serialized only when true and `default` only when the engine reports one
 /// — every omitted byte is the user's money (UX-4).
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct SchemaColumn {
     pub name: String,
     /// The type as the engine reports it (pg `format_type`, MySQL
-    /// `COLUMN_TYPE`, SQLite's declared type).
+    /// `COLUMN_TYPE`, SQLite's declared type). For MongoDB: the BSON type
+    /// name(s) — the same spelling `{$type: "..."}` takes — joined by `|` when
+    /// the documents disagree.
     #[serde(rename = "type")]
     pub ty: String,
     pub nullable: bool,
@@ -130,6 +145,19 @@ pub struct SchemaColumn {
     /// engine: the policy is config, not catalog.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pii: Option<&'static str>,
+    /// Where this line comes from, and therefore how much it may be trusted.
+    /// Absent for the SQL engines (a catalog IS the schema). MongoDB has no
+    /// schema, so it says which of the two it is: `"validator"` — the
+    /// collection's own declared `$jsonSchema`, a rule the SERVER enforces on
+    /// every write; `"sample"` — inferred by nyet from `sampled` documents,
+    /// i.e. a guess about the rest of the collection (UX-7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
+    /// `source = "sample"` only: in how many of the table's `sampled` documents
+    /// this field was present. A field seen in 3 of 100 is not "a field of this
+    /// collection" in the way a column is, and the agent has to be able to tell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seen: Option<u32>,
 }
 
 /// Mark the columns a PII policy covers, so the agent does not spend a round
@@ -330,6 +358,9 @@ pub fn build_table(
         columns: Some(columns),
         indexes: kept,
         fks,
+        // Set by the MongoDB engine after the fold; no catalog has them.
+        count: None,
+        sampled: None,
     }
 }
 
@@ -481,7 +512,14 @@ pub fn schema_meta_json(meta: &SchemaMeta, warnings: &[Warning]) -> String {
 pub fn schema_text(schema: &Schema) -> String {
     let mut out = String::new();
     for table in &schema.tables {
-        out.push_str(&format!("{} {}\n", table.name, table.kind));
+        out.push_str(&format!("{} {}", table.name, table.kind));
+        if let Some(count) = table.count {
+            out.push_str(&format!("  {count} documents"));
+        }
+        if let Some(sampled) = table.sampled {
+            out.push_str(&format!("  ({sampled} sampled)"));
+        }
+        out.push('\n');
         let Some(columns) = &table.columns else {
             continue;
         };
@@ -505,6 +543,14 @@ pub fn schema_text(schema: &Schema) -> String {
             }
             if let Some(mode) = c.pii {
                 line.push_str(&format!("  pii {mode}"));
+            }
+            // The provenance is never dropped from the human rendering either:
+            // "seen in 3 of 100 sampled documents" is the whole difference
+            // between a schema and a guess.
+            match (c.source, c.seen) {
+                (Some(source), Some(seen)) => line.push_str(&format!("  {source} {seen}")),
+                (Some(source), None) => line.push_str(&format!("  {source}")),
+                _ => {}
             }
             out.push_str(line.trim_end());
             out.push('\n');
@@ -789,6 +835,10 @@ pub enum EngineKind {
     Sqlite,
     Postgres,
     Mysql,
+    /// MongoDB: roles and a network transport like the server engines, but
+    /// layer 3 is read from the PRIVILEGES the server reports rather than
+    /// probed with a write, and one check exists only here (`server_side_js`).
+    Mongo,
 }
 
 /// Closed, append-only status list for a doctor check. `na` = the check does
@@ -862,6 +912,49 @@ pub enum ProbeFact {
     /// The write failed for a reason that does NOT prove read-only — could not
     /// verify. `warn`.
     Unknown { detail: String },
+    /// MongoDB: no probe ran at all. `connectionStatus {showPrivileges: true}`
+    /// lists every action these credentials hold on every resource of the
+    /// cluster, so layer 3 is proven by ASKING — the only engine where nyet can
+    /// answer "read-only" without writing a single byte.
+    Grants(Box<Grants>),
+}
+
+/// What the privilege list said (MongoDB). Pure data: the verdict is made in
+/// `mongo_grants_check` so it can be unit-tested without a server.
+pub struct Grants {
+    /// One entry per RESOURCE that carries write actions, as
+    /// `"<resource> (<action>, <action>, ...)"` — wherever in the cluster it
+    /// was granted. Capped for the agent's sake; the count below is honest.
+    pub writes: Vec<String>,
+    /// How many resources carry at least one write action.
+    pub write_count: usize,
+    /// Actions nyet cannot classify as read or write (a custom role, an action
+    /// a newer MongoDB added). Not a pass: fail closed and name them. Capped
+    /// like `writes`, with the honest total beside it.
+    pub unknown: Vec<String>,
+    pub unknown_count: usize,
+    /// At least one write action covers the database this connection reads —
+    /// or the whole cluster / every resource, which covers it too.
+    pub this_database: bool,
+    /// How many (resource, actions) entries the server listed.
+    pub resources: usize,
+    /// No user is authenticated on this connection at all.
+    pub unauthenticated: bool,
+}
+
+/// Whether the SERVER evaluates JavaScript (`$where`, `$function`,
+/// `$accumulator`, `mapReduce`). MongoDB only, and `None` for every other
+/// engine — nyet does not probe it by running JavaScript, which is the very
+/// thing it refuses to send (see `server_side_js_check`).
+pub enum JsFact {
+    /// The server runs with `--noscripting` / `security.javascriptEnabled:
+    /// false`.
+    Disabled,
+    /// Scripting is on (MongoDB's default: the setting is simply absent).
+    Enabled,
+    /// nyet could not read the server's startup options — most often because a
+    /// read-only role may not, which is the recommended setup.
+    Unknown(String),
 }
 
 /// Whether the role is a superuser / holds dangerous global privileges. An
@@ -884,6 +977,9 @@ pub struct ServerFacts {
     /// folded into the `read_only_role` ok message when the probe was blocked.
     pub read_only_note: Option<String>,
     pub probe: ProbeFact,
+    /// MongoDB only; `None` on every other engine (there is no server-side
+    /// JavaScript to ask about).
+    pub js: Option<JsFact>,
 }
 
 /// One `[pii]`-protected column, and whether the ROLE nyet connects as can read
@@ -1001,6 +1097,10 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
         not_superuser_check(input),
     ]
     .into_iter()
+    // Engine-specific checks are emitted only where they mean something: a
+    // `na` line on every other engine would be noise (UX-4), and the closed
+    // list of check NAMES is append-only either way (Д7).
+    .chain((input.engine == EngineKind::Mongo).then(|| server_side_js_check(input)))
     // Only when there IS a policy: a check that reports `na` on every
     // connection without `[pii]` is pure noise in the common case (UX-4).
     .chain(input.forward.as_ref().map(ssh_forward_check))
@@ -1188,11 +1288,12 @@ fn transport_check(transport: &Transport) -> DoctorCheck {
         ),
         Transport::InsecureDirect => warn_check(
             "transport_encrypted",
-            "the transport is not guaranteed encrypted or verified: the url's sslmode/ssl-mode \
-             is below require and there is no ssh tunnel, so nyet may talk to the server in \
-             plaintext",
-            "set sslmode=verify-full (Postgres) or ssl-mode=VERIFY_IDENTITY (MySQL) in the url \
-             to encrypt and authenticate the connection, or route it through an ssh tunnel",
+            "the transport is not guaranteed encrypted or verified: the url's \
+             sslmode/ssl-mode/tls is below require and there is no ssh tunnel, so nyet may talk \
+             to the server in plaintext",
+            "set sslmode=verify-full (Postgres), ssl-mode=VERIFY_IDENTITY (MySQL) or tls=true \
+             (MongoDB) in the url to encrypt and authenticate the connection, or route it \
+             through an ssh tunnel",
         ),
         Transport::Na => na_check(
             "transport_encrypted",
@@ -1216,6 +1317,9 @@ fn read_only_role_check(input: &DoctorInput) -> DoctorCheck {
             "fix the connectivity check above, then re-run nyet doctor",
         ),
         Some(server) => match &server.probe {
+            // MongoDB: no probe write ever ran — the verdict comes from the
+            // privilege list the server itself published for these credentials.
+            ProbeFact::Grants(grants) => mongo_grants_check(grants),
             ProbeFact::Blocked { detail, ddl_only } => {
                 // Honest headline (UX-7): only a real read-only refusal claims
                 // "every write is rejected"; an access-denied on CREATE proves
@@ -1268,6 +1372,155 @@ fn read_only_role_check(input: &DoctorInput) -> DoctorCheck {
             ),
         },
     }
+}
+
+/// The MongoDB `read_only_role` verdict, from the privilege list alone.
+///
+/// The rule is fail-closed twice over. It looks at EVERY resource the server
+/// listed, not just this connection's database — measured: a role that is
+/// `read` on `app` and `readWrite` on `scratch` can copy a whole collection out
+/// of `app` with `$out: {db: "scratch", ...}`. nyet's own layer 1 refuses
+/// `$out`, but doctor's job is the SETUP, and a role wider than the reads it
+/// serves is a finding whatever nyet does with it. And an action nyet cannot
+/// classify is reported, never assumed harmless: the list of write actions
+/// grows with every MongoDB release.
+fn mongo_grants_check(g: &Grants) -> DoctorCheck {
+    // No authenticated user at all. Not "could not verify": there is provably
+    // no read-only role in place, because there is no role in place.
+    if g.unauthenticated {
+        return fail_check(
+            "read_only_role",
+            "no user is authenticated on this connection, so there is no role that could be \
+             read-only — and a MongoDB server that serves an unauthenticated client is one \
+             where any client on the network can also write",
+            mongo_read_only_hint(),
+        );
+    }
+    let shown = |list: &[String]| list.join(", ");
+    if g.write_count > 0 {
+        let where_ = if g.this_database {
+            "including the database this connection reads"
+        } else {
+            "in another database of the same cluster — from which `$out`/`$merge` can copy \
+             this connection's data out (nyet refuses those stages, another client does not)"
+        };
+        let message = format!(
+            "these credentials hold write actions on {} resource(s) {where_}: {}{} — an agent \
+             that bypassed nyet and connected directly could modify data, and MongoDB has no \
+             read-only session to fall back on, so this role IS the whole of layer 3",
+            g.write_count,
+            shown(&g.writes),
+            if g.write_count > g.writes.len() {
+                ", ..."
+            } else {
+                ""
+            }
+        );
+        return if g.this_database {
+            fail_check("read_only_role", message, mongo_read_only_hint())
+        } else {
+            warn_check("read_only_role", message, mongo_read_only_hint())
+        };
+    }
+    if !g.unknown.is_empty() {
+        return warn_check(
+            "read_only_role",
+            format!(
+                "no known write action is granted, but nyet cannot classify {} action(s), \
+                 among them {}{}: they are not on its list of read actions either, so it will \
+                 not call this role read-only",
+                g.unknown_count,
+                shown(&g.unknown),
+                if g.unknown_count > g.unknown.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            ),
+            "check what that action allows (`db.getRole(<role>, {showPrivileges: true})`); if \
+             the account only needs to read, replace its roles with a plain \
+             { role: \"read\", db: \"<db>\" }",
+        );
+    }
+    ok_check(
+        "read_only_role",
+        format!(
+            "the server reports only read actions for these credentials on all {} resource(s) \
+             it listed, so a client that bypassed nyet with them would still be read-only \
+             (proven from connectionStatus — nyet writes nothing to find this out)",
+            g.resources
+        ),
+    )
+}
+
+/// Server-side JavaScript (`$where`, `$function`, `$accumulator`, `mapReduce`).
+///
+/// nyet refuses all of it in layer 1, so this check is not about nyet: it is
+/// about everything ELSE holding the same credentials. The honest part is the
+/// `Unknown` arm — reading the server's startup options needs a privilege the
+/// recommended read-only role does not have, and nyet will NOT probe by
+/// running a piece of JavaScript, because sending JavaScript to the server is
+/// exactly what it promises never to do (UX-7).
+fn server_side_js_check(input: &DoctorInput) -> DoctorCheck {
+    let why = "the plain `read` role is allowed to run $where/$function/$accumulator, and \
+               maxTimeMS does not budget them (measured: 8 s and 12 s under a 500 ms limit), so \
+               they are arbitrary code in the database process with no time bound";
+    let hint = "restart mongod with --noscripting (or security.javascriptEnabled: false) if \
+                nothing on this server needs stored/aggregation JavaScript — nyet's own refusal \
+                protects only what goes through nyet";
+    let Some(server) = &input.diagnosis.server else {
+        return warn_check(
+            "server_side_js",
+            "could not verify: there is no connection to the database",
+            "fix the connectivity check above, then re-run nyet doctor",
+        );
+    };
+    match &server.js {
+        Some(JsFact::Disabled) => ok_check(
+            "server_side_js",
+            "the server runs with scripting disabled (--noscripting), so $where / $function / \
+             $accumulator / mapReduce are refused by MongoDB itself — for every client, not \
+             just for nyet",
+        ),
+        Some(JsFact::Enabled) => warn_check(
+            "server_side_js",
+            format!(
+                "server-side JavaScript is ENABLED on this server: {why}. nyet never sends it \
+                 (its allowlist refuses $where/$function/$accumulator/mapReduce), but any \
+                 other client using these credentials can"
+            ),
+            hint,
+        ),
+        // "Could not check" is never an `ok` (UX-1).
+        other => {
+            let detail = match other {
+                Some(JsFact::Unknown(detail)) => detail.as_str(),
+                _ => "nyet did not ask this server",
+            };
+            warn_check(
+                "server_side_js",
+                format!(
+                    "could not check whether server-side JavaScript is enabled ({detail}). \
+                     MongoDB exposes no runtime parameter for it, and nyet will not probe by \
+                     RUNNING JavaScript — that is the one thing it promises never to send. It \
+                     matters because {why}"
+                ),
+                "ask the server's operator whether mongod runs with --noscripting; if it does \
+                 not, adding it costs nothing unless something on the server needs JavaScript",
+            )
+        }
+    }
+}
+
+/// The MongoDB layer-3 remedy (Д10), straight from the README recipe.
+fn mongo_read_only_hint() -> String {
+    "create a read-only user for exactly this database and point the url at it:\n\
+     use <db>\n\
+     db.createUser({ user: \"nyet_ro\", pwd: \"...\", roles: [ { role: \"read\", db: \"<db>\" } ] })\n\
+     — no role on any other database, because a write grant ANYWHERE in the cluster is a way \
+     out for this connection's data ($out/$merge). MongoDB has no read-only session (layer 2), \
+     so this role is the only server-side barrier."
+        .to_string()
 }
 
 fn not_superuser_check(input: &DoctorInput) -> DoctorCheck {
@@ -1347,8 +1600,11 @@ fn read_only_role_hint(engine: EngineKind) -> String {
              FLUSH PRIVILEGES;\n\
              (see the README layer-3 recipe)"
         }
-        // Never reached: SQLite short-circuits to `na` above.
-        EngineKind::Sqlite => "open the SQLite file read-only (nyet already does)",
+        // Never reached: MongoDB answers through `mongo_grants_check`, which
+        // carries its own recipe, and SQLite short-circuits to `na` above.
+        EngineKind::Mongo | EngineKind::Sqlite => {
+            "open the SQLite file read-only (nyet already does)"
+        }
     }
     .to_string()
 }
@@ -1362,6 +1618,11 @@ fn not_superuser_hint(engine: EngineKind) -> String {
         EngineKind::Mysql => {
             "grant only SELECT on the specific database(s) the agent needs; do not use an \
              account with ALL PRIVILEGES ON *.* or SUPER"
+        }
+        EngineKind::Mongo => {
+            "use an account whose only role is { role: \"read\", db: \"<db>\" } on the database \
+             in the url — root / dbOwner / userAdminAnyDatabase and friends can grant \
+             themselves anything, so no other layer can hold"
         }
         EngineKind::Sqlite => "not applicable to SQLite",
     }
@@ -1779,6 +2040,8 @@ mod tests {
             unique: false,
             default: None,
             pii: None,
+            source: None,
+            seen: None,
         }
     }
 
@@ -1849,16 +2112,12 @@ mod tests {
                 SchemaTable {
                     name: "users".into(),
                     kind: "table",
-                    columns: None,
-                    indexes: Vec::new(),
-                    fks: Vec::new(),
+                    ..SchemaTable::default()
                 },
                 SchemaTable {
                     name: "v_active".into(),
                     kind: "view",
-                    columns: None,
-                    indexes: Vec::new(),
-                    fks: Vec::new(),
+                    ..SchemaTable::default()
                 },
             ],
         };
@@ -2077,9 +2336,7 @@ mod tests {
             tables: vec![SchemaTable {
                 name: "users".into(),
                 kind: "table",
-                columns: None,
-                indexes: Vec::new(),
-                fks: Vec::new(),
+                ..SchemaTable::default()
             }],
         };
         assert_eq!(schema_text(&listing), "users table\n");
@@ -2112,6 +2369,7 @@ mod tests {
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
+                    js: None,
                     superuser: SuperuserFact::Yes("current_setting('is_superuser') = on".into()),
                     read_only_note: None,
                     probe: ProbeFact::Wrote { orphan: None },
@@ -2225,6 +2483,7 @@ mod tests {
                 pii,
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
+                    js: None,
                     superuser: SuperuserFact::No("off".into()),
                     read_only_note: None,
                     probe: ProbeFact::Blocked {
@@ -2303,6 +2562,7 @@ mod tests {
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
+                    js: None,
                     superuser: SuperuserFact::No("current_setting('is_superuser') = off".into()),
                     read_only_note: Some("the server is a read-only replica (hot standby)".into()),
                     probe: ProbeFact::Blocked {
@@ -2343,6 +2603,7 @@ mod tests {
                     pii: Vec::new(),
                     connect: ConnectFact::Ok { via_tunnel: false },
                     server: Some(ServerFacts {
+                        js: None,
                         superuser: SuperuserFact::No("off".into()),
                         read_only_note: None,
                         probe: ProbeFact::Blocked {
@@ -2380,6 +2641,7 @@ mod tests {
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
+                    js: None,
                     superuser: SuperuserFact::Unknown("could not read is_superuser".into()),
                     read_only_note: None,
                     probe: ProbeFact::Unknown {
@@ -2414,6 +2676,7 @@ mod tests {
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
+                    js: None,
                     superuser: SuperuserFact::Unresolved(
                         "the account has role/proxy grants nyet does not resolve".into(),
                     ),
@@ -2565,6 +2828,167 @@ mod tests {
             text.contains("→ line1") && text.contains("→ line2"),
             "{text}"
         );
+    }
+
+    /// MongoDB's `read_only_role` is decided from the PRIVILEGE LIST, with no
+    /// probe write anywhere — and the fail-closed wording rule applies to every
+    /// branch of it: only "the server listed nothing but reads" is an `ok`.
+    #[test]
+    fn doctor_mongo_reads_layer_3_from_the_grants_and_never_guesses() {
+        let grants = |g: Grants| DoctorInput {
+            // MongoDB rejects a `[pii]` section at config parse.
+            pii_mode: None,
+            engine: EngineKind::Mongo,
+            diagnosis: Diagnosis {
+                connect: ConnectFact::Ok { via_tunnel: false },
+                server: Some(ServerFacts {
+                    js: Some(JsFact::Disabled),
+                    superuser: SuperuserFact::No("roles: read@app".into()),
+                    read_only_note: None,
+                    probe: ProbeFact::Grants(Box::new(g)),
+                }),
+                pii: Vec::new(),
+            },
+            forward: None,
+            transport: Transport::TlsDirect,
+            permissions: Permissions::Secure,
+        };
+        let clean = || Grants {
+            writes: Vec::new(),
+            write_count: 0,
+            unknown: Vec::new(),
+            unknown_count: 0,
+            this_database: false,
+            resources: 2,
+            unauthenticated: false,
+        };
+        let check = |g: Grants| {
+            let checks = doctor_checks(&grants(g));
+            let c = by(&checks, "read_only_role");
+            (c.status, c.message.clone())
+        };
+
+        // Only read actions anywhere: an `ok` that says how it knows.
+        let (status, message) = check(clean());
+        assert_eq!(status, CheckStatus::Ok);
+        assert!(message.contains("connectionStatus"), "{message}");
+        assert!(message.contains("writes nothing"), "{message}");
+
+        // Write actions in ANOTHER database of the same cluster: a warn that
+        // names where, because $out from here into there is a way out.
+        let (status, message) = check(Grants {
+            writes: vec!["scratch.* (insert, update)".into()],
+            write_count: 1,
+            ..clean()
+        });
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(message.contains("scratch.*"), "{message}");
+
+        // ...and on this database: a fail.
+        let (status, _) = check(Grants {
+            writes: vec!["app.* (insert)".into()],
+            write_count: 1,
+            this_database: true,
+            ..clean()
+        });
+        assert_eq!(status, CheckStatus::Fail);
+
+        // An action nyet cannot classify is NOT assumed harmless.
+        let (status, message) = check(Grants {
+            unknown: vec!["teleportDocuments on app.*".into()],
+            unknown_count: 1,
+            ..clean()
+        });
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(message.contains("teleportDocuments"), "{message}");
+
+        // No authenticated user at all: there is provably no read-only role.
+        let (status, _) = check(Grants {
+            unauthenticated: true,
+            resources: 0,
+            ..clean()
+        });
+        assert_eq!(status, CheckStatus::Fail);
+    }
+
+    /// The MongoDB-only check, in all three states — and the one that matters
+    /// is `Unknown`: nyet refuses to probe by RUNNING JavaScript, so it says it
+    /// could not check instead of passing (UX-1/UX-7).
+    #[test]
+    fn doctor_server_side_js_is_mongodb_only_and_admits_it_cannot_check() {
+        let with = |engine, js| DoctorInput {
+            pii_mode: None,
+            engine,
+            diagnosis: Diagnosis {
+                connect: ConnectFact::Ok { via_tunnel: false },
+                server: Some(ServerFacts {
+                    js,
+                    superuser: SuperuserFact::No("roles: read@app".into()),
+                    read_only_note: None,
+                    probe: ProbeFact::Grants(Box::new(Grants {
+                        writes: Vec::new(),
+                        write_count: 0,
+                        unknown: Vec::new(),
+                        unknown_count: 0,
+                        this_database: false,
+                        resources: 1,
+                        unauthenticated: false,
+                    })),
+                }),
+                pii: Vec::new(),
+            },
+            forward: None,
+            transport: Transport::TlsDirect,
+            permissions: Permissions::Secure,
+        };
+        let js = |fact| {
+            let checks = doctor_checks(&with(EngineKind::Mongo, Some(fact)));
+            let c = by(&checks, "server_side_js");
+            (c.status, c.message.clone())
+        };
+        assert_eq!(js(JsFact::Disabled).0, CheckStatus::Ok);
+        let (status, message) = js(JsFact::Enabled);
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(message.contains("ENABLED"), "{message}");
+        let (status, message) = js(JsFact::Unknown("not authorized".into()));
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(message.contains("could not check"), "{message}");
+        assert!(message.contains("not authorized"), "{message}");
+        // Emitted for MongoDB and for nothing else.
+        for engine in [EngineKind::Postgres, EngineKind::Mysql, EngineKind::Sqlite] {
+            let checks = doctor_checks(&with(engine, None));
+            assert!(!checks.iter().any(|c| c.name == "server_side_js"));
+        }
+    }
+
+    /// Without a connection there are no facts, and a check with no fact is a
+    /// `warn` — including the MongoDB-only one. "Could not verify" is never an
+    /// `ok`: that is the failure mode doctor exists to avoid (UX-1).
+    #[test]
+    fn doctor_mongo_without_a_connection_never_reads_as_ok() {
+        let input = DoctorInput {
+            pii_mode: None,
+            engine: EngineKind::Mongo,
+            diagnosis: Diagnosis {
+                connect: ConnectFact::Failed {
+                    message: "no server could be selected".into(),
+                    hint: "check the host/port".into(),
+                },
+                server: None,
+                pii: Vec::new(),
+            },
+            forward: None,
+            transport: Transport::InsecureDirect,
+            permissions: Permissions::Secure,
+        };
+        let checks = doctor_checks(&input);
+        assert_eq!(by(&checks, "connectivity").status, CheckStatus::Fail);
+        for name in ["read_only_role", "not_superuser", "server_side_js"] {
+            let check = by(&checks, name);
+            assert_eq!(check.status, CheckStatus::Warn, "{name}");
+            assert!(check.message.contains("could not"), "{name}");
+            assert!(check.hint.is_some(), "{name}");
+        }
     }
 
     #[test]

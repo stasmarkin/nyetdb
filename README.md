@@ -19,11 +19,13 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
 - directory scoping (`allowed_dirs`) and `nyet list`;
 - `nyet schema` for all three engines: tables, views, columns, primary keys,
   unique constraints, indexes and foreign keys as structured JSON (see below);
-- `nyet query` for **MongoDB**: a parser for a subset of the mongosh read
-  syntax plus a closed allowlist over what it parsed (see "MongoDB" below) —
-  reads only, and honestly weaker than the SQL engines (no read-only session
-  exists in MongoDB, no `[pii]`, no guardrail; `nyet schema`/`explain`/`doctor`
-  answer `NOT_IMPLEMENTED` for now);
+- `nyet query`, `schema`, `explain` and `doctor` for **MongoDB**: a parser for a
+  subset of the mongosh read syntax plus a closed allowlist over what it parsed
+  (see "MongoDB" below) — reads only, and honestly weaker than the SQL engines
+  (no read-only session exists in MongoDB, no `[pii]`, no guardrail). `schema`
+  marks every field it INFERRED from a sample as a guess, `explain` shows the
+  plan without executing anything and invents no cost, and `doctor` proves
+  read-only from the privileges the server publishes — without writing a byte;
 - `nyet query` for **SQLite**, **PostgreSQL** and **MySQL/MariaDB**: the full
   SQL validator (read-only allowlist, recursive AST walk, Unicode stripping,
   locking clauses, per-engine function denylist with per-connection policy),
@@ -254,9 +256,13 @@ layers; MongoDB has two, and nyet says so rather than implying otherwise:
   guardrail mode a MongoDB connection accepts (anything else is a config
   error), and the backstops are the row limit and the timeout. nyet sends
   `maxTimeMS` with every command, so a runaway query is cancelled server-side.
-- **`nyet schema`, `nyet explain` and `nyet doctor` are not implemented yet**
-  for MongoDB: they answer `NOT_IMPLEMENTED` (exit 1) with a hint pointing at
-  `nyet query`, rather than guessing a schema from sampled documents.
+- **there is no schema.** `nyet schema` answers anyway, but it never presents a
+  guess as a schema: see "MongoDB schema, explain and doctor" below.
+- **server-side JavaScript cannot be checked from the client.** MongoDB exposes
+  no runtime parameter for it, so `nyet doctor` reports "could not check"
+  unless the account may read the server's startup options — and it will not
+  probe by RUNNING JavaScript, which is the one thing nyet promises never to
+  send.
 
 ### Recommended: a read-only MongoDB user (layer 3)
 
@@ -1019,6 +1025,84 @@ difference from PostgreSQL/MySQL, which keep TLS on the tunnel leg — their
 driver can verify a certificate chain without checking the hostname, MongoDB's
 cannot, so on that leg the ssh hop is the only encryption.
 
+### MongoDB schema, explain and doctor
+
+**`nyet schema <alias>` lists, `nyet schema <alias> <collection>` describes.**
+The listing is one round trip — names and kinds only — because describing a
+collection in MongoDB means *sampling* it, and doing that for every collection
+would cost several round trips each for an answer nobody asked for. It comes
+with a `SCHEMA_TRUNCATED` warning that says exactly that.
+
+**Nothing in that answer pretends to be a schema it is not.** Each field
+carries a `source`:
+
+| `source` | what it is | how much to trust it |
+|---|---|---|
+| `validator` | the collection's declared `$jsonSchema` | a rule the **server enforces on every write** |
+| `sample` | inferred by nyet from `sampled` random documents | a guess about the rest of the collection |
+
+A `sample` field also carries `seen` — in how many of the sampled documents it
+appeared — because a field present in 3 of 100 documents is not a column, and
+an agent has to be able to tell. `sampled` (how many documents were drawn — at
+most 100, fewer in a smaller collection) and `count` (the
+collection's document count, from its metadata, not a scan) sit on the table
+itself, nested paths are dotted (`profile.city` — the spelling a filter takes),
+`type` is the BSON type name `{$type: "..."}` takes (several joined by `|` when
+the documents disagree), `_id` is marked as the key and indexes come from
+`listIndexes`. Every such answer carries the `SCHEMA_SAMPLED` warning.
+
+```json
+{"name":"users","kind":"collection","count":51234,"sampled":100,
+ "columns":[{"name":"_id","type":"objectId","nullable":false,"pk":true,"source":"sample","seen":100},
+            {"name":"email","type":"string","nullable":false,"unique":true,"source":"validator","seen":100},
+            {"name":"profile.city","type":"string","nullable":true,"source":"sample","seen":37}],
+ "indexes":[{"name":"created_at_-1","columns":["created_at"]}]}
+```
+
+The sample size is not configurable (like the 50-object detail limit): when you
+want a bigger one, ask for it as what it is — a query:
+`nyet query <alias> 'db.users.aggregate([{$sample: {size: 1000}}])'`. At most
+100 inferred fields are listed per collection (rarest dropped first) and paths go three
+levels deep — a schemaless "field names are user ids" collection must not burn
+your agent's context. If the role may not run `listCollections` (the common
+case when it is scoped to a single view), the listing still works
+(`authorizedCollections`) and a named collection is still sampled — but nyet
+then cannot read the declared validator, so **the absence of `source:
+"validator"` never means "there is no validator"**.
+
+**`nyet explain <alias> '<query>'` plans, and only plans.** nyet asks for
+`verbosity: "queryPlanner"` and nothing else, because `executionStats` and
+`allPlansExecution` *execute* the query (measured: 1 ms vs 4 s on the same
+pipeline). The same layer 1 applies as for `query`, so `explain` is not a way
+around the allowlist — `db.c.aggregate([{$out: "copy"}])` is refused here too
+(exit 5). The plan carries `stages` (a `COLLSCAN` means no index was usable, an
+`IXSCAN` means one was), the `indexes` used, the `rejected` plans and the
+winning plan verbatim (`indexBounds` included — that is where "why did my regex
+not use the index" is answered). There is **no cost and no row estimate**:
+MongoDB publishes neither before execution, and nyet does not manufacture one.
+`collection_documents` is the size of the *collection*, so that "COLLSCAN"
+reads as "COLLSCAN over 40 million documents" — it is not an estimate of the
+query.
+
+**`nyet doctor <alias>` proves read-only by asking, not by writing.** On the SQL
+engines doctor runs a probe write inside a transaction it rolls back; on
+MongoDB it runs none at all — `connectionStatus {showPrivileges: true}` lists
+every action these credentials hold on every resource of the cluster, and nyet
+checks that none of them writes. It checks the **whole cluster**, not just this
+database: a role that is `read` here and `readWrite` in a scratch database can
+copy a collection out with `$out: {db: "scratch", coll: "exfil"}` (measured) —
+nyet's own allowlist refuses `$out`, but another client with the same
+credentials will not. Write actions elsewhere are a `warn`, write actions here
+(or on the cluster) a `fail`, and an action nyet cannot classify is reported
+rather than assumed harmless. The MongoDB-only `server_side_js` check is the
+honest one: `$where`/`$function`/`$accumulator` run arbitrary code in the
+database process, the plain `read` role is allowed to use them and `maxTimeMS`
+does not bound them (measured: 8 s and 12 s under a 500 ms limit). nyet refuses
+all of it — but only for queries going through nyet. MongoDB exposes no runtime
+parameter for the setting, so doctor reads the server's startup options if the
+account may (`--noscripting` → `ok`), and otherwise says **"could not check"**
+with the reason. It will not probe by running JavaScript.
+
 ### nyet schema
 
 ```sh
@@ -1453,8 +1537,27 @@ What each check means and what to do about it:
   forward that outlives the process is something you can see and kill, not
   folklore. With `reuse_forward = false` it says so and offers no command,
   because nothing is left behind.
+- **server_side_js** (MongoDB only) — does the SERVER evaluate JavaScript
+  (`$where`, `$function`, `$accumulator`, `mapReduce`)? nyet refuses all of it,
+  but only for queries that go through nyet: the plain `read` role may run it,
+  and `maxTimeMS` does not bound it (measured: 8 s and 12 s under a 500 ms
+  limit), so it is unbounded arbitrary code in the database process for any
+  other client with the same credentials. MongoDB publishes **no runtime
+  parameter** for the setting, so doctor reads the server's startup options
+  (`--noscripting` → `ok`, scripting on → `warn` with the fix). If the account
+  may not read them — the normal case for a read-only role — the answer is
+  `warn`, **"could not check"**, with the reason: nyet will not probe by
+  RUNNING JavaScript, which is precisely what it promises never to send.
 - **config_permissions** — is the config file `0600` (owner-only)? Group/other
   bits → `warn`. Fix: `chmod 600` on the config file.
+
+**MongoDB proves layer 3 without writing anything.** There is no probe write
+there: `connectionStatus {showPrivileges: true}` publishes every action these
+credentials hold on every resource, so `read_only_role` is decided by reading a
+list. It looks at the WHOLE cluster (a `readWrite` role in another database is
+an exfiltration path through `$out`, measured), and an action nyet cannot
+classify as a read is reported, not assumed harmless — see "MongoDB schema,
+explain and doctor".
 
 **SQLite is reported honestly.** It has no roles, no server and no network, so
 `transport_encrypted`, `read_only_role`, `not_superuser` and `pii_columns` (when
@@ -1646,7 +1749,9 @@ which has no plan),
 is below `require` and has no ssh tunnel — the transport is not guaranteed
 encrypted or verified; the message says how to force TLS),
 `SCHEMA_TRUNCATED` (`nyet schema` listed objects by name only — more than 50
-tables + views),
+tables + views, or a MongoDB listing, which is always names-only),
+`SCHEMA_SAMPLED` (MongoDB: part of that schema answer was INFERRED from a
+sample of documents — see "MongoDB schema, explain and doctor"),
 `PII_MASKED` (`[pii] mode = "mask"`: the named columns came back as
 `[REDACTED]` — see "PII columns").
 
@@ -1753,7 +1858,8 @@ Every error carries an actionable `hint`. Error codes today:
 see [Audit log](#audit-log)), `NYET` (with `reason`, see above),
 `CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
 Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
-`INSECURE_TRANSPORT`, `SCHEMA_TRUNCATED`, `GUARDRAIL_SKIPPED`, `NO_PLAN`.
+`INSECURE_TRANSPORT`, `SCHEMA_TRUNCATED`, `SCHEMA_SAMPLED`,
+`GUARDRAIL_SKIPPED`, `NO_PLAN`.
 
 `nyet doctor` carries a `checks` array instead — one object per diagnostic
 (`{name, status, message, hint?}`) — and always `ok: true` (it ran; the verdicts

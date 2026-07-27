@@ -80,8 +80,9 @@ Success is `{"v":1,"ok":true, ...}`:
   `connection`; `explain` → `duration_ms`, `connection`.
 - `warnings` — array of `{code, message}`, omitted when empty. These are NOT
   errors; the answer is valid. Codes include `TRUNCATED`, `SCHEMA_TRUNCATED`,
-  `GUARDRAIL_SKIPPED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
-  `INSECURE_TRANSPORT`, `PII_MASKED` (see below).
+  `SCHEMA_SAMPLED` (MongoDB: part of that schema answer is a guess drawn from a
+  sample — see below), `GUARDRAIL_SKIPPED`, `DUPLICATE_COLUMNS`,
+  `UNICODE_STRIPPED`, `INSECURE_TRANSPORT`, `PII_MASKED` (see below).
 
 Failure is `{"v":1,"ok":false,"error":{"code":...,"message":...,"hint":...}}`.
 Always read `hint` — it tells you how to fix it. A refusal (`"code":"NYET"`)
@@ -119,9 +120,26 @@ Refused, by an allowlist that is closed by design: every write (including the
 `$out`/`$merge` stages anywhere in a pipeline), server-side JavaScript
 (`$where`, `$function`, `$accumulator`, `mapReduce`), any `$`-key nyet does not
 know, command options (`allowDiskUse`, `let`, `readConcern`, ...) and
-`db.runCommand`/`db.adminCommand`. `nyet schema`, `nyet explain` and
-`nyet doctor` do not support MongoDB yet (they answer `NOT_IMPLEMENTED`,
-exit 1) — use `db.<collection>.find({}).limit(1)` to see a document's shape.
+`db.runCommand`/`db.adminCommand`. `nyet explain <alias> '<query>'` runs the
+same allowlist, so it is not a way around any of this.
+
+`nyet schema <alias>` lists collections and views by name; `nyet schema <alias>
+<collection>` describes ONE of them. **MongoDB has no schema, so read the
+`source` of every field**: `"validator"` means the collection's declared
+`$jsonSchema` — a rule the server enforces — while `"sample"` means nyet
+inferred the field from `sampled` random documents and `seen` says in how many
+of them it appeared. A field seen in 3 of 100 is not a column; a field absent
+from the sample is missing from the answer entirely. `count` is the
+collection's document count, nested paths are dotted (`profile.city`, the
+spelling a filter takes) and `type` is the BSON type name `{$type: "..."}`
+takes.
+
+`nyet explain <alias> '<query>'` returns the query plan without running the
+query: `stages` (`COLLSCAN` means no index was usable, `IXSCAN` means one was),
+`indexes`, the `rejected` plans and `collection_documents` — the size of the
+COLLECTION, not an estimate of the query. MongoDB publishes no cost or row
+estimate before execution, so there is none in the answer and no guardrail on
+this engine.
 
 ## When nyet refuses (exit 5, "code":"NYET")
 
