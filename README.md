@@ -8,7 +8,7 @@ credentials, per-directory scoping, layered read-only enforcement (SQL AST
 validation + session-level read-only + read-only roles), and JSON output
 designed for agents.
 
-Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
+Supported: PostgreSQL, MySQL/MariaDB, SQLite, MongoDB.
 
 ## Status
 
@@ -41,8 +41,10 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
   estimate is over the connection's threshold (see below);
 - the stable JSON envelope and exit-code contract.
 
-Redis and ClickHouse arrive in later releases; `nyet query` against a
-not-yet-supported engine resolves the connection and returns `NOT_IMPLEMENTED`.
+Redis and ClickHouse are wishlist items rather than scheduled work, and each
+needs a decision before it is built rather than just a driver — see ROADMAP.
+`nyet query` against an engine that is not supported resolves the connection
+and returns `NOT_IMPLEMENTED`.
 Direct connections **support TLS** (rustls): set `sslmode=require`/`verify-full`
 (Postgres) or `ssl-mode=REQUIRED`/`VERIFY_IDENTITY` (MySQL) in the `url` to force
 it — otherwise the default (`prefer`/`PREFERRED`) uses TLS only if the server
