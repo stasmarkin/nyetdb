@@ -2,9 +2,6 @@
 
 ## Build & test
 
-`just build` / `just test` / `just install` wrap the three commands below;
-`just` alone lists the recipes.
-
 ```sh
 cargo build                                # binary: target/debug/nyet
 cargo test                                 # unit + integration (see Docker note below)
@@ -13,6 +10,24 @@ cargo clippy --all-targets -- -D warnings
 cargo deny check                           # cargo install cargo-deny --locked (or brew install cargo-deny)
 cargo audit                                # cargo install cargo-audit --locked (or brew install cargo-audit)
 ```
+
+The `justfile` is a convenience wrapper around exactly those commands (nothing
+needs `just` — building and installing nyet is plain cargo); `just` alone lists
+the recipes:
+
+| recipe | what it runs |
+|---|---|
+| `just build` / `just install` | `cargo build` / `cargo install --path . --locked` |
+| `just test-fast` | `--bins` + `--test cli`, minus the five container unit tests — **no Docker**, ~2 s |
+| `just test` | the whole `cargo test`, containers included, ~40 s |
+| `just check` | the pre-commit gate: fmt, clippy, full test, deny, audit |
+
+The container recipes resolve Docker themselves: an exported `DOCKER_HOST` wins,
+otherwise `~/.colima/docker.sock` if it exists, otherwise docker's own default —
+and if no daemon answers there, they say so (with the `colima start` /
+`just test-fast` way out) instead of dropping a testcontainers stack trace.
+`just test-fast` skips the container tests **by name**, so a new one has to be
+added to `container_units` in the justfile.
 
 Stable Rust; no nightly features. `#![forbid(unsafe_code)]` on the whole crate.
 
@@ -45,11 +60,21 @@ docker pull postgres:16-alpine             # first run only; cached after
 docker pull mysql:8.4
 docker pull mariadb:11.4
 docker pull linuxserver/openssh-server@sha256:9c5e178975fcc3917853f5e37cbf135ad7deb11de504ab0f460cc81a2e1eb539  # SSH tunnel stand (digest-pinned in tests/ssh.rs)
-echo $DOCKER_HOST                           # testcontainers reads this (colima socket)
-cargo test                                 # containers come up and are reaped per test
+just test                                  # containers come up and are reaped per test
 ```
 
-The SQLite and validator/config/resolver tests need no Docker.
+`just test` also sets `DOCKER_HOST` for you (colima publishes its socket in
+`~/.colima`, which testcontainers does not look at on its own — it reads
+`DOCKER_HOST` or falls back to `/var/run/docker.sock`, and it does *not* read
+docker CLI contexts). With a plain `cargo test`, export it yourself.
+
+The SQLite and validator/config/resolver tests need no Docker; `just test-fast`
+is exactly that subset (`cargo test --bins --test cli` minus
+`postgres_layer2_types_and_timeout`,
+`pg_collapsed_guardrail_arming_keeps_its_invariants`,
+`mysql_layer2_types_and_timeout`, `mysql8_caching_sha2_password_over_tls` and
+`mariadb_server_timeout_maps_to_timeout` — the container tests that live in
+`src/engine.rs` among the pure ones).
 
 ### MySQL vs MariaDB, and the TLS backend (rustls)
 
