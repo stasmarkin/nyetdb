@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+mongodb = "3.8"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
 sqlparser = { version = "0.62", default-features = false, features = ["std", "visitor"] }
@@ -27,7 +28,7 @@ unicode-properties = { version = "0.1.4", default-features = false, features = [
 
 [dev-dependencies]
 tempfile = "3.27.0"
-testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb", "mongo"] }
 # The PostgreSQL tests build a multi-thread runtime (testcontainers + its async
 # Drop need it); declared explicitly so it does not depend on transitive features.
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread"] }

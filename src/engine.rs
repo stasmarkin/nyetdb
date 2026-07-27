@@ -12,6 +12,7 @@ use crate::output::{
 };
 use crate::validator::Origin;
 use futures_util::TryStreamExt;
+use mongodb::options::{ClientOptions, ServerAddress, Tls};
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlRow, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgRow, PgSslMode};
@@ -25,6 +26,14 @@ use std::time::Duration;
 pub struct ResultSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
+    /// The SERVER stopped short of what nyet asked for, so this result is
+    /// incomplete for a reason the row count cannot show. Only MongoDB sets it
+    /// (its 16 MiB reply cap can cut a batch before the row limit is reached);
+    /// the SQL engines stream rows and detect truncation by counting them, so
+    /// they leave it false. The cli ORs it into `meta.truncated` — an
+    /// incomplete answer that reads as complete is the worst failure a read
+    /// tool has (UX-1).
+    pub truncated: bool,
     /// Where each column came from, as the DRIVER reported it — the raw
     /// material for the cli's net B (`validator::check_origins`). Same length
     /// and order as `columns`; a missing entry counts as `Origin::Unknown`
@@ -616,6 +625,7 @@ impl Engine for Sqlite {
                     columns,
                     rows,
                     origins,
+                    truncated: false,
                 },
                 estimate: None,
             })
@@ -1214,6 +1224,7 @@ impl Engine for Postgres {
                     columns,
                     rows,
                     origins,
+                    truncated: false,
                 },
                 estimate,
             });
@@ -2019,6 +2030,20 @@ pub fn transport_below_require(engine: &str, url: &str) -> bool {
                 MySqlSslMode::Disabled | MySqlSslMode::Preferred
             )
         }),
+        // Read off the url text rather than through the driver: parsing a
+        // MongoDB url is async (SRV) and this runs before any runtime exists
+        // (Д9). `tls`/`ssl` are synonyms; `mongodb+srv://` turns TLS on by
+        // default, which an explicit `false` can still switch off. Erring
+        // toward "insecure" is the safe direction for a warning.
+        "mongodb" => {
+            let url = url.to_ascii_lowercase();
+            if url.contains("tls=false") || url.contains("ssl=false") {
+                return true;
+            }
+            !(url.starts_with("mongodb+srv://")
+                || url.contains("tls=true")
+                || url.contains("ssl=true"))
+        }
         _ => false,
     }
 }
@@ -2525,6 +2550,7 @@ impl Engine for Mysql {
                     columns,
                     rows,
                     origins,
+                    truncated: false,
                 },
                 estimate,
             });
@@ -3379,6 +3405,328 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+/// MongoDB. The odd one out on purpose, and the README says so:
+///
+/// - **there is no layer 2.** MongoDB has no read-only session, transaction or
+///   connection flag — `readConcern`/`readPreference` are consistency and
+///   routing knobs, not permissions, and a secondary is not a barrier either
+///   (measured: a `$out` sent to a secondary is routed to the primary and
+///   creates the collection). So layer 1 (`crate::mongo`) and layer 3 (a
+///   read-only role) are the whole story here.
+/// - **no guardrail.** `explain` with `queryPlanner` publishes neither a cost
+///   nor a row estimate, and `executionStats` RUNS the query — so there is
+///   nothing to compare a threshold against (`guardrail::engine_modes` accepts
+///   `off` only, a config error otherwise).
+/// - **no `[pii]`.** Rejected at config parse: nyet cannot prove which field of
+///   a schemaless document a rule would cover, and a policy that quietly
+///   protects nothing is worse than none (UX-7).
+pub struct Mongo {
+    /// The `url` from the config (no password embedded by convention).
+    pub url: String,
+    /// Read from `password_env` by the cli; never logged/printed.
+    pub password: Option<String>,
+    /// The effective per-query wall budget in ms: sent to the server as
+    /// `maxTimeMS` AND used as the in-process deadline, so a runaway query is
+    /// TIMEOUT (exit 8) whichever fires.
+    pub query_timeout_ms: u64,
+    /// When an SSH tunnel is up, `(127.0.0.1, local_port)` to connect through.
+    pub host_override: Option<(String, u16)>,
+    /// Test-only override for the connect deadline (ms); production is `None`.
+    pub connect_timeout_ms: Option<u64>,
+}
+
+impl Mongo {
+    /// The client and the database name the url names. The driver connects
+    /// lazily, so the deadline here bounds SRV resolution only; server
+    /// selection and the TCP/TLS handshake are bounded by the same value
+    /// through `server_selection_timeout`/`connect_timeout`, which is what
+    /// turns an unreachable host into CONNECTION_FAILED (exit 6) rather than a
+    /// TIMEOUT (exit 8) or a 30-second default hang.
+    async fn open(&self) -> Result<(mongodb::Client, String), EngineError> {
+        let deadline = self
+            .connect_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| connect_deadline(self.query_timeout_ms));
+        // Never echo the url on a parse error: it may embed credentials.
+        let invalid_url = |message: &str| EngineError::Connect {
+            message: message.to_string(),
+            hint: "use the form mongodb://user@host:27017/dbname; put the password in the \
+                   env var named by password_env, not in the url"
+                .to_string(),
+        };
+        let parsed = tokio::time::timeout(deadline, ClientOptions::parse(&self.url)).await;
+        let mut opts = match parsed {
+            Err(_elapsed) => {
+                return Err(EngineError::Connect {
+                    message: "resolving the MongoDB connection string did not complete in time"
+                        .to_string(),
+                    hint: "a mongodb+srv:// url needs DNS (SRV + TXT records); check \
+                           connectivity to the resolver, or use a plain mongodb:// url"
+                        .to_string(),
+                })
+            }
+            Ok(Err(e)) => {
+                return Err(match *e.kind {
+                    mongodb::error::ErrorKind::DnsResolve { .. } => EngineError::Connect {
+                        message: "the SRV record for this mongodb+srv:// url could not be resolved"
+                            .to_string(),
+                        hint: "check the cluster hostname and that DNS is reachable from here"
+                            .to_string(),
+                    },
+                    _ => invalid_url(
+                        "the `url` for this connection is not a valid MongoDB \
+                                      connection string",
+                    ),
+                })
+            }
+            Ok(Ok(opts)) => opts,
+        };
+        let Some(database) = opts.default_database.clone() else {
+            return Err(invalid_url(
+                "the `url` for this connection names no database",
+            ));
+        };
+        if let Some(password) = &self.password {
+            let Some(credential) = opts.credential.as_mut() else {
+                return Err(EngineError::Connect {
+                    message: "password_env is set for this connection but its `url` names no user"
+                        .to_string(),
+                    hint: "put the user in the url (mongodb://<user>@host:27017/dbname) and the \
+                           password in the env var named by password_env"
+                        .to_string(),
+                });
+            };
+            credential.password = Some(password.clone());
+        }
+        // Visible in the server's log/currentOp, so the human can tell nyet's
+        // reads apart from everything else touching the database.
+        opts.app_name = Some("nyet".to_string());
+        opts.connect_timeout = Some(deadline);
+        opts.server_selection_timeout = Some(deadline);
+        if let Some((host, port)) = &self.host_override {
+            // The tunnel's local end is the ONLY address we may use, and
+            // `directConnection` is what stops the driver from discovering the
+            // replica set's real members through rs.conf() and going straight
+            // to them — around the bastion (config parse rejects an explicit
+            // directConnection=false, and mongodb+srv, alongside [ssh]).
+            opts.hosts = vec![ServerAddress::Tcp {
+                host: host.clone(),
+                port: Some(*port),
+            }];
+            opts.direct_connection = Some(true);
+            opts.repl_set_name = None;
+            // TLS is dropped for the tunnel leg: the ssh hop already encrypts
+            // it, and the driver's rustls backend can only verify a certificate
+            // against the name it dialed (127.0.0.1), which the server's
+            // certificate does not carry. The alternatives were worse —
+            // accepting invalid certificates is the security theatre UX-7
+            // forbids. Documented in the README.
+            opts.tls = Some(Tls::Disabled);
+        }
+        let client = mongodb::Client::with_options(opts).map_err(|_| EngineError::Connect {
+            message: "the MongoDB client could not be built from this connection's `url`"
+                .to_string(),
+            hint: "check the url's options; over an ssh tunnel nyet forces a direct \
+                   connection to the forwarded port, so replicaSet/loadBalanced options \
+                   are not usable there"
+                .to_string(),
+        })?;
+        // The driver connects LAZILY, so the handshake would otherwise happen
+        // inside the first command — under the QUERY deadline, which makes an
+        // unreachable host answer TIMEOUT (exit 8) instead of
+        // CONNECTION_FAILED (exit 6). One `ping` under the CONNECT deadline
+        // buys the same split the other engines get from their handshake: a
+        // dead host, a refused TLS handshake and a wrong password are all exit
+        // 6, and only a slow QUERY is exit 8. It costs the round trip those
+        // engines already pay at connect.
+        let ping = mongodb::bson::doc! { "ping": 1 };
+        match tokio::time::timeout(deadline, client.database(&database).run_command(ping)).await {
+            Err(_elapsed) => {
+                return Err(EngineError::Connect {
+                    message: "the connection to the MongoDB server did not complete in time"
+                        .to_string(),
+                    hint: "check the host/port in `url` and that the server is reachable \
+                           (a firewall may be dropping the connection)"
+                        .to_string(),
+                })
+            }
+            // Anything that goes wrong before the first real command is a
+            // CONNECTION failure, whatever shape the driver gave it.
+            Ok(Err(e)) => {
+                let (message, hint) = error_parts(mongo_error(e));
+                return Err(EngineError::Connect { message, hint });
+            }
+            Ok(Ok(_)) => {}
+        }
+        Ok((client, database))
+    }
+}
+
+impl Engine for Mongo {
+    /// The guardrail parameter is ignored, like SQLite's: MongoDB publishes no
+    /// plan cost or row estimate that could be compared to a threshold without
+    /// executing the query, so `off` is the only mode its config accepts.
+    async fn execute(
+        &self,
+        sql: &str,
+        fetch_limit: u64,
+        _guardrail: &Guardrail,
+    ) -> Result<QueryOutcome, EngineError> {
+        // Layer 1 again, on the very text the cli classified. `mongo::check` is
+        // pure and deterministic, so this cannot disagree with the cli's own
+        // verdict — it is here so that what EXECUTES is what was CLASSIFIED,
+        // with no second representation in between to drift.
+        let request = crate::mongo::check(sql).map_err(|r| EngineError::Db {
+            message: format!("nyet refused this query on re-validation: {}", r.message),
+            hint: r.hint,
+        })?;
+        let (client, database) = self.open().await?;
+        let command = request.command(fetch_limit, self.query_timeout_ms);
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        let reply =
+            match tokio::time::timeout(deadline, client.database(&database).run_command(command))
+                .await
+            {
+                Err(_elapsed) => return Err(client_timeout(self.query_timeout_ms)),
+                Ok(Err(e)) => return Err(mongo_error(e)),
+                Ok(Ok(reply)) => reply,
+            };
+        let reply = request
+            .read_reply(reply)
+            .map_err(|message| EngineError::Db {
+                message: format!("the MongoDB server returned an unexpected reply: {message}"),
+                hint: "this is a server/driver mismatch rather than a problem with the query; \
+                   report it if it persists"
+                    .to_string(),
+            })?;
+        Ok(QueryOutcome::Ran {
+            result: ResultSet {
+                // Provenance does not exist here: a document field has no
+                // catalog origin, and net B never runs (a `[pii]` section on a
+                // MongoDB connection is a config error).
+                origins: vec![Origin::Unknown; reply.columns.len()],
+                columns: reply.columns,
+                rows: reply.rows,
+                truncated: reply.truncated,
+            },
+            estimate: None,
+        })
+    }
+
+    /// Not implemented for MongoDB (step 2). The cli refuses `nyet explain` for
+    /// this engine before it gets here, so this is only the honest fallback —
+    /// a refusal, never a panic (Д3).
+    async fn estimate(&self, _sql: &str) -> Result<Option<CostEstimate>, EngineError> {
+        Err(mongo_not_implemented("explain"))
+    }
+
+    async fn schema(&self, _table: Option<&str>) -> Result<Schema, EngineError> {
+        Err(mongo_not_implemented("schema"))
+    }
+
+    async fn diagnose(&self, _pii: &[(String, String)]) -> Diagnosis {
+        let (message, hint) = error_parts(mongo_not_implemented("doctor"));
+        Diagnosis {
+            connect: ConnectFact::Failed { message, hint },
+            server: None,
+            pii: Vec::new(),
+        }
+    }
+}
+
+fn mongo_not_implemented(command: &str) -> EngineError {
+    EngineError::Db {
+        message: format!("nyet {command} does not support MongoDB yet"),
+        hint: "MongoDB currently supports `nyet query` only".to_string(),
+    }
+}
+
+/// MongoDB error -> contract code. `MaxTimeMSExpired` (50) and
+/// `ExceededTimeLimit` (262) are the server acting on the `maxTimeMS` nyet
+/// sends, so they map to TIMEOUT (exit 8) exactly like Postgres 57014 —
+/// deterministic whichever of the two deadlines fires first. Everything that
+/// happens before a command is accepted (server selection, IO, auth, TLS) is
+/// CONNECTION_FAILED (exit 6); the rest is DB_ERROR (exit 7).
+fn mongo_error(e: mongodb::error::Error) -> EngineError {
+    use mongodb::error::ErrorKind;
+    match *e.kind {
+        ErrorKind::Command(command) => {
+            if matches!(command.code, 50 | 262) {
+                return EngineError::Timeout {
+                    message: "the query exceeded the timeout and was cancelled by the server"
+                        .to_string(),
+                    hint: "narrow the query (a tighter filter, .limit(n)), or raise --timeout \
+                           or timeout_secs in the config"
+                        .to_string(),
+                };
+            }
+            EngineError::Db {
+                message: format!(
+                    "the database returned an error: {}",
+                    trim_server_message(&command.message)
+                ),
+                hint: "check the query against the actual documents, e.g. \
+                       db.<collection>.find({}).limit(1)"
+                    .to_string(),
+            }
+        }
+        ErrorKind::ServerSelection { message, .. } => EngineError::Connect {
+            message: format!(
+                "no MongoDB server could be selected: {}",
+                trim_server_message(&message)
+            ),
+            hint: "check the host/port in `url` and that the server is reachable; over an \
+                   ssh tunnel check that the bastion forwards to the right member"
+                .to_string(),
+        },
+        ErrorKind::Authentication { message, .. } => EngineError::Connect {
+            message: format!(
+                "authentication against MongoDB failed: {}",
+                trim_server_message(&message)
+            ),
+            hint: "check the user in `url`, the password in the env var named by \
+                   password_env, and the authSource the user belongs to"
+                .to_string(),
+        },
+        ErrorKind::Io(e) => EngineError::Connect {
+            message: format!("the connection to the MongoDB server failed: {e}"),
+            hint: "check the host/port in `url` and that the server is reachable".to_string(),
+        },
+        ErrorKind::DnsResolve { message, .. } => EngineError::Connect {
+            message: format!("DNS resolution for this connection failed: {message}"),
+            hint: "check the cluster hostname and that DNS is reachable from here".to_string(),
+        },
+        ErrorKind::InvalidTlsConfig { message, .. } => EngineError::Connect {
+            message: format!("the TLS configuration for this connection is invalid: {message}"),
+            hint: "check tls/tlsCAFile in `url`; over an ssh tunnel nyet disables TLS \
+                   because the hop is already encrypted"
+                .to_string(),
+        },
+        other => EngineError::Db {
+            message: format!(
+                "the database returned an error: {}",
+                trim_server_message(&other.to_string())
+            ),
+            hint: "check the query against the actual documents, e.g. \
+                   db.<collection>.find({}).limit(1)"
+                .to_string(),
+        },
+    }
+}
+
+/// MongoDB echoes the whole command document back in some error messages
+/// (measured on an `Unauthorized`), which for a large pipeline is kilobytes of
+/// the agent's own text charged back to it (UX-4). Keep the first line and cap
+/// its length; the full message is in the server's log.
+fn trim_server_message(text: &str) -> String {
+    const MAX: usize = 600;
+    let line = first_line(text);
+    match line.char_indices().nth(MAX) {
+        None => line,
+        Some((cut, _)) => format!("{}… (message truncated by nyet)", &line[..cut]),
+    }
 }
 
 fn db_error(e: sqlx::Error) -> EngineError {
@@ -4829,5 +5177,168 @@ mod tests {
 
             container.rm().await.unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod mongo_tests {
+    use super::*;
+
+    /// A current-thread runtime with IO as well as time: the MongoDB driver
+    /// opens sockets and runs its topology monitor as background tasks.
+    fn mongo_block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    fn engine(url: &str, password: Option<&str>) -> Mongo {
+        Mongo {
+            url: url.to_string(),
+            password: password.map(str::to_string),
+            query_timeout_ms: 300,
+            host_override: None,
+            // Keep the connect phase short: these tests are about which ERROR
+            // comes back, not about how patient the default is.
+            connect_timeout_ms: Some(300),
+        }
+    }
+
+    /// The driver connects lazily, so without nyet's own connect phase an
+    /// unreachable server would be reported by the QUERY deadline as a TIMEOUT
+    /// (exit 8). The split has to hold: a connection problem is exit 6, and
+    /// only a slow query is exit 8.
+    #[test]
+    fn mongo_unreachable_server_is_connection_failed_not_timeout() {
+        // Port 1 on loopback: nothing listens, and the driver keeps retrying
+        // server selection until ITS deadline (which nyet sets to the connect
+        // deadline) rather than failing on the first refused socket.
+        let err = mongo_block_on(engine("mongodb://127.0.0.1:1/app", None).execute(
+            "db.c.find({})",
+            10,
+            &Guardrail::OFF,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, EngineError::Connect { .. }), "{err:?}");
+    }
+
+    /// The url is the only place the database name can come from — nyet never
+    /// picks one for the agent, and it never guesses `admin`/`test`.
+    #[test]
+    fn a_url_without_a_database_is_a_connect_error_naming_the_problem() {
+        let err = mongo_block_on(engine("mongodb://127.0.0.1:27017", None).execute(
+            "db.c.find({})",
+            10,
+            &Guardrail::OFF,
+        ))
+        .unwrap_err();
+        let EngineError::Connect { message, hint } = err else {
+            panic!("expected a connect error")
+        };
+        assert!(message.contains("names no database"), "{message}");
+        assert!(!hint.is_empty());
+    }
+
+    /// A password with nobody to attach it to is a configuration mistake, and
+    /// the message must say so rather than let the driver try an anonymous
+    /// connection that "works" against an unauthenticated server.
+    #[test]
+    fn a_password_without_a_user_is_refused_before_connecting() {
+        let err = mongo_block_on(
+            engine("mongodb://127.0.0.1:1/app", Some("hunter2")).execute(
+                "db.c.find({})",
+                10,
+                &Guardrail::OFF,
+            ),
+        )
+        .unwrap_err();
+        let EngineError::Connect { message, hint } = err else {
+            panic!("expected a connect error")
+        };
+        assert!(message.contains("names no user"), "{message}");
+        // The password itself is never echoed (it is a secret, and the message
+        // travels to the agent).
+        assert!(!message.contains("hunter2") && !hint.contains("hunter2"));
+    }
+
+    /// An invalid url never echoes the url: it may carry credentials.
+    #[test]
+    fn an_invalid_url_is_a_connect_error_that_echoes_nothing() {
+        let err = mongo_block_on(engine("postgres://user:hunter2@host/db", None).execute(
+            "db.c.find({})",
+            10,
+            &Guardrail::OFF,
+        ))
+        .unwrap_err();
+        let EngineError::Connect { message, hint } = err else {
+            panic!("expected a connect error")
+        };
+        assert!(!message.contains("hunter2"), "{message}");
+        assert!(!hint.contains("hunter2"));
+    }
+
+    /// The engine re-validates the text it was given, so a refused query can
+    /// never reach the server even if a caller forgot layer 1 — and the
+    /// refusal is an error, not a panic.
+    #[test]
+    fn the_engine_revalidates_and_never_runs_a_refused_query() {
+        let err = mongo_block_on(engine("mongodb://127.0.0.1:1/app", None).execute(
+            "db.c.aggregate([{$out: \"copy\"}])",
+            10,
+            &Guardrail::OFF,
+        ))
+        .unwrap_err();
+        // Refused before the connect phase, so it is not a Connect error.
+        let EngineError::Db { message, .. } = err else {
+            panic!("expected the re-validation refusal, got a connect error")
+        };
+        assert!(message.contains("re-validation"), "{message}");
+    }
+
+    /// A MongoDB url without TLS gives no encryption guarantee, and doctor /
+    /// the INSECURE_TRANSPORT warning must say so — reading it off the url
+    /// text, because parsing a MongoDB url is async and this runs before any
+    /// runtime exists.
+    #[test]
+    fn mongodb_transport_is_judged_from_the_url_text() {
+        for insecure in [
+            "mongodb://h:27017/app",
+            "mongodb://h:27017/app?replicaSet=rs0",
+            "mongodb+srv://h/app?tls=false",
+            "mongodb://h:27017/app?ssl=false",
+        ] {
+            assert!(
+                transport_below_require("mongodb", insecure),
+                "{insecure} should warn"
+            );
+        }
+        for secure in [
+            "mongodb://h:27017/app?tls=true",
+            "mongodb://h:27017/app?ssl=true",
+            "mongodb+srv://cluster.example.net/app",
+        ] {
+            assert!(
+                !transport_below_require("mongodb", secure),
+                "{secure} should not warn"
+            );
+        }
+    }
+
+    /// A server message that echoes the whole command back is capped: the
+    /// agent pays for every byte it reads (UX-4).
+    #[test]
+    fn a_huge_server_message_is_trimmed() {
+        let long = format!("Unauthorized: {}", "x".repeat(5000));
+        let trimmed = trim_server_message(&long);
+        assert!(trimmed.len() < 800, "{}", trimmed.len());
+        assert!(trimmed.starts_with("Unauthorized: x"));
+        assert!(trimmed.ends_with("(message truncated by nyet)"));
+        // A short one is passed through untouched.
+        assert_eq!(
+            trim_server_message("no such collection"),
+            "no such collection"
+        );
     }
 }

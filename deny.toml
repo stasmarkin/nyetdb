@@ -30,6 +30,16 @@ allow = ["Zlib"]
 name = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
 
+# Scoped: the SHA-3/Keccak implementation the MongoDB driver's SCRAM auth
+# reaches through its hash stack. CC0-1.0 is a public-domain DEDICATION (no
+# conditions to satisfy, no attribution to carry) rather than a permissive code
+# license, so it stays confined to this one crate instead of joining the global
+# allowlist — a future dependency that arrives under CC0 must be a conscious
+# decision of its own.
+[[licenses.exceptions]]
+name = "tiny-keccak" # via mongodb
+allow = ["CC0-1.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

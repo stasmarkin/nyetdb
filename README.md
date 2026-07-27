@@ -19,6 +19,11 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
 - directory scoping (`allowed_dirs`) and `nyet list`;
 - `nyet schema` for all three engines: tables, views, columns, primary keys,
   unique constraints, indexes and foreign keys as structured JSON (see below);
+- `nyet query` for **MongoDB**: a parser for a subset of the mongosh read
+  syntax plus a closed allowlist over what it parsed (see "MongoDB" below) —
+  reads only, and honestly weaker than the SQL engines (no read-only session
+  exists in MongoDB, no `[pii]`, no guardrail; `nyet schema`/`explain`/`doctor`
+  answer `NOT_IMPLEMENTED` for now);
 - `nyet query` for **SQLite**, **PostgreSQL** and **MySQL/MariaDB**: the full
   SQL validator (read-only allowlist, recursive AST walk, Unicode stripping,
   locking clauses, per-engine function denylist with per-connection policy),
@@ -34,7 +39,7 @@ Planned support: PostgreSQL, MySQL/MariaDB, SQLite, Redis, MongoDB, ClickHouse.
   estimate is over the connection's threshold (see below);
 - the stable JSON envelope and exit-code contract.
 
-Redis, MongoDB and ClickHouse arrive in later releases; `nyet query` against a
+Redis and ClickHouse arrive in later releases; `nyet query` against a
 not-yet-supported engine resolves the connection and returns `NOT_IMPLEMENTED`.
 Direct connections **support TLS** (rustls): set `sslmode=require`/`verify-full`
 (Postgres) or `ssl-mode=REQUIRED`/`VERIFY_IDENTITY` (MySQL) in the `url` to force
@@ -102,7 +107,7 @@ enabled = true                         # false disables logging (CI/containers)
 log_responses = false                  # true also logs the result rows
 
 [connections.prod]
-engine = "postgres"                    # postgres | mysql | sqlite | ...
+engine = "postgres"                    # postgres | mysql | mariadb | sqlite | mongodb
 url = "postgres://nyet_ro@db.internal:5432/app"
 password_env = "PROD_DB_PASSWORD"      # NAME of an env var; no password in the file
 # Directories this connection is reachable from (subdirectories included).
@@ -144,6 +149,15 @@ engine = "mariadb"                     # or "mysql" — same driver/dialect
 url = "mysql://nyet_ro@db.internal:3306/shop"
 password_env = "ANALYTICS_DB_PASSWORD"
 allowed_dirs = ["~/Workspace/shop"]
+
+[connections.events]
+engine = "mongodb"
+# The database name is part of the url and nyet never switches away from it.
+url = "mongodb://nyet_ro@mongo.internal:27017/events?tls=true"
+password_env = "EVENTS_DB_PASSWORD"
+allowed_dirs = ["~/Workspace/app"]
+# NOTE: [connections.events.pii] and a guardrail mode other than "off" are
+# hard config errors for MongoDB — see "MongoDB specifics" below.
 
 [connections.localdev]
 engine = "sqlite"
@@ -202,6 +216,68 @@ use `ssl-mode=REQUIRED` or stricter (`REQUIRED` accepts a self-signed cert; the
 auto-generated one MySQL 8 ships is enough to get the password onto an encrypted
 channel). MariaDB's default `mysql_native_password` works with or without TLS.
 
+MongoDB specifics: `engine = "mongodb"`, and `url` is required *including the
+database name* (`mongodb://user@host:27017/dbname`) — nyet never picks a database
+and offers no way to switch to another one. The password goes in
+`password_env`. Queries are written in a **subset of the mongosh syntax**
+(`db.<collection>.find(...)`, `.aggregate([...])`, `.countDocuments(...)`,
+`.distinct(...)`) — see the "MongoDB" usage section below for exactly what is
+accepted and why everything else is refused. Result documents map to JSON as
+**relaxed extended JSON**: an ObjectId reads `{"$oid": "..."}`, a date
+`{"$date": "2026-01-31T00:00:00Z"}`, a `Decimal128` `{"$numberDecimal": "19.99"}`
+— the same spelling you can paste back into the next filter. **TLS:** put
+`tls=true` in the url (a `mongodb+srv://` url turns it on by default); without
+it a query carries the `INSECURE_TRANSPORT` warning. Certificates are verified
+against the bundled Mozilla roots; point `tlsCAFile=` at a private CA if needed.
+
+**Be honest about what MongoDB does NOT get (UX-7).** The SQL engines have three
+layers; MongoDB has two, and nyet says so rather than implying otherwise:
+
+- **there is no layer 2** — MongoDB has no read-only session, transaction or
+  connection flag. `readConcern` and `readPreference` are consistency and
+  routing knobs, not permissions, and **connecting to a secondary is not a
+  barrier either**: a write stage sent to a secondary is routed to the primary
+  and executes there (measured). So layer 1 (nyet's allowlist) and layer 3 (a
+  read-only role) are the whole story — which makes the read-only role below
+  much more important here than on the SQL engines.
+- **no `[pii]` policy.** A `[connections.X.pii]` section on a MongoDB connection
+  is a hard config error (exit 3), not a silently ignored setting: nyet's rules
+  name a `table.column` pair and are cross-checked against the column
+  provenance the server reports, and a schemaless document has neither. A
+  policy that protects nothing is worse than no policy. Protect the data in the
+  database instead (a role without access to the collection, or a view that
+  projects the sensitive fields away) — that holds for every client, not only
+  for the ones going through nyet.
+- **no auto-guardrail.** MongoDB's `explain` publishes no cost and no row
+  estimate in `queryPlanner` mode, and its `executionStats` mode *runs* the
+  query — the one thing a guardrail must never do. So `off` is the only
+  guardrail mode a MongoDB connection accepts (anything else is a config
+  error), and the backstops are the row limit and the timeout. nyet sends
+  `maxTimeMS` with every command, so a runaway query is cancelled server-side.
+- **`nyet schema`, `nyet explain` and `nyet doctor` are not implemented yet**
+  for MongoDB: they answer `NOT_IMPLEMENTED` (exit 1) with a hint pointing at
+  `nyet query`, rather than guessing a schema from sampled documents.
+
+### Recommended: a read-only MongoDB user (layer 3)
+
+**On MongoDB this is not optional advice.** There is no read-only session to
+fall back on (see above), so the database role is the only thing under nyet's
+allowlist:
+
+```js
+use events
+db.createUser({
+  user: "nyet_ro",
+  pwd: passwordPrompt(),
+  roles: [ { role: "read", db: "events" } ]
+})
+```
+
+Then `url = "mongodb://nyet_ro@mongo.internal:27017/events?tls=true"` and
+`password_env = "NYET_RO_PASSWORD"`. With the `read` role the server refuses
+`$out`/`$merge` and every write command outright — nyet's layer 1 simply gets
+there first, without a round trip.
+
 ### Recommended: a read-only MySQL/MariaDB user (layer 3)
 
 Same idea as the PostgreSQL role: a `SELECT`-only user makes even a direct
@@ -237,7 +313,10 @@ Then `url = "postgres://nyet_ro@db.internal:5432/app"` and
 ### PII columns
 
 A connection can declare which columns hold personal data. `nyet` then either
-refuses any query that could expose them, or returns them fully redacted:
+refuses any query that could expose them, or returns them fully redacted.
+**SQL engines only** — a `[pii]` section on a MongoDB connection is a hard
+config error (exit 3), not a setting that is quietly ignored; see "MongoDB
+specifics" above for why:
 
 ```toml
 [connections.prod.pii]
@@ -815,6 +894,131 @@ envelope (without `rows`) on stderr as one JSON line:
 `[defaults].format` is `jsonl`/`csv`, `list` falls back to `json`. `nyet schema`
 and `nyet explain` follow the same rule.
 
+### MongoDB queries
+
+A MongoDB connection takes a **subset of the mongosh read syntax**, not raw BSON
+command documents — the agent writes what it would type in `mongosh`:
+
+```sh
+$ nyet query events 'db.users.find({active: true}, {name: 1, _id: 0}).sort({name: 1}).limit(3)'
+{"v":1,"ok":true,"rows":[{"name":"ann"},{"name":"bob"}],"meta":{"row_count":2,...}}
+
+$ nyet query events 'db.orders.aggregate([{$match: {status: "paid"}}, {$group: {_id: "$user_id", total: {$sum: "$amount"}}}, {$sort: {total: -1}}, {$limit: 10}])'
+$ nyet query events 'db.users.countDocuments({active: true})'
+$ nyet query events 'db.users.distinct("status", {active: true})'
+```
+
+**What is accepted** (everything else is refused — see below):
+
+| form | notes |
+|---|---|
+| `db.<collection>.find(<filter>[, <projection>])` | plus `.sort({..})`, `.skip(n)`, `.limit(n)`, `.toArray()`, each at most once |
+| `db.<collection>.findOne(<filter>[, <projection>])` | a `find` with `limit 1` |
+| `db.<collection>.aggregate([<stages>])` | the pipeline only — no options document |
+| `db.<collection>.countDocuments([<filter>])` | answers one row, `{"count": N}` |
+| `db.<collection>.distinct("<field>"[, <filter>])` | answers one row per value, column `value`; run as a bounded aggregation, so the row limit applies. A dotted path (`"items.sku"`) is refused — see below |
+
+Values are JSON plus the mongosh type constructors — `ObjectId("..")`,
+`ISODate("..")` / `new Date("..")`, `NumberLong(..)`, `NumberInt(..)`,
+`NumberDecimal("..")`, `UUID("..")` — regex literals (`/^acme/i`, options
+`imsx` only), and **extended JSON in value position** (`{"$oid": ".."}`,
+`{"$date": ".."}`, `{"$numberDecimal": ".."}`, ...). Comments (`// ...`,
+`/* ... */`), trailing commas, single or double quotes and Unicode in keys and
+strings are all fine.
+
+**Everything nyet did not explicitly parse is a refusal, never an attempt.**
+The interesting cases, because each is a deliberate decision:
+
+- **Writes** — every writing method (`insertOne`, `updateMany`, `drop`,
+  `bulkWrite`, ...) and the `$out`/`$merge` stages, refused **in every
+  position**, nested pipelines included (`$lookup`, `$unionWith`, `$facet`).
+  The server happens to accept those two stages only as the last top-level
+  stage; nyet does not rely on that, because the rule that protects your data
+  must not be the server's grammar. → `WRITE_OPERATION`.
+- **Server-side JavaScript** — `$where`, `$function`, `$accumulator`,
+  `mapReduce` and a `$code` BSON value are **never** allowlisted: they run
+  arbitrary code inside the database process, and `maxTimeMS` does not bound
+  them (measured). → `DENIED_FUNCTION`.
+- **Any unknown `$`-key**, at any depth, in any position. The allowlist is
+  closed by construction, which is the whole point: **a writing operator
+  introduced by the next MongoDB major is refused by default**, before anyone
+  has heard of it. That also covers the undocumented `$_internal*` stages
+  (there are ~30, the list grows every release, and at least one of them
+  writes under the plain `read` role), the unbounded `$changeStream`, the
+  Atlas-only `$search`/`$vectorSearch`, and cluster introspection
+  (`$currentOp`, `$collStats`, `$planCacheStats`, `$listCatalog`, ...) whose
+  output can quote other sessions' query text. → `DENIED_OPERATOR`.
+- **Command options** — `allowDiskUse`, `let`, `readConcern`, `writeConcern`,
+  `comment`, `bypassDocumentValidation`, `lsid`, `apiVersion` and friends are
+  not accepted: nyet owns the command document, and `limit`, `batchSize`,
+  `singleBatch` and `maxTimeMS` are exactly the bounds that make the query
+  safe. → `DENIED_COMMAND` (an options document) / `DENIED_OPERATOR` (a
+  `$`-spelled one inside a filter).
+- **Database-level commands** — `db.runCommand`, `db.adminCommand`,
+  `db.getSiblingDB` — and the internal `system.*` catalogs (stored JavaScript,
+  view definitions, profiler output that quotes real values). The `system.*`
+  rule holds **wherever a collection is named**, not only in
+  `db.<collection>`: a stage's own namespace argument (`$lookup.from`,
+  `$unionWith`, `$graphLookup.from`) is checked by the same rule, and a
+  `{db: ..., coll: ...}` namespace naming another database is refused outright
+  — the connection's url names the one database nyet reads.
+  → `DENIED_COMMAND`.
+- **`distinct` into a sub-document** (`distinct("items.sku")`) is refused
+  rather than answered approximately: nyet runs `distinct` as an aggregation so
+  that the row limit applies, and that cannot descend through an array on the
+  way to a sub-field — it would report whole arrays as distinct values. Write
+  it out instead, which also makes what is unwound visible:
+  `db.orders.aggregate([{$unwind: "$items"}, {$group: {_id: "$items.sku"}}])`.
+  → `DENIED_COMMAND`.
+- **A `$binary` value cannot be written** into a filter (it can be read back
+  out of a result). For the common case — a UUID — use `UUID("..")`.
+  → `DENIED_OPERATOR`.
+- **Duplicate field names** in one document (`{a: 1, a: 2}`) are refused.
+  BSON permits them and every JSON parser silently keeps one; either choice
+  would mean nyet classified a document the server does not evaluate.
+  → `PARSE_FAILED`.
+- **Nesting past 100 levels** (MongoDB's own BSON limit) and inputs past 64 KiB
+  are refused rather than parsed. → `PARSE_FAILED`.
+
+**The row limit and the timeout work as everywhere else.** nyet fetches
+`row_limit + 1` documents (`limit` + `batchSize` for a find, a trailing
+`$limit` plus a matching `batchSize` for an aggregation) and marks the answer
+`truncated`. Your own `.limit(n)` can only **lower** the effective limit, never
+raise the connection's. `maxTimeMS` carries the timeout to the server, so a
+runaway query is cancelled there (exit 8) rather than only abandoned locally.
+
+**A reply can also be cut by MongoDB itself.** The server caps a batch at
+16 MiB, which it can reach *before* the row limit — a collection of megabyte
+documents comes back with fewer rows than you asked for. nyet detects that (the
+server leaves its cursor open) and reports `truncated: true` with a `TRUNCATED`
+warning that says so, instead of presenting a partial answer as the whole
+result. Narrow the query or project away the large fields; raising `--limit`
+will not help there. (A truncated read leaves a server-side cursor that MongoDB
+reaps after ten minutes.)
+
+**Results are documents, so the columns are the union of the top-level field
+names** in first-seen order; a document missing one gets `null` there, and
+nested documents and arrays stay nested JSON. `--format table` and `--format
+csv` therefore work exactly as they do for a PostgreSQL `jsonb` column: the
+nested value is rendered as compact JSON in its cell.
+
+**Through an SSH tunnel** nyet forces `directConnection=true` and drops TLS on
+the tunnel leg. Both are deliberate: without `directConnection` the driver reads
+the replica set's configuration and connects to the members' **real** addresses,
+straight around your bastion; and the driver can only verify a certificate
+against the address it dialed (`127.0.0.1`), which the server's certificate does
+not carry — the ssh hop already encrypts the traffic, and accepting invalid
+certificates instead would be security theatre. Two combinations are therefore
+refused at config time (exit 3) rather than half-supported: `[ssh]` together
+with a `mongodb+srv://` url (SRV re-resolves the cluster's members through DNS
+while nyet runs), and `[ssh]` together with an explicit
+`directConnection=false`. So is `[ssh]` together with an explicit
+`tls=true`/`ssl=true`: nyet would have to ignore it, and leaving you to believe
+in encryption it did not apply is worse than an error at startup. Note the
+difference from PostgreSQL/MySQL, which keep TLS on the tunnel leg — their
+driver can verify a certificate chain without checking the hostname, MongoDB's
+cannot, so on that leg the ssh hop is the only encryption.
+
 ### nyet schema
 
 ```sh
@@ -1039,6 +1243,7 @@ Per engine:
 | PostgreSQL | `cost`, `rows`, `off` | `cost` | `max_cost = 1000000.0` (`max_rows = 10000000`) |
 | MySQL/MariaDB | `rows`, `off` | `rows` | `max_rows = 10000000` |
 | SQLite | `off` only | `off` | — |
+| MongoDB | `off` only | `off` | — |
 
 ```toml
 [connections.prod.guardrail]
@@ -1073,6 +1278,11 @@ max_rows = 20000000
   estimate at all, so the only accepted mode is `off` (the default) and
   `nyet explain` answers `verdict: "no_estimate"` with the plan text. Saying so
   is the honest answer; a made-up number would not be.
+- **MongoDB has no guardrail either.** `explain` in `queryPlanner` mode
+  publishes neither a cost nor a row estimate, and `executionStats` mode *runs*
+  the query — so there is nothing to compare a threshold against without doing
+  the very thing the guardrail exists to prevent. `off` is the only accepted
+  mode; the row limit and `maxTimeMS` are the backstops.
 - A `mode` an engine cannot honor is always a **config error (exit 3)** — never
   a silent downgrade to "unguarded". So is a threshold the active mode never
   reads (`max_rows` under `mode = "cost"`, or either one under `off`): a limit
@@ -1336,14 +1546,16 @@ to do:
 |---|---|
 | `PARSE_FAILED` | the query could not be parsed — anything not understood is denied (fail closed) |
 | `MULTI_STATEMENT` | more than one statement in a single query |
-| `WRITE_OPERATION` | not a read statement (DML/DDL/PRAGMA/ATTACH/...), anywhere in the query: top level, CTE bodies (`WITH x AS (DELETE ...)`), derived tables (`SELECT * FROM (DELETE ...)`), subqueries, `SELECT INTO`, `EXPLAIN <write>` |
+| `WRITE_OPERATION` | not a read statement (DML/DDL/PRAGMA/ATTACH/...), anywhere in the query: top level, CTE bodies (`WITH x AS (DELETE ...)`), derived tables (`SELECT * FROM (DELETE ...)`), subqueries, `SELECT INTO`, `EXPLAIN <write>`. On MongoDB: a writing method (`insertOne`, `updateMany`, `drop`, ...) and the `$out`/`$merge` stages **in every position**, nested pipelines (`$lookup`, `$unionWith`, `$facet`) included |
 | `TXN_CONTROL` | transaction or session control (BEGIN/COMMIT/ROLLBACK/SET) |
 | `LOCKING_CLAUSE` | `SELECT ... FOR UPDATE` / `FOR SHARE` — takes row locks, not a plain read |
-| `DENIED_FUNCTION` | a function on the denylist for this connection (the message names it) |
+| `DENIED_FUNCTION` | a function on the denylist for this connection (the message names it). On MongoDB: anything that runs server-side JavaScript — `$where`, `$function`, `$accumulator`, `mapReduce`, a `$code` BSON value — none of which is ever allowlisted |
 | `EXPLAIN_ANALYZE` | `EXPLAIN ANALYZE ...` (or PostgreSQL's `EXPLAIN (ANALYZE, ...)`) — it *runs* the statement it claims to explain, so it is an execution wearing a plan's clothes; use `nyet explain` for a plan, a plain `EXPLAIN` is fine as a query |
 | `EXPENSIVE_QUERY` | the query plan's estimate is above this connection's guardrail limit, so the query was not executed — the envelope carries the plan. Also used when *planning itself* outran the guardrail's budget (then there is no plan to carry): see the auto-guardrail section |
 | `EXECUTABLE_COMMENT` | a MySQL/MariaDB executable comment or optimizer hint (`/*! … */`, `/*M! … */`, `/*+ … */`) — the server runs its body but a SQL parser drops it, so nyet cannot see what it does; remove the comment |
 | `PII_COLUMN` | the query could expose a column this connection's `[pii]` policy protects — named directly, wrapped in an expression, swept up by `*`, used as a filter, or resolved from the result's provenance. See "PII columns" |
+| `DENIED_COMMAND` | (MongoDB) the collection method is not on the read allowlist — a write (`insertOne`, `drop`, ...), a database-level command (`db.runCommand`, `db.adminCommand`), a cursor method nyet does not run (`.forEach`, `.count`), or an internal `system.*` catalog. The message names it |
+| `DENIED_OPERATOR` | (MongoDB) a `$`-prefixed key — pipeline stage, query operator, aggregation expression or accumulator — that is not on the read allowlist, at any nesting depth. Everything nyet has not reviewed is refused by default, including operators a newer MongoDB adds, undocumented `$_internal*` stages, Atlas-only `$search`/`$vectorSearch`, cluster introspection (`$currentOp`, `$collStats`, `$planCacheStats`) and the options nyet sets itself |
 | `PII_UNPROVABLE` | the database would not state where a result column came from, on a connection with a PII policy — an undetermined origin is refused rather than guessed |
 
 PRAGMA is refused with a pointer instead of a dead end: schema questions

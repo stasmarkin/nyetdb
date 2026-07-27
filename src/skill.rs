@@ -29,7 +29,7 @@ pub enum Connections {
 /// per-user "Your connections" section begins.
 const HEAD: &str = r#"---
 name: nyet
-description: Read-only database access for AI agents. Use nyet to inspect database schemas and run safe read-only SQL (SELECT, SHOW, DESCRIBE, EXPLAIN) against the user's configured databases (PostgreSQL, MySQL/MariaDB, SQLite). It enforces read-only, keeps credentials behind aliases, and returns compact JSON. Reach for it whenever a task needs to read from a database.
+description: Read-only database access for AI agents. Use nyet to inspect database schemas and run safe read-only SQL (SELECT, SHOW, DESCRIBE, EXPLAIN) against the user's configured databases (PostgreSQL, MySQL/MariaDB, SQLite) or read-only mongosh queries against MongoDB. It enforces read-only, keeps credentials behind aliases, and returns compact JSON. Reach for it whenever a task needs to read from a database.
 ---
 
 # nyet — read-only database access
@@ -99,6 +99,30 @@ also carries a `reason`.
     7  the database returned an execution error
     8  timeout
 
+## MongoDB connections (engine `mongodb`)
+
+A MongoDB alias takes a subset of the **mongosh** syntax instead of SQL:
+
+    nyet query <alias> 'db.users.find({active: true}, {name: 1, _id: 0}).sort({name: 1}).limit(20)'
+    nyet query <alias> 'db.orders.aggregate([{$match: {status: "paid"}}, {$group: {_id: "$user_id", total: {$sum: "$amount"}}}])'
+    nyet query <alias> 'db.users.countDocuments({active: true})'
+    nyet query <alias> 'db.users.distinct("status")'
+
+Accepted: `find` / `findOne` / `aggregate` / `countDocuments` / `distinct`, with
+`.sort()`, `.skip()`, `.limit()`, `.toArray()` after `find` (each once). Values
+are JSON plus `ObjectId("..")`, `ISODate("..")`, `NumberLong(..)`,
+`NumberDecimal("..")`, `UUID("..")`, `/regex/i` and extended JSON
+(`{"$oid": ".."}`). Results are documents: the columns are the union of the
+top-level field names, and an ObjectId reads back as `{"$oid": ".."}`.
+
+Refused, by an allowlist that is closed by design: every write (including the
+`$out`/`$merge` stages anywhere in a pipeline), server-side JavaScript
+(`$where`, `$function`, `$accumulator`, `mapReduce`), any `$`-key nyet does not
+know, command options (`allowDiskUse`, `let`, `readConcern`, ...) and
+`db.runCommand`/`db.adminCommand`. `nyet schema`, `nyet explain` and
+`nyet doctor` do not support MongoDB yet (they answer `NOT_IMPLEMENTED`,
+exit 1) — use `db.<collection>.find({}).limit(1)` to see a document's shape.
+
 ## When nyet refuses (exit 5, "code":"NYET")
 
 nyet runs a single read statement only (SELECT, plus SHOW/DESCRIBE/EXPLAIN).
@@ -117,6 +141,10 @@ flag. Common reasons:
   LIMIT, join on an indexed column).
 - `PII_COLUMN` / `PII_UNPROVABLE` — the query touches a column the config owner
   marked as personal data (see below).
+- `DENIED_COMMAND` / `DENIED_OPERATOR` (MongoDB) — the method or the `$`-key is
+  not on nyet's read allowlist. The allowlist is closed: anything nyet has not
+  reviewed is refused, so check `hint` for what IS allowed rather than retrying
+  a variation.
 - `DENIED_FUNCTION`, `LOCKING_CLAUSE` (`FOR UPDATE`/`FOR SHARE`),
   `EXPLAIN_ANALYZE`, `TXN_CONTROL`, `EXECUTABLE_COMMENT`, `PARSE_FAILED` — read
   the message and rewrite accordingly.

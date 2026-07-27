@@ -1,0 +1,616 @@
+# Golden corpus — MongoDB queries that must be REFUSED. Every case carries the
+# reason from the closed list: PARSE_FAILED | WRITE_OPERATION | DENIED_FUNCTION
+# | DENIED_COMMAND | DENIED_OPERATOR (see src/mongo.rs).
+
+# --- writing collection methods ---
+- query: db.users.insertOne({a: 1})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.insertMany([{a: 1}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.insert({a: 1})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.updateOne({a: 1}, {$set: {b: 2}})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.updateMany({}, {$set: {b: 2}})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.update({}, {$set: {b: 2}})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.replaceOne({a: 1}, {a: 2})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.deleteOne({a: 1})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.deleteMany({})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.remove({})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.save({a: 1})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.bulkWrite([])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.findOneAndUpdate({a: 1}, {$set: {b: 2}})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.findOneAndDelete({a: 1})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.findOneAndReplace({a: 1}, {a: 2})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.findAndModify({query: {a: 1}, update: {$set: {b: 2}}})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.drop()
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.dropIndexes()
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.createIndex({a: 1})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.renameCollection("gone")
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- $out / $merge: every spelling and every position, nested included ---
+- query: db.users.aggregate([{$out: "copy"}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.aggregate([{$match: {a: 1}}, {$out: "copy"}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.aggregate([{$out: "copy"}, {$match: {a: 1}}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.aggregate([{$out: {db: "other", coll: "copy"}}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.aggregate([{$merge: "copy"}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.aggregate([{$merge: {into: "copy", whenMatched: "replace"}}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.aggregate([{$lookup: {from: "orders", as: "o", pipeline: [{$out: "copy"}]}}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.aggregate([{$unionWith: {coll: "archive", pipeline: [{$merge: {into: "copy"}}]}}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.aggregate([{$facet: {a: [{$out: "copy"}]}}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.aggregate([{$facet: {a: [{$match: {}}], b: [{$merge: {into: "copy"}}]}}])
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.find({$out: "copy"})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.find({a: {$elemMatch: {$out: "copy"}}})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.countDocuments({$merge: {into: "copy"}})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.distinct("a", {$out: "copy"})
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: db.users.find({}).sort({$out: 1})
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- server-side JavaScript, in every form ---
+- query: db.users.find({$where: "this.a == 1"})
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: db.users.find({$where: function() { return true }})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: {$elemMatch: {$where: "1"}}})
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: db.users.find({$and: [{$where: "1"}]})
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: db.users.aggregate([{$match: {$where: "1"}}])
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: db.users.aggregate([{$match: {$expr: {$function: {body: "function(){return 1}", args: [], lang: "js"}}}}])
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: db.users.aggregate([{$project: {x: {$function: {body: "f", args: [], lang: "js"}}}}])
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: db.users.aggregate([{$group: {_id: null, x: {$accumulator: {init: "f", accumulate: "f", accumulateArgs: [], merge: "f", lang: "js"}}}}])
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: db.users.mapReduce("function(){}", "function(){}", {out: "res"})
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: db.users.find({a: {"$code": "return 1"}})
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: db.users.find({a: {"$codeWithScope": "x"}})
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# --- undocumented internals: not on the list, so refused by default ---
+- query: db.users.aggregate([{$_internalApplyOplogUpdate: {oplogUpdate: {}}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$_internalInhibitOptimization: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$_internalUnpackBucket: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.find({a: {$_internalSchemaType: 1}})
+  verdict: deny
+  reason: DENIED_OPERATOR
+
+# --- unknown / not-allowlisted $-keys (the "next major adds an operator" case) ---
+- query: db.users.find({a: {$totallyNewOperator: 1}})
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$brandNewStage: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$match: {}}, {$brandNewStage: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.find({a: {$Gt: 1}})
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.find({a: {"$g​t": 1}})
+  verdict: deny
+  reason: DENIED_OPERATOR
+
+# --- stages nyet deliberately does not allow ---
+- query: db.users.aggregate([{$changeStream: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$search: {text: {query: "a", path: "b"}}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$vectorSearch: {index: "i", path: "p", queryVector: [1], numCandidates: 1, limit: 1}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$currentOp: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$listLocalSessions: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$listSessions: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$planCacheStats: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$listCatalog: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$collStats: {storageStats: {}}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$indexStats: {}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$documents: [{a: 1}]}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$lookup: {from: "o", as: "o", pipeline: [{$changeStream: {}}]}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+
+# --- service fields: nyet owns limit/batchSize/maxTimeMS, and refuses options ---
+- query: db.users.aggregate([{$match: {}}], {allowDiskUse: true})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([{$match: {}}], {let: {x: 1}})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.find({}, {a: 1}, {readConcern: {level: "majority"}})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.countDocuments({}, {maxTimeMS: 999999})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.find({$comment: "hi"})
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.find({$hint: {a: 1}})
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.find({$maxTimeMS: 999999})
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.find({$db: "admin"})
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.find({$readPreference: {mode: "primary"}})
+  verdict: deny
+  reason: DENIED_OPERATOR
+
+# --- database-level commands and other methods ---
+- query: db.runCommand({ping: 1})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.adminCommand({shutdown: 1})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.getSiblingDB("admin")
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.eval("1")
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.count()
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.estimatedDocumentCount()
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.watch()
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.getIndexes()
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.stats()
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.explain().find({})
+  verdict: deny
+  reason: DENIED_COMMAND
+
+# --- internal catalogs ---
+- query: db.system.js.find({})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.system.profile.find({})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.system.views.find({})
+  verdict: deny
+  reason: DENIED_COMMAND
+
+# --- cursor chain: only sort/skip/limit/toArray, each at most once ---
+- query: db.users.find({}).forEach(printjson)
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.find({}).map(function(d) { return d })
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.find({}).count()
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.find({}).hint({a: 1})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.find({}).explain()
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([]).sort({a: 1})
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.countDocuments({}).limit(1)
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.find({}).limit(1).limit(2)
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}).sort({a: 1}).sort({b: 1})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}).skip(1).skip(2)
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}).limit(0)
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}).limit(-1)
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}).skip(-1)
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}).limit(1.5)
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}).sort()
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}).sort({})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}).toArray(1)
+  verdict: deny
+  reason: PARSE_FAILED
+
+# --- argument shapes ---
+- query: db.users.aggregate({$match: {}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.aggregate([{$match: {}}, {$limit: 1}, "extra"])
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.aggregate([{$match: {}, $limit: 1}])
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.aggregate([[]])
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find("not a document")
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({}, "not a document")
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.distinct()
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.distinct("")
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.distinct({a: 1})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.countDocuments("x")
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.aggregate([{$facet: {a: {$match: {}}}}])
+  verdict: deny
+  reason: PARSE_FAILED
+
+# --- syntax: garbage in, refusal out (never a panic, never a "let's try it") ---
+- query: SELECT * FROM users
+  verdict: deny
+  reason: PARSE_FAILED
+- query: {"find": "users"}
+  verdict: deny
+  reason: PARSE_FAILED
+- query: use admin
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db..find({})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({)
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: 1}
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: })
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a 1})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: 1 b: 2})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: "unterminated})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: /unterminated})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: 1}) /* unterminated
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: 1}) extra
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: 1}); db.users.drop()
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: undefined})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: NaN})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: Infinity})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: someVariable})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: 1 + 1})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: [1, 2 3]})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: "bad \q escape"})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: "\ud83d"})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: "\uZZZZ"})
+  verdict: deny
+  reason: PARSE_FAILED
+
+# --- duplicate keys: BSON allows them, nyet refuses to guess which one wins ---
+- query: db.users.find({a: 1, a: 2})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({"a": 1, 'a': 2})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({x: {$gt: 1, $gt: 2}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.aggregate([{$match: {a: 1}}, {$group: {_id: null, n: {$sum: 1}, n: {$sum: 2}}}])
+  verdict: deny
+  reason: PARSE_FAILED
+
+# --- typed literals with the wrong payload (never demoted to "an operator") ---
+- query: db.users.find({_id: ObjectId("not-hex")})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({_id: ObjectId()})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({_id: ObjectId("66210f0e2f1a4b0012a3c4d5", "extra")})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({d: ISODate("yesterday")})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({d: ISODate()})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({d: new Date()})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({n: NumberLong("not a number")})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({n: NumberDecimal("not a number")})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({u: UUID("not-a-uuid")})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({_id: {"$oid": {"$where": "1"}}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({_id: {"$oid": "not-hex"}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({d: {"$date": {"$where": "1"}}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({d: {"$date": "yesterday"}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({n: {"$numberLong": {"$out": "copy"}}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({n: {"$numberDecimal": 1}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({r: {"$regularExpression": {"pattern": "^a"}}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({r: {"$regularExpression": {"pattern": "^a", "options": "g"}}})
+  verdict: deny
+  reason: PARSE_FAILED
+
+# --- regex flags MongoDB does not accept (dropping one changes what matches) ---
+- query: db.users.find({name: /^a/g})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({name: /^a/u})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({name: /^a/iy})
+  verdict: deny
+  reason: PARSE_FAILED
+
+# --- internal catalogs reached through a STAGE, not through db.<collection> ---
+# (a collection name is a string VALUE, so the $-key allowlist never sees it;
+# verified live that these returned system.js / system.profile before the fix)
+- query: db.users.aggregate([{$lookup: {from: "system.js", pipeline: [], as: "j"}}])
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([{$lookup: {from: "system.profile", localField: "a", foreignField: "b", as: "p"}}])
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([{$unionWith: "system.js"}])
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([{$unionWith: {coll: "system.profile", pipeline: []}}])
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([{$graphLookup: {from: "system.js", startWith: "$a", connectFromField: "a", connectToField: "b", as: "c"}}])
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([{$lookup: {from: "o", as: "o", pipeline: [{$unionWith: "system.js"}]}}])
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([{$facet: {a: [{$unionWith: {coll: "system.views"}}]}}])
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([{$lookup: {from: {db: "admin", coll: "system.users"}, as: "u", pipeline: []}}])
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.users.aggregate([{$lookup: {from: {db: "other", coll: "orders"}, as: "o", pipeline: []}}])
+  verdict: deny
+  reason: DENIED_COMMAND
+
+# --- a $facet BRANCH NAME is a document key too ---
+- query: db.users.aggregate([{$facet: {"$evil": [{$match: {}}]}}])
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.aggregate([{$facet: {ok: [{$match: {}}], "$out": [{$match: {}}]}}])
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- extended JSON must be EXACTLY canonical: an extra key would be dropped,
+# --- taking whatever it carried with it, before the classifier ever ran
+- query: db.users.find({r: {"$regularExpression": {"pattern": "^a", "options": "i", "extra": {"$where": "1"}}}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: {"$minKey": {"$where": "1"}}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: {"$maxKey": {"$out": "copy"}}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({a: {"$minKey": 2}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({d: {"$date": {"$numberLong": "1767139200000", "x": 1}}})
+  verdict: deny
+  reason: PARSE_FAILED
+
+# --- distinct into a sub-document: nyet runs it as a bounded aggregation, and
+# --- $unwind cannot descend THROUGH an array to a sub-field, so the answer
+# --- would differ from the distinct command's (measured: [1,2] vs [null,[1,2],[2]])
+- query: db.orders.distinct("items.sku")
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: db.orders.distinct("a.b.c", {active: true})
+  verdict: deny
+  reason: DENIED_COMMAND
+
+# --- a BSON type nyet returns but cannot accept as input says exactly that,
+# --- instead of calling a type an unknown operator
+- query: db.users.find({blob: {"$binary": {"base64": "AQID", "subType": "00"}}})
+  verdict: deny
+  reason: DENIED_OPERATOR
+- query: db.users.find({ts: {"$timestamp": {"t": 1, "i": 1, "x": 1}}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({ts: {"$timestamp": 1}})
+  verdict: deny
+  reason: PARSE_FAILED
+- query: db.users.find({ts: {"$timestamp": {"t": -1, "i": 1}}})
+  verdict: deny
+  reason: PARSE_FAILED

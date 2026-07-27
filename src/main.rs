@@ -7,6 +7,7 @@ mod audit;
 mod config;
 mod engine;
 mod guardrail;
+mod mongo;
 mod output;
 mod resolver;
 mod skill;
@@ -259,9 +260,17 @@ enum Db {
     Sqlite(engine::Sqlite),
     Postgres(engine::Postgres),
     Mysql(engine::Mysql),
+    Mongo(engine::Mongo),
 }
 
 impl Db {
+    /// Which layer 1 applies. MongoDB is not SQL: it has its own pure
+    /// parser+allowlist (`src/mongo.rs`), so the cli picks the validator by
+    /// engine rather than handing mongosh text to sqlparser.
+    fn is_mongo(&self) -> bool {
+        matches!(self, Db::Mongo(_))
+    }
+
     /// The ONE way rows leave the engine layer — and therefore the one place
     /// net B (PII provenance) is applied, refusal AND masking alike. Putting it
     /// here rather than in a command body means a future rows-returning command
@@ -285,6 +294,7 @@ impl Db {
             Db::Sqlite(e) => e.execute(sql, fetch_limit, guardrail).await,
             Db::Postgres(e) => e.execute(sql, fetch_limit, guardrail).await,
             Db::Mysql(e) => e.execute(sql, fetch_limit, guardrail).await,
+            Db::Mongo(e) => e.execute(sql, fetch_limit, guardrail).await,
         }?;
         let mut masked = Vec::new();
         if let engine::QueryOutcome::Ran { result, .. } = &mut outcome {
@@ -315,6 +325,7 @@ impl Db {
             Db::Sqlite(e) => e.estimate(sql).await,
             Db::Postgres(e) => e.estimate(sql).await,
             Db::Mysql(e) => e.estimate(sql).await,
+            Db::Mongo(e) => e.estimate(sql).await,
         }
     }
 
@@ -326,6 +337,10 @@ impl Db {
         match self {
             Db::Postgres(pg) => pg.host_override = Some(over),
             Db::Mysql(my) => my.host_override = Some(over),
+            // MongoDB also forces `directConnection` from this: without it the
+            // driver would discover the replica set's real members and go
+            // straight to them, around the bastion (see engine::Mongo::open).
+            Db::Mongo(mg) => mg.host_override = Some(over),
             Db::Sqlite(_) => {}
         }
     }
@@ -338,7 +353,10 @@ impl Db {
     fn resolve_column_origins(&mut self) {
         match self {
             Db::Postgres(pg) => pg.resolve_column_origins = true,
-            Db::Mysql(_) | Db::Sqlite(_) => {}
+            // MongoDB never reaches here: a `[pii]` section on a MongoDB
+            // connection is a config error (exit 3), because a document field
+            // has no provenance net B could check.
+            Db::Mysql(_) | Db::Sqlite(_) | Db::Mongo(_) => {}
         }
     }
 
@@ -347,6 +365,7 @@ impl Db {
             Db::Sqlite(e) => e.schema(table).await,
             Db::Postgres(e) => e.schema(table).await,
             Db::Mysql(e) => e.schema(table).await,
+            Db::Mongo(e) => e.schema(table).await,
         }
     }
 
@@ -355,6 +374,7 @@ impl Db {
             Db::Sqlite(e) => e.diagnose(pii).await,
             Db::Postgres(e) => e.diagnose(pii).await,
             Db::Mysql(e) => e.diagnose(pii).await,
+            Db::Mongo(e) => e.diagnose(pii).await,
         }
     }
 }
@@ -693,9 +713,14 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // Flag > per-connection > [defaults] > built-in, capped by the
                 // config owner's max_row_limit (see config::capped).
                 let limit = cfg.row_limit(conn, limit);
-                // Layer 1: the validator. Any deny -> code NYET + reason, exit 5.
-                let (query, is_query, mut warnings, pii_exempt) =
-                    validate(&query, &session.policy)?;
+                // Layer 1. Any deny -> code NYET + reason, exit 5. Which layer 1
+                // runs is decided by the engine: MongoDB has its own parser and
+                // allowlist (mongosh text is not SQL and sqlparser must never
+                // see it), everything else goes through the SQL validator.
+                let (query, is_query, mut warnings, pii_exempt) = match session.db.is_mongo() {
+                    true => validate_mongo(&query)?,
+                    false => validate(&query, &session.policy)?,
+                };
                 // Layer 1.5: the guardrail. Only a plain query can be wrapped in an
                 // EXPLAIN; SHOW/DESCRIBE are metadata no planner estimates, so they
                 // run unguarded (documented). An EXPLAIN ANALYZE never gets here —
@@ -768,17 +793,39 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     warnings.push(guardrail_skipped_warning());
                 }
 
-                let truncated = rs.rows.len() as u64 > limit;
-                if truncated {
+                // Two ways an answer can fall short of the whole truth: nyet
+                // fetched limit+1 and cut it, or the ENGINE was cut off before
+                // it got there (MongoDB's 16 MiB reply cap stops a batch before
+                // the row limit). Either one must reach the agent as
+                // `truncated` — a partial answer that reads as complete is the
+                // worst failure a read tool has (UX-1).
+                // The server stopped early on its own (MongoDB's 16 MiB
+                // reply cap), which the row count cannot show — the answer is
+                // SHORTER than the limit and still incomplete.
+                let server_cut = rs.truncated;
+                let over_limit = rs.rows.len() as u64 > limit;
+                let truncated = over_limit || server_cut;
+                if over_limit {
                     rs.rows
                         .truncate(usize::try_from(limit).unwrap_or(usize::MAX));
                 }
                 if truncated {
                     warnings.push(output::Warning {
                         code: "TRUNCATED",
-                        message: format!(
-                            "result truncated to {limit} rows; add WHERE/LIMIT or raise --limit"
-                        ),
+                        message: match over_limit {
+                            true => format!(
+                                "result truncated to {limit} rows; add WHERE/LIMIT or raise --limit"
+                            ),
+                            // Telling the agent to raise --limit here would be
+                            // wrong: the limit was never reached (Д10).
+                            false => format!(
+                                "result truncated to {} rows by the database's own reply-size \
+                                 limit (16 MiB), reached before the {limit}-row limit: there \
+                                 ARE more rows — narrow the query, project away large fields, \
+                                 or page through it",
+                                rs.rows.len()
+                            ),
+                        },
                     });
                 }
                 // Warned for every format (json/jsonl collapse same-named keys to
@@ -863,6 +910,9 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // (there is no agent SQL here, and a catalog read has nothing to
             // estimate).
             let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
+            if session.db.is_mongo() {
+                return Err(mongo_not_implemented("schema", &alias));
+            }
             let engine = conn.engine.clone();
             let cwd_str = cwd.display().to_string();
             let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
@@ -959,6 +1009,9 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // PLAN instead of the execution. Nothing runs: the EXPLAIN is never
             // ANALYZE, so `nyet explain` cannot be a way to execute anything.
             let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
+            if session.db.is_mongo() {
+                return Err(mongo_not_implemented("explain", &alias));
+            }
             let engine = conn.engine.clone();
             let raw_sql = query.clone();
             let cwd_str = cwd.display().to_string();
@@ -1099,6 +1152,9 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     let conn = lookup_alias(&cfg, &path, &alias)?;
                     let timeout_secs = cfg.timeout_secs(conn, None);
                     let (mut db, _policy) = build_engine(&alias, conn, timeout_secs)?;
+                    if db.is_mongo() {
+                        return Err(mongo_not_implemented("doctor", &alias));
+                    }
                     audit_id = Some((alias.clone(), conn.engine.clone()));
                     // The policy is needed twice here: the engine asks the
                     // server about these very columns, and the redaction below
@@ -1275,6 +1331,28 @@ fn validate(
                 .collect(),
             pii_exempt,
         )),
+    }
+}
+
+/// Layer 1 for MongoDB, in the shape the query arm expects. The parsed request
+/// is deliberately DROPPED: `mongo::check` is pure, so the engine re-runs it on
+/// the same text and executes exactly what was classified here — one
+/// representation, no drift, and the refusal still happens before anything
+/// touches the network.
+///
+/// `is_query = false`: there is no plan to estimate (MongoDB's guardrail modes
+/// are `off` only, enforced at config parse), so the guardrail is skipped the
+/// same way it is for a `SHOW`. No unicode normalization either: the SQL
+/// stripping exists to stop zero-width characters from hiding a keyword, while
+/// here every operator is matched literally (an invisible character inside
+/// `$where` simply makes it an unknown key -> deny) and stripping would corrupt
+/// filter VALUES, which are data.
+fn validate_mongo(
+    query: &str,
+) -> Result<(String, bool, Vec<output::Warning>, Vec<usize>), Failure> {
+    match mongo::check(query) {
+        Ok(_request) => Ok((query.to_string(), false, Vec::new(), Vec::new())),
+        Err(r) => Err(Failure::new(ErrorCode::Nyet(r.reason), r.message, r.hint)),
     }
 }
 
@@ -1592,13 +1670,61 @@ fn build_engine(
                 validator::Policy::mysql(v_allow, v_deny),
             ))
         }
+        // MongoDB is not SQL, so it brings its own layer 1 (`src/mongo.rs`) and
+        // an empty SQL policy: `Policy` is still built because `Session` holds
+        // one, but nothing ever hands mongosh text to sqlparser.
+        "mongodb" => {
+            let Some(url) = &conn.url else {
+                return Err(Failure::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("connection '{alias}' has engine = \"mongodb\" but no `url`"),
+                    "add url = \"mongodb://user@host:27017/dbname\" to this connection in \
+                     the config; the database name is required (nyet never switches \
+                     databases on its own)",
+                ));
+            };
+            let password = read_password_env(alias, conn)?;
+            Ok((
+                Db::Mongo(engine::Mongo {
+                    url: url.clone(),
+                    password,
+                    // One value for both halves of the bound: the server-side
+                    // maxTimeMS and the in-process deadline that backstops it.
+                    query_timeout_ms: timeout_secs.saturating_mul(1000),
+                    host_override: None,
+                    connect_timeout_ms: None,
+                }),
+                validator::Policy::sqlite(v_allow, v_deny),
+            ))
+        }
         other => Err(Failure::new(
             ErrorCode::NotImplemented,
             format!("engine \"{other}\" of connection '{alias}' is not supported yet"),
-            "supported engines: sqlite, postgres, mysql, mariadb; others arrive in \
+            "supported engines: sqlite, postgres, mysql, mariadb, mongodb; others arrive in \
              later releases",
         )),
     }
+}
+
+/// `nyet schema` / `explain` / `doctor` do not support MongoDB yet. An honest
+/// refusal (NOT_IMPLEMENTED, exit 1 — the code that already means "this build
+/// cannot do that") rather than a half-answer or a crash: `schema` would have
+/// to sample documents to guess a shape, `explain` has no estimate to report
+/// (see the guardrail note), and `doctor`'s write probe needs a per-engine
+/// read-only proof that does not exist for MongoDB yet.
+fn mongo_not_implemented(command: &str, alias: &str) -> Failure {
+    Failure::new(
+        ErrorCode::NotImplemented,
+        format!(
+            "nyet {command} does not support engine \"mongodb\" yet \
+             (connection '{alias}')"
+        ),
+        format!(
+            "MongoDB currently supports reads only: \
+             nyet query {alias} 'db.<collection>.find({{}}).limit(5)' — and \
+             nyet query {alias} 'db.<collection>.aggregate([...])' for anything richer"
+        ),
+    )
 }
 
 /// Open the SSH tunnel (if the connection has one) and point the engine at its
@@ -2019,6 +2145,38 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
                  \"table.column\" (or \"schema.table.column\"), e.g. \
                  columns = [\"users.email\", \"users.phone\"]; matching is \
                  case-insensitive and any schema qualifier is ignored"
+            ),
+        ),
+        config::ConfigError::PiiUnsupported { alias, engine } => (
+            format!(
+                "config file {}: connection '{alias}' is engine = \"{engine}\", which nyet's \
+                 [pii] policy does not support",
+                path.display()
+            ),
+            format!(
+                "remove the [connections.{alias}.pii] section — keeping it would look like \
+                 protection that is not there. nyet's PII rules name a table.column pair and \
+                 are cross-checked against the column provenance the server reports; a \
+                 MongoDB document has neither, so nyet cannot prove a rule covers what you \
+                 meant. Protect the data in the database instead (a role without read \
+                 access to the collection, or a view that projects the sensitive fields \
+                 away), which holds for every client — not just for the ones going \
+                 through nyet"
+            ),
+        ),
+        config::ConfigError::MongoTunnelInvalid { alias, message } => (
+            format!(
+                "config file {}: connection '{alias}' combines an [ssh] tunnel with a \
+                 MongoDB url nyet cannot keep inside it: {message}",
+                path.display()
+            ),
+            format!(
+                "point `url` at ONE member through the tunnel — \
+                 url = \"mongodb://user@127.0.0.1:27017/dbname\" with \
+                 [connections.{alias}.ssh] remote = \"<that member>:27017\" — and let nyet \
+                 add directConnection itself, without tls=true (the ssh hop is what \
+                 encrypts that leg); a tunnel that the driver can route around, or a TLS \
+                 setting nyet would have to ignore, is worse than an honest error"
             ),
         ),
         config::ConfigError::AuditPathEnvVar { value } => (

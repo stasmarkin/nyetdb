@@ -122,7 +122,7 @@ path = "/var/log/nyet/audit.jsonl"     # дефолт $XDG_DATA_HOME/nyet/audit.
 log_responses = false                  # дефолт false; true — логировать и rows ответа
 
 [connections.prod]
-engine = "postgres"                    # postgres | mysql | sqlite (v0.2) | ...
+engine = "postgres"                    # postgres | mysql | mariadb | sqlite | mongodb
 url = "postgres://nyet_ro@db.internal:5432/app"
 password_env = "PROD_DB_PASSWORD"      # имя env-переменной; в конфиге пароля нет
 allowed_dirs = ["~/Workspace/app"]     # пусто/отсутствует = запрещено везде
@@ -268,6 +268,7 @@ allowed_dirs = ["~/Workspace/app"]
 | PostgreSQL | `options=-c default_transaction_read_only=on -c statement_timeout=<ms>`; запрос в явной транзакции с `SET TRANSACTION READ ONLY` |
 | MySQL/MariaDB | `SET SESSION TRANSACTION READ ONLY`; `max_execution_time` |
 | SQLite | открытие файла в режиме `mode=ro` (file-level, сильнее сессионного) |
+| MongoDB | **нет** — сессионного read-only в MongoDB не существует (`readConcern`/`readPreference` — не разрешения; реплика не барьер: `$out` на secondary уходит на primary и создаёт коллекцию, замерено). Остаются слой 1 и слой 3 |
 
 Row limit — клиентский: fetch `limit + 1` строк; если пришло больше limit —
 `truncated: true` и warning.
@@ -286,9 +287,26 @@ zero-width unicode, denylist-функции), а также представит
   дешёвый roundtrip, всегда соответствует версии сервера); кэш станет
   естественным свойством connection daemon (v0.5), если тот появится.
   Переопределение policy — `validator.allow_commands` / `deny_commands`.
-- MongoDB: собственный allowlist read-команд (find, aggregate без `$out`/`$merge`,
-  count, distinct, listCollections, ...). Aggregate-пайплайны сканируются на
-  пишущие стадии.
+- MongoDB (**реализовано**, `src/mongo.rs`): собственный парсер подмножества
+  mongosh (`db.<collection>.find/findOne/aggregate/countDocuments/distinct`,
+  цепочки `.sort/.skip/.limit/.toArray`) плюс **закрытый allowlist** поверх
+  разобранной структуры — имена методов, стадии пайплайна, операторы,
+  выражения и аккумуляторы. Любой неизвестный ключ на `$` на любой глубине —
+  deny (новый пишущий оператор следующего мажора отклоняется by default).
+  `$out`/`$merge` — deny в ЛЮБОЙ позиции, включая вложенные пайплайны
+  (`$lookup`, `$unionWith`, `$facet`); серверный JS (`$where`, `$function`,
+  `$accumulator`, `mapReduce`, BSON-значение `$code`) — deny всегда.
+  Новые reason'ы: `DENIED_COMMAND` (метод коллекции вне allowlist'а) и
+  `DENIED_OPERATOR` (`$`-ключ вне allowlist'а); `PARSE_FAILED`,
+  `WRITE_OPERATION` и `DENIED_FUNCTION` — те же, что у SQL.
+  Golden-корпус: `tests/corpus/mongo/*.yaml`.
+  Чего у MongoDB НЕТ и о чём мы говорим честно: слоя 2 (см. таблицу выше),
+  секции `[pii]` (жёсткая ошибка конфига — провенанса колонок в документной
+  БД нет, а политика, которая ничего не защищает, хуже отсутствия политики) и
+  guardrail'а (`explain` в режиме `queryPlanner` не даёт ни cost, ни оценки
+  строк, а `executionStats` ВЫПОЛНЯЕТ запрос — принимается только
+  `mode = "off"`). `nyet schema`/`explain`/`doctor` для MongoDB — следующий
+  шаг, сейчас честный `NOT_IMPLEMENTED` (exit 1).
 
 ---
 

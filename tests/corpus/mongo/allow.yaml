@@ -1,0 +1,194 @@
+# Golden corpus — MongoDB queries that must be ALLOWED (mongosh subset).
+# Same tiny line format as the SQL corpus; the runner lives in src/mongo.rs.
+# These live in a subdirectory so the SQL runner (tests/corpus/*.yaml) does not
+# try to parse them with sqlparser.
+
+# --- find: the plain shapes ---
+- query: db.users.find()
+  verdict: allow
+- query: db.users.find({})
+  verdict: allow
+- query: db.users.find({active: true})
+  verdict: allow
+- query: db.users.find({name: "Ann", active: false, deleted: null})
+  verdict: allow
+- query: db.users.find({age: {$gte: 18, $lt: 65}})
+  verdict: allow
+- query: db.users.find({status: {$in: ["new", "paid"]}})
+  verdict: allow
+- query: db.users.find({tags: {$all: ["a", "b"]}, "profile.city": "Berlin"})
+  verdict: allow
+- query: db.users.find({items: {$elemMatch: {qty: {$gt: 5}, sku: /^ab/i}}})
+  verdict: allow
+- query: db.users.find({$and: [{a: 1}, {$or: [{b: 2}, {$nor: [{c: 3}]}]}]})
+  verdict: allow
+- query: db.users.find({a: {$not: {$eq: 1}}, b: {$exists: true, $type: "string"}})
+  verdict: allow
+- query: db.users.find({$expr: {$gt: ["$spent", "$budget"]}})
+  verdict: allow
+- query: db.users.find({}, {name: 1, email: 1, _id: 0})
+  verdict: allow
+- query: db.users.findOne({_id: 7})
+  verdict: allow
+- query: db.users.findOne({}, {name: 1})
+  verdict: allow
+
+# --- cursor chain ---
+- query: db.users.find({}).limit(5)
+  verdict: allow
+- query: db.users.find({}).sort({created_at: -1}).skip(10).limit(5)
+  verdict: allow
+- query: db.users.find({}).limit(5).toArray()
+  verdict: allow
+- query: db.users.find({}).skip(0)
+  verdict: allow
+
+# --- counting and distinct ---
+- query: db.users.countDocuments()
+  verdict: allow
+- query: db.users.countDocuments({active: true})
+  verdict: allow
+- query: db.users.distinct("status")
+  verdict: allow
+- query: db.users.distinct("status", {active: true})
+  verdict: allow
+
+# --- aggregate ---
+- query: db.users.aggregate([])
+  verdict: allow
+- query: db.users.aggregate([{$match: {active: true}}, {$group: {_id: "$dept", n: {$sum: 1}}}, {$sort: {n: -1}}, {$limit: 10}])
+  verdict: allow
+- query: db.users.aggregate([{$project: {name: 1, shout: {$toUpper: "$name"}}}])
+  verdict: allow
+- query: db.users.aggregate([{$addFields: {total: {$multiply: ["$price", "$qty"]}}}, {$unset: "tmp"}])
+  verdict: allow
+- query: db.users.aggregate([{$count: "n"}])
+  verdict: allow
+- query: db.users.aggregate([{$sample: {size: 5}}])
+  verdict: allow
+- query: db.users.aggregate([{$unwind: "$tags"}, {$sortByCount: "$tags"}])
+  verdict: allow
+- query: db.users.aggregate([{$bucketAuto: {groupBy: "$age", buckets: 4}}])
+  verdict: allow
+- query: db.users.aggregate([{$replaceRoot: {newRoot: "$profile"}}])
+  verdict: allow
+- query: db.users.aggregate([{$group: {_id: null, avg: {$avg: "$n"}, top: {$topN: {n: 3, sortBy: {n: -1}, output: "$name"}}}}])
+  verdict: allow
+- query: db.users.aggregate([{$setWindowFields: {partitionBy: "$dept", sortBy: {salary: -1}, output: {place: {$rank: {}}}}}])
+  verdict: allow
+
+# --- nested pipelines: the shapes that carry stages inside a stage ---
+- query: db.users.aggregate([{$lookup: {from: "orders", localField: "_id", foreignField: "user_id", as: "orders"}}])
+  verdict: allow
+- query: db.users.aggregate([{$lookup: {from: "orders", as: "o", let: {u: "$_id"}, pipeline: [{$match: {$expr: {$eq: ["$user_id", "$$u"]}}}, {$project: {total: 1}}]}}])
+  verdict: allow
+- query: db.users.aggregate([{$unionWith: {coll: "archive", pipeline: [{$match: {active: true}}]}}])
+  verdict: allow
+- query: db.users.aggregate([{$facet: {byStatus: [{$group: {_id: "$status", n: {$sum: 1}}}], total: [{$count: "n"}]}}])
+  verdict: allow
+- query: db.users.aggregate([{$graphLookup: {from: "users", startWith: "$manager", connectFromField: "manager", connectToField: "_id", as: "chain"}}])
+  verdict: allow
+
+# --- typed literals: constructors ---
+- query: db.users.find({_id: ObjectId("66210f0e2f1a4b0012a3c4d5")})
+  verdict: allow
+- query: db.users.find({_id: new ObjectId("66210f0e2f1a4b0012a3c4d5")})
+  verdict: allow
+- query: db.users.find({created_at: {$gt: ISODate("2026-01-31T00:00:00Z")}})
+  verdict: allow
+- query: db.users.find({created_at: {$gt: new Date("2026-01-31T00:00:00Z")}})
+  verdict: allow
+- query: db.users.find({n: NumberLong("9007199254740993")})
+  verdict: allow
+- query: db.users.find({n: NumberLong(42)})
+  verdict: allow
+- query: db.users.find({n: NumberInt(7)})
+  verdict: allow
+- query: db.users.find({price: {$lte: NumberDecimal("19.99")}})
+  verdict: allow
+- query: db.users.find({uid: UUID("3b241101-e2bb-4255-8caf-4136c566a962")})
+  verdict: allow
+
+# --- typed literals: extended JSON in VALUE position ---
+# ($-keys of TYPES and $-keys of OPERATORS share one namespace; these resolve to
+# native BSON at parse time, so the classifier never sees them as operators)
+- query: db.users.find({_id: {"$oid": "66210f0e2f1a4b0012a3c4d5"}})
+  verdict: allow
+- query: db.users.find({created_at: {"$date": "2026-01-31T00:00:00Z"}})
+  verdict: allow
+- query: db.users.find({created_at: {"$date": {"$numberLong": "1767139200000"}}})
+  verdict: allow
+- query: db.users.find({n: {"$numberLong": "9007199254740993"}})
+  verdict: allow
+- query: db.users.find({n: {"$numberInt": "7"}})
+  verdict: allow
+- query: db.users.find({n: {"$numberDouble": "1.5"}})
+  verdict: allow
+- query: db.users.find({price: {"$numberDecimal": "19.99"}})
+  verdict: allow
+- query: db.users.find({a: {$gt: {"$minKey": 1}, $lt: {"$maxKey": 1}}})
+  verdict: allow
+- query: db.users.find({name: {"$regularExpression": {"pattern": "^ac", "options": "i"}}})
+  verdict: allow
+
+# --- regex literals ---
+- query: db.users.find({name: /^acme/})
+  verdict: allow
+- query: db.users.find({name: /^acme/i})
+  verdict: allow
+- query: db.users.find({name: /a[/]b/i})
+  verdict: allow
+- query: db.users.find({name: /a\/b/})
+  verdict: allow
+- query: db.users.find({name: {$regex: "^ac", $options: "i"}})
+  verdict: allow
+
+# --- lexical: comments, trailing commas, quotes, unicode, semicolon ---
+- query: db.users.find({a: 1, /* note */ b: 2,})
+  verdict: allow
+- query: db.users.find({a: 1}) // trailing comment
+  verdict: allow
+- query: db.users.find({'a': 1, "b": 2})
+  verdict: allow
+- query: db.users.find({tags: {$in: ["a", "b",]}})
+  verdict: allow
+- query: db.users.find({"имя": "Ольга"})
+  verdict: allow
+- query: db.users.find({"ключ с пробелом": "значение"})
+  verdict: allow
+- query: db.users.find({emoji: "😀"})
+  verdict: allow
+- query: db.users.find({escaped: "a\"b\\c\nd\teé"})
+  verdict: allow
+- query: db.users.find({a: 1});
+  verdict: allow
+- query:    db.users.find( { a : 1 } )
+  verdict: allow
+
+# --- collection names ---
+- query: db.orders.archive.find({})
+  verdict: allow
+- query: db.my-collection.find({})
+  verdict: allow
+- query: db.users_2026.find({})
+  verdict: allow
+
+# --- numbers ---
+- query: db.users.find({a: -3.5, b: 1e6, c: -0, d: 9007199254740993})
+  verdict: allow
+
+# --- an ordinary field that merely SHARES A NAME with a stage's collection
+# --- reference is data, not a namespace: the check is scoped to the stage
+- query: db.mail.find({from: "system.import", coll: "system.x"})
+  verdict: allow
+- query: db.users.aggregate([{$match: {from: "system.import"}}])
+  verdict: allow
+- query: db.users.aggregate([{$lookup: {from: "orders", as: "o", pipeline: [{$match: {coll: "system.js"}}]}}])
+  verdict: allow
+
+# --- a Timestamp read out of a document can be pasted straight back into the
+# --- next filter (the round-trip the output format promises)
+- query: db.oplog.find({ts: {"$timestamp": {"t": 1767139200, "i": 1}}})
+  verdict: allow
+- query: db.oplog.find({ts: {$gt: {"$timestamp": {"t": 1767139200, "i": 1}}}})
+  verdict: allow

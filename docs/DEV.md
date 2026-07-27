@@ -45,6 +45,9 @@ daemon, on purpose:
   `caching_sha2_password` user connecting over `ssl-mode=REQUIRED` — the TLS
   proof, since MySQL 8 auto-generates a self-signed cert and enables TLS at
   init).
+- MongoDB — `mongo:8` (digest-pinned in `tests/mongo.rs`): `tests/mongo.rs` is
+  the e2e via the binary against an authenticated server with a `read`-role
+  account. The MongoDB unit tests in `src/engine.rs` need no Docker.
 - MariaDB — `mariadb:11.4`: `src/engine.rs` `mariadb_server_timeout_maps_to_timeout`
   proves the `max_statement_time`/SQLSTATE 1969 path directly (no outer tokio
   timeout — a `Timeout` can only come from the server), and `tests/mysql.rs` is
@@ -59,6 +62,7 @@ colima start                               # or Docker Desktop — any Docker da
 docker pull postgres:16-alpine             # first run only; cached after
 docker pull mysql:8.4
 docker pull mariadb:11.4
+docker pull mongo:8
 docker pull linuxserver/openssh-server@sha256:9c5e178975fcc3917853f5e37cbf135ad7deb11de504ab0f460cc81a2e1eb539  # SSH tunnel stand (digest-pinned in tests/ssh.rs)
 just test                                  # containers come up and are reaped per test
 ```
@@ -215,6 +219,10 @@ covered by unit tests in `src/tunnel.rs` / `src/engine.rs` (no network).
 cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 ├─ config    (src/config.rs)    — pure: TOML text -> validated structures; env lookup injected
 ├─ resolver  (src/resolver.rs)  — pure: (cwd, allowed_dirs) -> allowed?; canonicalize injected
+├─ mongo     (src/mongo.rs)     — pure: (mongosh text) -> Request | Refusal;
+│                                 the MongoDB layer 1 (parser + closed
+│                                 allowlist) and the wire command it builds;
+│                                 depends ONLY on mongodb::bson (+std)
 ├─ validator (src/validator.rs) — pure: (SQL text, Policy) -> Allow{sql,warnings} |
 │                                 Deny{reason,message,hint}; also owns the PII
 │                                 policy (PiiRules + PiiMode) and the
@@ -1016,6 +1024,314 @@ depends on statistics, parameters and server settings, and a stale cached
 estimate would be a guardrail that lies. Reconsider only if a connection daemon
 (ROADMAP v0.5) ever gives it a natural home.
 
+## MongoDB (`src/mongo.rs` layer 1, `engine::Mongo` IO)
+
+The odd engine out, and the README says so out loud. Split per Д1/Д2: the whole
+of layer 1 — parsing the agent's text, classifying it, and building the wire
+command — is a **pure** module with `mongodb::bson` as its only dependency, and
+the engine does nothing but IO.
+
+### Why a parser at all
+
+The agent writes a subset of **mongosh** (`db.users.find({active: true})`), not
+a raw command document. That is the syntax an LLM has actually seen (UX-3), and
+it means nyet controls the command envelope completely: `limit`, `batchSize` and
+`maxTimeMS` are nyet's, and there is no shape in the input that can set them.
+(`singleBatch` is deliberately NOT sent — see the row-limit note below.)
+
+**Accepted, deliberately small:** `find(<filter>[, <projection>])`,
+`findOne(...)`, `aggregate([<stages>])`, `countDocuments([<filter>])`,
+`distinct("<field>"[, <filter>])`, plus the cursor chain `.sort({..})`,
+`.skip(n)`, `.limit(n)`, `.toArray()` after a `find` — each at most once.
+Values are JSON plus the mongosh constructors (`ObjectId`, `ISODate`/`Date`,
+`NumberLong`, `NumberInt`, `NumberDecimal`, `UUID`, optionally with `new`),
+regex literals, comments and trailing commas.
+
+**Deliberately NOT accepted** (each one a refusal, never an attempt):
+`estimatedDocumentCount` / legacy `count` (inaccurate by design), `$text`
+(needs an index and a sub-language of its own), geo operators, `$jsonSchema`,
+`getCollection(...)`, a no-argument `ISODate()`/`new Date()` (a query whose
+meaning depends on the clock is not reproducible from the audit log), and every
+options document. Adding any of them later is a list entry plus corpus cases —
+which is the point of the shape.
+
+### Decisions worth writing down
+
+- **Duplicate keys are refused** (`{a: 1, a: 2}` -> `PARSE_FAILED`). BSON allows
+  them; every JSON parser silently keeps one. Keeping one quietly would mean
+  nyet classified a document the server does not evaluate — the exact
+  validate/exec drift the tunnel module also refuses to live with. Refusing is
+  cheap: no legitimate read needs a duplicate field.
+- **Extended JSON is resolved at PARSE time, into native BSON.** `{"$oid": ".."}`
+  and `{"$gt": 1}` live in one namespace, so the parser decides the question
+  once and for all: a single-key document whose key is in `EXT_JSON_KEYS`
+  becomes the native type (and a wrong payload is a refusal, NOT a fallback to
+  "then it must be an operator" — that fallback is exactly how
+  `{"$oid": {"$where": ".."}}` would slip through). By the time the classifier
+  runs, every remaining `$`-key is an operator candidate. None of the type keys
+  collides with an operator name, which is what makes the question decidable.
+  **The canonical form is required exactly**, not merely recognized: an EXTRA
+  key inside the payload (`{"$regularExpression": {pattern, options, extra}}`),
+  a `$minKey`/`$maxKey` payload other than `1`, or any other deviation is a
+  refusal — anything nyet dropped here would be dropped BEFORE the classifier
+  ran, taking whatever it carried with it.
+  **Round trip:** results print relaxed extended JSON, so what a result shows
+  must be what the next filter takes. `$timestamp` is accepted for exactly that
+  reason (there is no constructor form for it, so without it a Timestamp could
+  be read and never matched on). `$binary` is the one exception and it SAYS so:
+  writing it would need a base64 decoder of nyet's own for a value no read has
+  to match on, so it is refused with "a BSON type nyet can return but not
+  accept" rather than with the "unknown operator" message it used to get —
+  calling a type an operator was simply wrong. A UUID has the `UUID("..")`
+  form, which is the common case.
+- **The classifier is one dumb recursive walk.** No shape-specific shortcuts, no
+  "this branch cannot contain an operator" assumptions: every key that starts
+  with `$` is checked against an allowlist, at every depth, in every position.
+  Two structural rules on top, because they carry NESTED PIPELINES:
+  `$facet`'s branch values, and any `pipeline: [...]` array (`$lookup`,
+  `$unionWith`) are walked as pipelines — an array of single-key stage
+  documents.
+- **Stages and operators are two lists, but the OPERATOR check accepts both.**
+  Stage position takes `STAGES` only (a precise message); everywhere else the
+  union applies. Splitting the union per position (query vs expression vs
+  accumulator vs window) would buy precision nyet does not need — using `$sum`
+  in a filter is a *server* error, not a hole — at the price of a much larger
+  rule surface that could drift. What the union must never contain is anything
+  that writes, evaluates JavaScript or reaches outside the collection, and it
+  does not. `binary_search` over the lists means they must stay sorted, which a
+  unit test pins (an unsorted entry would be a false refusal, and the same test
+  proves the deny lists do not overlap the allowlists).
+- **`$out`/`$merge` are refused in every position**, including nested pipelines.
+  Measured: the server accepts them only as the final top-level stage today —
+  and nyet does not lean on that, because the rule that protects the data must
+  not be the server's grammar.
+- **Server JS is never on any list**: `$where`, `$function`, `$accumulator`,
+  `mapReduce`, a `$code` BSON value. It runs arbitrary code in the database
+  process, and (measured) `maxTimeMS` does not budget `$function`/`$accumulator`
+  at all — which for our allowlist is closed precisely because they never pass.
+- **Stages refused on purpose, with the reason:** `$changeStream` (an unbounded
+  cursor would simply hang the CLI), `$search`/`$vectorSearch` (Atlas-only
+  sub-languages nyet cannot classify — a filter it cannot read is not a filter
+  it may forward), cluster introspection `$currentOp` / `$listSessions` /
+  `$listLocalSessions` / `$planCacheStats` / `$listCatalog` / `$collStats` /
+  `$indexStats` (they leak other sessions' query text, which quotes real data,
+  and topology the agent has no business with), `$documents` (a
+  collection-less source), and every `$_internal*` stage — there are ~30, the
+  list grows every release, and one of them (`$_internalApplyOplogUpdate`)
+  WRITES under the plain `read` role. None of them is listed, so all of them are
+  refused by the default rule rather than by a blocklist that would have to keep
+  up.
+- **`system.*` is refused wherever a collection can be NAMED**, which is two
+  places, not one: `db.<collection>.<method>` at parse time and a stage's own
+  namespace argument at classify time (`$lookup.from`, `$unionWith` — as a bare
+  string or `coll:` — and `$graphLookup.from`). The second one was a real hole
+  and is why `check_collection_name` is now shared: a collection name is a
+  string VALUE, and the classifier only ever looked at `$`-KEYS, so
+  `{$lookup: {from: "system.js"}}` walked straight past the check. Verified
+  live under the README's own `read`-role recipe: it returned the stored
+  JavaScript, and on a server without auth the same shape returned
+  `system.profile` — other sessions' queries WITH their values, exactly what
+  the refusal's own hint promises to keep away. The check is scoped to those
+  three stages on purpose, so an ordinary document field that happens to be
+  called `from` (`db.mail.find({from: "system.import"})`) is untouched; a
+  future stage that names a collection is not a hole either, because it would
+  have to be added to `STAGES` first and that list sits next to this one. A
+  `{db: .., coll: ..}` namespace is refused outright: the connection's url
+  names the ONE database nyet reads, and "today's server would have refused it
+  outside Atlas" is not a rule.
+- **`$facet` branch NAMES go through `check_key` too.** They are document keys
+  like any other, and without that a `$`-prefixed branch name travelled to the
+  server unclassified.
+- **No Unicode stripping**, unlike SQL. The SQL rule exists because a zero-width
+  character can hide a keyword from a reviewer; here every operator is matched
+  literally, so an invisible character inside `$where` simply makes it an
+  unknown key -> deny (fail closed), while stripping would corrupt filter
+  VALUES, which are data.
+- **Depth 100 / input 64 KiB (BYTES, checked before the `Vec<char>` is
+  built).** The parser recurses per `{`/`[`/`(` — including
+  through constructor arguments, which is why the depth is threaded through
+  `parse_args` too (without it `NumberLong(NumberLong(...))` restarted the
+  count at zero and a few thousand of them overflowed the stack; an abort is
+  not a refusal, Д3). 100 is MongoDB's own BSON nesting limit, so nyet refuses
+  exactly what the server would.
+
+### The engine
+
+- **Layer 1 runs twice, on purpose.** The cli refuses before the network (exit 5
+  without a connect), and `Mongo::execute` re-runs `mongo::check` on the same
+  text to get the request it executes. `check` is pure and deterministic, so
+  the two cannot disagree — and there is no second representation of the query
+  in between that could drift from the classified one. The re-validation
+  failure path is an error, never a panic.
+- **The connect phase is explicit.** The driver connects lazily, so without it
+  the handshake would happen inside the first command, under the QUERY deadline
+  — making an unreachable host answer TIMEOUT (exit 8) instead of
+  CONNECTION_FAILED (exit 6). `open()` therefore runs one `{ping: 1}` under the
+  CONNECT deadline (which also sets `connect_timeout`/`server_selection_timeout`
+  to it), and every failure there is a Connect error whatever shape the driver
+  gave it. That is the same round trip the other engines pay in their handshake.
+- **Row limit + truncation, and the 16 MiB trap.** `find` gets
+  `limit: N+1` **plus `batchSize: N+1`** — deliberately NOT `singleBatch`.
+  Both keep the read to one round trip, but the server cuts a batch at
+  **16 MiB before it reaches the limit**, and `singleBatch` makes it close the
+  cursor anyway: the rest was then lost with no signal at all, and the answer
+  read as complete (measured: 30 documents of ~1 MB came back as 16 with
+  `truncated: false` — a partial answer presented as the whole truth, the worst
+  failure mode a read tool has, UX-1). With `batchSize` the server leaves the
+  cursor OPEN when it cut the batch, and `read_reply` treats a non-zero
+  `cursor.id` as truncation. (A batch size is also required rather than
+  optional: without one the first batch is the protocol default of 101
+  documents, which would truncate at 101 instead of at the row limit.) An
+  aggregation already carried a cursor and gets the same treatment plus its
+  trailing `{$limit: N+1}`. `ResultSet::truncated` carries the fact up, and the
+  cli ORs it into `meta.truncated`; the `TRUNCATED` warning then says which of
+  the two happened, because "raise --limit" is the wrong advice for a limit
+  that was never reached (Д10). The agent's own `.limit(n)` is `min`ed with
+  nyet's, so it can only lower the effective limit.
+  *Residual, accepted:* a truncated read leaves the server-side cursor open,
+  and nyet does not send `killCursors` — MongoDB reaps an idle cursor after ten
+  minutes, and a round trip on the rare truncated read is not worth the code.
+- **`distinct` runs as a bounded AGGREGATION, not as the `distinct` command.**
+  That command takes no limit at all: measured, 500 distinct values crossed the
+  network for a `--limit 3` and the only ceiling was the 16 MiB reply cap — a
+  hole in the same row-limit contract every other read honors. The pipeline is
+  `$match` -> `$unwind` (with `preserveNullAndEmptyArrays`, keeping the
+  command's array semantics: distinct returns the ELEMENTS of an array field)
+  -> `$group` -> `$sort` (so a truncated answer is deterministic) ->
+  `$limit: N+1`, read back as one `value` column. Pinned against the real
+  command in the container e2e, for a direct array field as well as a plain
+  one.
+  **A DOTTED path is refused** (`distinct("items.sku")` -> `DENIED_COMMAND`),
+  and that is the honest half of this trade: `$unwind` does not descend
+  THROUGH an array on its way to a sub-field, so for
+  `{items: [{sku: 1}, {sku: 2}]}` the command answers `[1, 2]` while this
+  pipeline answers the whole arrays plus a `null` — a WRONG answer that reads
+  like a complete one, the same class of defect the 16 MiB work removed. The
+  hint hands the agent the explicit `aggregate([{$unwind: ...}, {$group: ...}])`
+  form, where what is unwound is visible. *Residuals:* a document MISSING the
+  field contributes a `null` where the command would have omitted it; and
+  `$group`/`$sort` are bounded by the server's 100 MB in-memory limit (nyet
+  never sends `allowDiskUse`), so a distinct of very high cardinality can error
+  where the command would have answered — untested, and the honest error is the
+  acceptable direction.
+- **Timeouts:** `maxTimeMS` in the command (server side) plus the in-process
+  deadline (client side), like the other engines; server codes 50
+  (`MaxTimeMSExpired`) and 262 (`ExceededTimeLimit`) map to `EngineError::Timeout`
+  so exit 8 is deterministic whichever fires.
+- **`countDocuments` is an aggregation** (`$match` + `$group` + `$project`),
+  like mongosh's own implementation — the legacy `count` command is inaccurate
+  after an unclean shutdown and on a sharded cluster. It answers one row,
+  `{"count": N}`, and an empty collection is a count of ZERO rather than "no
+  answer". `distinct` answers one row per value under the column `value`.
+- **Results -> columns/rows:** documents have no fixed shape, so the columns are
+  the UNION of the top-level field names in first-seen order and a missing field
+  reads as `null`. Values are **relaxed extended JSON**
+  (`Bson::into_relaxed_extjson`), so an ObjectId comes back as
+  `{"$oid": ".."}` — the spelling that can be pasted into the next filter.
+  `table`/`csv` need no special case: a nested value renders as compact JSON in
+  its cell, exactly as a PostgreSQL `jsonb` column already does. A format
+  refusal was considered and rejected — `ResultSet` is columns+rows anyway, so
+  the flattening has to happen regardless, and refusing a format would break a
+  `[defaults].format = "csv"` setup for no gain.
+- **Server error text is trimmed** (first line, 600 chars). Measured: an
+  `Unauthorized` echoes the whole command document back, which for a large
+  pipeline is kilobytes of the agent's own text charged back to it (UX-4).
+- **SSH tunnel:** `directConnection = true` is forced with the host override —
+  without it the driver reads `rs.conf()` and connects to the members' real
+  addresses, straight around the bastion. TLS is DISABLED on the tunnel leg
+  (the ssh hop encrypts, and rustls can only verify a certificate against the
+  name dialed — `127.0.0.1` — which the server's certificate does not carry;
+  accepting invalid certificates instead is the theatre UX-7 forbids). Two
+  combinations are refused at CONFIG parse rather than half-supported:
+  `[ssh]` + `mongodb+srv://` (SRV re-resolves the members through DNS while nyet
+  runs), `[ssh]` + an explicit `directConnection=false`, and `[ssh]` + an
+  explicit `tls=true`/`ssl=true`. The last one is there for SYMMETRY with the
+  second: nyet refuses to silently overrule the human on `directConnection`,
+  and quietly ignoring their explicit `tls=true` is the same class of switch —
+  they would be left believing in encryption nyet did not apply. (The driver's
+  rustls backend offers only `allow_invalid_certificates`, with no "verify the
+  CA but not the hostname" middle ground, so honoring `tls=true` over the
+  tunnel is not available at all.) Note the asymmetry with Postgres/MySQL, which
+  KEEP TLS on the tunnel leg (`apply_host_override` downgrades `verify-full` to
+  `verify-ca` instead of dropping it): sqlx's backend has that middle ground and
+  the MongoDB driver does not, so the bastion→mongo leg is protected by ssh
+  alone. Documented rather than papered over.
+
+### What MongoDB does NOT get, and why it is said out loud
+
+- **No layer 2.** MongoDB has no read-only session, transaction or connection
+  flag; `readConcern`/`readPreference` are consistency and routing knobs, not
+  permissions. **A replica is not a barrier either**: measured, a `$out` sent to
+  a secondary is routed to the primary and creates the collection. So layer 1
+  and layer 3 are the whole story, which is why the README's read-only-role
+  recipe is not optional advice here.
+- **No `[pii]`.** The section is a hard config error (`PiiUnsupported`, exit 3),
+  not an ignored setting: nyet's rules name a `table.column` pair and net B
+  cross-checks them against the column provenance the server reports, and a
+  schemaless document has neither. A collection-level deny may come later, as
+  its own step; there is no groundwork for it here on purpose (Д5).
+- **No guardrail.** `explain` in `queryPlanner` mode publishes neither a cost
+  nor a row estimate, and `executionStats` RUNS the query. `off` is the only
+  accepted mode (`guardrail::engine_modes`), so a `cost`/`rows` mode is a config
+  error with an honest reason. There is deliberately **no per-query
+  `GUARDRAIL_SKIPPED` warning**: that code means "the guardrail was ON and could
+  not reach a verdict", and emitting it where no guardrail was ever armed would
+  both change the meaning of a contract code (Д7) and tax every single call
+  (UX-4) — SQLite, which is in the same position, does not warn either. The
+  honest statement lives in the README and in the config error.
+- **No `schema` / `explain` / `doctor`** yet: they answer `NOT_IMPLEMENTED`
+  (exit 1) with a hint pointing at `nyet query`. `schema` would have to guess a
+  shape from sampled documents, `explain` has no estimate to report, and
+  `doctor`'s write probe needs a per-engine read-only proof that does not exist
+  yet.
+
+### Error codes (Д7: append-only)
+
+`PARSE_FAILED`, `WRITE_OPERATION` and `DENIED_FUNCTION` are REUSED with exactly
+their existing meaning (a unit test pins that the strings stay identical to the
+SQL validator's — an agent that learned them on Postgres must recognize them
+here). Two are new: **`DENIED_COMMAND`** (the collection method / database-level
+command is not on the read allowlist) and **`DENIED_OPERATOR`** (a `$`-key —
+stage, query operator, expression, accumulator — is not, including the options
+nyet owns). They are new rather than folded into `DENIED_FUNCTION` because the
+agent's fix differs: one means "use a different method", the other "use a
+different operator", and a single code would make both hints vague.
+
+### Tests
+
+- **Golden corpus** — `tests/corpus/mongo/{allow,deny}.yaml`, ~240 cases, same
+  tiny line format as the SQL corpus and read by the runner in `src/mongo.rs`.
+  It lives in a SUBdirectory because the SQL runner globs `tests/corpus/*.yaml`
+  and would otherwise hand mongosh to sqlparser. Covers: every writing method,
+  `$out`/`$merge` in every position (nested pipelines included), all of the
+  server JS, `$_internal*`, unknown `$`-keys, the refused stages, options and
+  service fields, database-level commands, `system.*`, the cursor chain
+  (including a repeated call), extended-JSON types with a wrong payload,
+  duplicate keys, regex flags, and a wide range of malformed input.
+- **Pure unit tests** (`src/mongo.rs`): list sortedness/disjointness, the shared
+  reason codes, `no_input_can_panic` (every PREFIX of a set of nasty seeds, plus
+  5000-level nesting in three shapes and an oversized input), the BSON types the
+  parser produces, the command document's bounds, the reply -> columns/rows
+  mapping, and "an unknown `$`-key is refused at any depth".
+- **Engine unit tests** (`src/engine.rs`, `mongo_tests`, NO Docker — they point
+  at a closed port with a 300 ms connect deadline): the connect/query deadline
+  split (exit 6, not 8), a url without a database, a password without a user, an
+  invalid url that echoes nothing, the engine's re-validation, the transport
+  warning rule, and the server-message trimming.
+- **CLI e2e** (`tests/cli.rs`, no Docker): layer 1 refusals reaching the agent as
+  `NYET` + reason with exit 5 **against a closed port** (so anything that
+  reached the network would fail differently), the `NOT_IMPLEMENTED` answers for
+  schema/explain/doctor, and the two config errors (`[pii]`, `guardrail.mode`).
+- **Container e2e** (`tests/mongo.rs`, `mongo:8` digest-pinned, ONE container
+  with auth enabled and a `read`-role account): the read shapes and the union
+  of document keys, the row limit + `truncated`, the timeout (an un-indexed
+  self-join over 20k documents under `--timeout 1`), a write refused by layer 1
+  with the collection provably not created, the SAME `$out` refused by the
+  SERVER for that role (layer 3 is really underneath), and a DB error keeping
+  exit 7. Readiness is polled with a real `ping` rather than trusted to the log
+  line, because the official image restarts mongod once while applying the root
+  credentials.
+
 ## Round trips (the control statements, per engine)
 
 On a LAN the control statements around a query are invisible; over a WAN they are
@@ -1469,6 +1785,26 @@ Runtime:
   `-c default_transaction_read_only=on -c statement_timeout=<ms>` plus an explicit
   `BEGIN READ ONLY`); MySQL/MariaDB layer 2 is an explicit `START TRANSACTION READ
   ONLY` plus a `SET SESSION max_execution_time`/`max_statement_time`.
+- `mongodb` (default features: `rustls-tls`, `dns-resolver`, `bson-2`,
+  `compat-3-*`) — the MongoDB driver, and through its `bson` re-export the BSON
+  model the pure `src/mongo.rs` builds and classifies. Justification (Д8): the
+  wire protocol is not a line format one can hand-roll — it is OP_MSG framing,
+  BSON encoding/decoding for every type, SCRAM-SHA-256 authentication, TLS,
+  server discovery and cursor management; the "30 lines of our own" alternative
+  does not exist, and re-implementing SCRAM in a credential-handling tool would
+  be the worse supply-chain decision. Feature choices: **`rustls-tls`, not
+  `openssl-tls`** — the same reasoning as sqlx's rustls backend (memory-safe
+  Rust, no C dependency, no OpenSSL advisory stream, static cross-compiles);
+  **`dns-resolver` KEPT** because it is what makes `mongodb+srv://` (i.e. Atlas,
+  the way most managed MongoDB is addressed) work at all; **`bson-2`** is the
+  default and the only one the 3.8 API is stable on. It brings tokio's `process`
+  and `fs` features into the build (declared by the driver itself, so nothing is
+  added to our own `[dependencies]`) and one new license into `deny.toml`:
+  `CC0-1.0`, **scoped to `tiny-keccak`** (SHA-3 under the auth stack). CC0 is a
+  public-domain dedication rather than a permissive code license, so it stays a
+  per-crate exception — a future CC0 dependency must be its own decision. The
+  driver is a big tree (hickory-dns for SRV, its own connection pool); that
+  weight was accepted consciously when the engine was scoped.
 - `tokio` (rt, time, net) — sqlx requires an async runtime; `time` gives the query
   timeout, `net` the Postgres TCP connection. The per-query runtime uses
   `enable_all` (io + time). Single-threaded, built per query.

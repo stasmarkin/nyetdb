@@ -179,6 +179,13 @@ pub enum ConfigError {
     /// A `[connections.X.pii] columns` entry that is not `table.column` or
     /// `schema.table.column`. Fail loud rather than silently protecting nothing.
     PiiRuleInvalid { alias: String, message: String },
+    /// A `[connections.X.pii]` section on an engine whose PII policy nyet does
+    /// not implement (MongoDB). Refused rather than ignored: a human who wrote
+    /// the section believes something is protected.
+    PiiUnsupported { alias: String, engine: String },
+    /// A MongoDB `[ssh]` combination that would route the driver around the
+    /// tunnel (see `validate_mongodb`).
+    MongoTunnelInvalid { alias: String, message: String },
     /// `${VAR}` in `[audit] path`: like the per-connection policy values, the
     /// audit path is security-relevant and the agent controls the environment,
     /// so substitution there would let it redirect or disable its own audit
@@ -235,6 +242,7 @@ pub fn parse(text: &str, env: EnvLookup) -> Result<Config, ConfigError> {
             &format!("connections.{alias}.max_timeout_secs"),
         )?;
         validate_ssh(alias, conn)?;
+        validate_mongodb(alias, conn)?;
         guardrail(alias, conn)?;
         pii(alias, conn)?;
     }
@@ -331,6 +339,76 @@ fn validate_ssh(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
     crate::tunnel::validate_remote(ssh.remote.as_deref().unwrap_or_default()).map_err(invalid)?;
     if let Some(cp) = &ssh.control_persist {
         crate::tunnel::validate_control_persist(cp).map_err(invalid)?;
+    }
+    Ok(())
+}
+
+/// What MongoDB cannot honor, said LOUDLY at parse time (exit 3) instead of
+/// being silently ignored — the same reflex as a guardrail mode an engine has
+/// no estimates for. All three cases are promises nyet would otherwise appear
+/// to make and could not keep:
+///
+/// - **`[pii]`** — nyet has no way to prove which field of a schemaless
+///   document a `table.column` rule covers, and MongoDB reports no column
+///   provenance for net B to cross-check. A policy that protects nothing is
+///   worse than no policy (UX-7), so the section is refused outright rather
+///   than accepted and ignored.
+/// - **`[ssh]` + `mongodb+srv://`** — SRV names the cluster's members by DNS
+///   and the driver re-resolves them periodically, which would route around
+///   the bastion. Refused rather than half-supported.
+/// - **`[ssh]` + `directConnection=false`** — over a tunnel nyet forces a
+///   direct connection to the forwarded port; without it the driver reads
+///   `rs.conf()` and connects to the members' real addresses, bypassing the
+///   bastion. An explicit `false` therefore contradicts the tunnel, and
+///   silently overriding the human's setting on a security-relevant switch is
+///   the wrong way to resolve that.
+fn validate_mongodb(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
+    if conn.engine != "mongodb" {
+        return Ok(());
+    }
+    if conn.pii.is_some() {
+        return Err(ConfigError::PiiUnsupported {
+            alias: alias.to_string(),
+            engine: conn.engine.clone(),
+        });
+    }
+    if conn.ssh.is_none() {
+        return Ok(());
+    }
+    let url = conn.url.as_deref().unwrap_or_default().to_ascii_lowercase();
+    let bad = |message: &str| {
+        Err(ConfigError::MongoTunnelInvalid {
+            alias: alias.to_string(),
+            message: message.to_string(),
+        })
+    };
+    if url.starts_with("mongodb+srv://") {
+        return bad(
+            "a mongodb+srv:// url resolves the cluster's members through DNS and the driver \
+             re-resolves them while it runs, so the connection would leave the ssh tunnel",
+        );
+    }
+    if url.contains("directconnection=false") {
+        return bad(
+            "directConnection=false makes the driver discover the replica set's real member \
+             addresses and connect to them directly, around the tunnel",
+        );
+    }
+    // Symmetry with the rule above, and the reason is the same one: nyet does
+    // not silently overrule the human on a security switch. Over the tunnel
+    // nyet must DISABLE TLS (the driver's rustls backend can only verify a
+    // certificate against the address it dialed — 127.0.0.1 — which the
+    // server's certificate does not carry, and the only alternative the driver
+    // offers is accepting invalid certificates, i.e. theatre). An explicit
+    // `tls=true` therefore contradicts the tunnel, and quietly ignoring it
+    // would leave the human believing in encryption nyet did not apply.
+    if url.contains("tls=true") || url.contains("ssl=true") {
+        return bad(
+            "an explicit tls=true cannot be honored through the tunnel: the driver verifies \
+             the certificate against the address it dials (127.0.0.1), which the server's \
+             certificate does not name, and nyet will not turn certificate verification off \
+             to paper over that",
+        );
     }
     Ok(())
 }
@@ -1166,6 +1244,96 @@ mod tests {
             parse("[audit]\ntypo = 1", &env_of(&[])).unwrap_err(),
             ConfigError::Invalid(_)
         ));
+    }
+
+    /// MongoDB has no PII policy and no tunnel-safe replica-set discovery, and
+    /// nyet says so LOUDLY at parse time instead of accepting a section it
+    /// would then ignore (UX-7: a policy that protects nothing is the worst
+    /// outcome, and a tunnel the driver can route around is not a tunnel).
+    #[test]
+    fn mongodb_refuses_the_promises_it_cannot_keep() {
+        let base = "[connections.m]\nengine = \"mongodb\"\n\
+                    url = \"mongodb://u@h:27017/app\"\nallowed_dirs = [\"~\"]\n";
+        // A [pii] section on a MongoDB connection is a hard error — even an
+        // empty one, because a human who wrote it believes something is
+        // protected.
+        for pii in [
+            "[connections.m.pii]\ncolumns = [\"users.email\"]\n",
+            "[connections.m.pii]\ncolumns = []\n",
+        ] {
+            match parse(&format!("{base}{pii}"), &env_of(&[])).unwrap_err() {
+                ConfigError::PiiUnsupported { alias, engine } => {
+                    assert_eq!(alias, "m");
+                    assert_eq!(engine, "mongodb");
+                }
+                other => panic!("expected PiiUnsupported, got {other:?}"),
+            }
+        }
+        // The same section on a supported engine is still fine.
+        let sql = "[connections.p]\nengine = \"postgres\"\nurl = \"postgres://h/db\"\n\
+                   [connections.p.pii]\ncolumns = [\"users.email\"]\n";
+        parse(sql, &env_of(&[])).unwrap();
+
+        // An ssh tunnel plus a url nyet could not honor inside it: one the
+        // driver would leave the tunnel through, or a TLS setting nyet would
+        // have to ignore. Refusing to silently overrule the human is the same
+        // rule in both cases.
+        for url in [
+            "mongodb+srv://u@cluster.example.net/app",
+            "mongodb://u@h:27017/app?directConnection=false",
+            "mongodb://u@h:27017/app?DIRECTCONNECTION=FALSE",
+            "mongodb://u@h:27017/app?tls=true",
+            "mongodb://u@h:27017/app?ssl=true&replicaSet=rs0",
+        ] {
+            let text = format!(
+                "[connections.m]\nengine = \"mongodb\"\nurl = \"{url}\"\n\
+                 [connections.m.ssh]\nhost = \"bastion\"\nremote = \"h:27017\"\n"
+            );
+            match parse(&text, &env_of(&[])).unwrap_err() {
+                ConfigError::MongoTunnelInvalid { alias, message } => {
+                    assert_eq!(alias, "m");
+                    assert!(!message.is_empty());
+                }
+                other => panic!("{url}: expected MongoTunnelInvalid, got {other:?}"),
+            }
+        }
+        // A plain url through a tunnel is exactly what nyet supports.
+        let ok = "[connections.m]\nengine = \"mongodb\"\n\
+                  url = \"mongodb://u@127.0.0.1:27017/app\"\n\
+                  [connections.m.ssh]\nhost = \"bastion\"\nremote = \"h:27017\"\n";
+        parse(ok, &env_of(&[])).unwrap();
+        // ... and so is the same url without a tunnel.
+        parse(base, &env_of(&[])).unwrap();
+    }
+
+    /// MongoDB publishes no plan estimate at all, so `off` is the only mode its
+    /// config accepts — a `cost`/`rows` mode is a loud error, never a silent
+    /// downgrade to "unguarded".
+    #[test]
+    fn mongodb_accepts_no_guardrail_mode_but_off() {
+        let with = |mode: &str| {
+            format!(
+                "[connections.m]\nengine = \"mongodb\"\nurl = \"mongodb://h/app\"\n\
+                 [connections.m.guardrail]\nmode = \"{mode}\"\n"
+            )
+        };
+        for mode in ["cost", "rows"] {
+            match parse(&with(mode), &env_of(&[])).unwrap_err() {
+                ConfigError::GuardrailInvalid { alias, message } => {
+                    assert_eq!(alias, "m");
+                    // Д10: the message says WHY, not just "no".
+                    assert!(message.contains("executionStats"), "{message}");
+                }
+                other => panic!("{mode}: expected GuardrailInvalid, got {other:?}"),
+            }
+        }
+        parse(&with("off"), &env_of(&[])).unwrap();
+        // No section at all resolves to the same "off".
+        parse(
+            "[connections.m]\nengine = \"mongodb\"\nurl = \"mongodb://h/app\"\n",
+            &env_of(&[]),
+        )
+        .unwrap();
     }
 
     #[test]

@@ -316,6 +316,11 @@ fn why_unsupported(engine: &str) -> &'static str {
              row estimates only"
         }
         "sqlite" => "SQLite's EXPLAIN QUERY PLAN carries no cost or row estimates at all",
+        "mongodb" => {
+            "MongoDB's explain publishes no cost and no row estimate in queryPlanner mode, \
+             and its executionStats mode RUNS the query — which is the one thing a guardrail \
+             must never do"
+        }
         _ => "this engine has no query planner nyet can read",
     }
 }

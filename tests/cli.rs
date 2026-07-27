@@ -3199,3 +3199,122 @@ fn pii_doctor_keeps_the_connect_diagnosis_honest() {
         );
     }
 }
+
+/// A MongoDB connection that is never contacted: every assertion below is
+/// about a refusal that must happen BEFORE the network (layer 1, exit 5) or
+/// before the engine is even built (config, exit 3 / not implemented, exit 1).
+fn mongo_config(dir: &Path) -> String {
+    format!(
+        r#"
+[connections.mongo]
+engine = "mongodb"
+url = "mongodb://127.0.0.1:1/app"
+allowed_dirs = ["{}"]
+timeout_secs = 1
+"#,
+        dir.display()
+    )
+}
+
+#[test]
+fn mongo_layer1_refuses_before_touching_the_network() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(tmp.path(), &mongo_config(tmp.path()));
+    // (query, expected reason). The url points at a closed port, so anything
+    // that reached the network would answer CONNECTION_FAILED (exit 6)
+    // instead — which is exactly what makes this a test of layer 1.
+    let cases = [
+        ("db.users.insertOne({a: 1})", "WRITE_OPERATION"),
+        (
+            "db.users.aggregate([{$match: {}}, {$out: \"copy\"}])",
+            "WRITE_OPERATION",
+        ),
+        ("db.users.find({$where: \"1\"})", "DENIED_FUNCTION"),
+        (
+            "db.users.mapReduce(\"f\", \"f\", {out: \"r\"})",
+            "DENIED_FUNCTION",
+        ),
+        (
+            "db.users.aggregate([{$_internalApplyOplogUpdate: {}}])",
+            "DENIED_OPERATOR",
+        ),
+        ("db.users.find({a: {$brandNew: 1}})", "DENIED_OPERATOR"),
+        ("db.runCommand({ping: 1})", "DENIED_COMMAND"),
+        ("db.users.count()", "DENIED_COMMAND"),
+        ("SELECT * FROM users", "PARSE_FAILED"),
+        ("db.users.find({a: 1, a: 2})", "PARSE_FAILED"),
+    ];
+    for (query, reason) in cases {
+        let out = nyet(tmp.path())
+            .args(["query", "mongo", query, "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(5), "{query}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "NYET", "{query}");
+        assert_eq!(v["error"]["reason"], reason, "{query}");
+    }
+}
+
+#[test]
+fn mongo_says_honestly_what_it_does_not_support_yet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(tmp.path(), &mongo_config(tmp.path()));
+    // schema/explain/doctor are step 2: an honest NOT_IMPLEMENTED (exit 1)
+    // that names `nyet query` as the way forward — never a crash and never a
+    // half-answer.
+    for args in [
+        vec!["schema", "mongo"],
+        vec!["explain", "mongo", "db.users.find({})"],
+        vec!["doctor", "mongo", "--format", "json"],
+    ] {
+        let out = nyet(tmp.path())
+            .args(&args)
+            .args(["--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "NOT_IMPLEMENTED", "{args:?}");
+        assert!(
+            v["error"]["hint"].as_str().unwrap().contains("nyet query"),
+            "{args:?}: the hint must point at what DOES work"
+        );
+    }
+}
+
+#[test]
+fn mongo_config_promises_it_cannot_keep_are_exit_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = mongo_config(tmp.path());
+    for (name, extra) in [
+        (
+            "pii",
+            "[connections.mongo.pii]\ncolumns = [\"users.email\"]\n",
+        ),
+        (
+            "guardrail",
+            "[connections.mongo.guardrail]\nmode = \"cost\"\n",
+        ),
+    ] {
+        let cfg = write_config(tmp.path(), &format!("{base}{extra}"));
+        let out = nyet(tmp.path())
+            .args(["query", "mongo", "db.users.find({})", "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{name}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "CONFIG_INVALID", "{name}");
+        // Д10: the message says what is wrong and the hint what to do instead.
+        assert!(
+            !v["error"]["message"].as_str().unwrap().is_empty(),
+            "{name}"
+        );
+    }
+}
