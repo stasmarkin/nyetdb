@@ -76,6 +76,9 @@ Or build from source (any platform with a Rust toolchain):
 cargo install --path .
 ```
 
+The minimum supported Rust version (MSRV) is stated as `rust-version` in
+`Cargo.toml` and checked in CI.
+
 Prebuilt binaries cover macOS and Linux (x86_64 + aarch64). Windows is not
 released yet — SSH tunnels and some tests are unix-only; build from source if
 you need it.
