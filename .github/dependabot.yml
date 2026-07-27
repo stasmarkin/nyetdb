@@ -1,0 +1,38 @@
+version: 2
+
+# Actions are SHA-pinned for supply chain safety (Д8), which also freezes them:
+# a pin never floats to a fix on its own. Dependabot re-pins to the new SHA when
+# an update lands. For cargo it opens the bump PR that `cargo audit` only warns
+# about. Grouped + PR-capped so routine bumps don't become a review flood.
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Patch-only: the tree is full of 0.x crates (sqlx, sqlparser, ...) where
+      # 0.9->0.10 is breaking by Cargo semver. A minor bump can break the build,
+      # so it gets its own PR to review — only patches ride the grouped "routine" PR.
+      cargo-patch:
+        update-types: ["patch"]
+
+  # fuzz/ is a separate out-of-workspace crate (nightly cargo-fuzz) with its own
+  # Cargo.lock the root "/" updater never sees — without this its deps rot silently.
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      cargo-patch:
+        update-types: ["patch"]
