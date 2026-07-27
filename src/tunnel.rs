@@ -10,17 +10,61 @@
 //! `ControlMaster=auto`/`ControlPersist` over a stable `ControlPath` reuse the
 //! master between runs so the second `nyet` call pays no handshake (Д9).
 //!
-//! LIFECYCLE: `open` returns a `Tunnel` guard that lives only for the current
-//! query; its `Drop` removes the forward so nothing accumulates across a
-//! session. Two teardown modes (verified against a real bastion):
-//!   * with a `ControlPath` (a persistent master exists), the `-L` forward is
-//!     owned by the master and outlives its client, so it must be removed
-//!     explicitly with `ssh -O cancel -L ...` — this leaves the master up for
-//!     reuse (the intended cheap warm path);
-//!   * without a `ControlPath` (no master), a plain `ssh -N -L` child owns the
-//!     forward, so killing that child removes it.
+//! LIFECYCLE — the forward is a shared, recorded resource, not a per-process one.
+//! A `-L` forward opened through a `ControlMaster` is owned by the *master* and
+//! outlives its client (verified against a real bastion). nyet used to fight
+//! that by removing the forward on `Drop`, which made every call pay two `ssh`
+//! spawns (measured: 5.6 ms to open + 4.9 ms to cancel on a warm master; ~118 ms
+//! of the same plumbing across a WAN bastion). Now the forward is *kept* and
+//! reused by the next run, under one invariant:
 //!
-//! Either way: master reused where possible, forward gone at query end.
+//!   **At most one nyet forward per (ssh destination, remote host:port) pair.**
+//!   It is recorded in exactly one registry file under the nyet runtime dir
+//!   (0700, our uid), which also serializes concurrent runs for that pair; it is
+//!   discoverable (`nyet doctor <alias>` shows it) and killable (doctor prints
+//!   the exact `ssh -O exit` command).
+//!
+//! Reuse is only allowed when all three hold — otherwise a fresh forward on a
+//! fresh random port (fail closed, i.e. today's behaviour):
+//! (1) the registry entry parses AND names this very pair; (2) the local port is
+//! *occupied* (a free port means the forward is gone); (3) `ssh -O check`
+//! reports the *same master pid* that created it.
+//!
+//! (3) is the ownership proof, and it is inference, not certainty: a forward
+//! disappears only when its master exits or someone runs `-O cancel -L`, so
+//! "same master still alive" + "port still taken" means the listener is still
+//! ours *unless* that one cancel happened. It is the strongest check available
+//! without socket-owner introspection (`ssh` has no "list forwards" command;
+//! `lsof`/`/proc` are neither portable nor a dependency we want, and cost more
+//! than the whole saving). THE RESIDUAL RISK, stated plainly: after such a
+//! cancel the freed ephemeral port can be taken by any ordinary local process
+//! — no attacker needed, the kernel hands out that same range — and the next
+//! run would adopt it and send the database handshake there. That is why
+//! `kill_command` deliberately teaches `-O exit` (which invalidates the pid)
+//! instead of `-O cancel`: we do not ship the recipe for the one state our
+//! reasoning cannot see through.
+//!
+//! The port stays *random*, though not as a secret — any local process can list
+//! loopback listeners in milliseconds. Random buys two things a derived port
+//! would not: nothing can be **pre**-captured (a squatter cannot sit on the port
+//! before nyet ever runs, only race the moment it frees), and there is no fixed
+//! port to hold hostage as a denial-of-service handle.
+//!
+//! TTL: none of our own. The forward dies with its master, and the master's life
+//! is `ControlPersist` — an OpenSSH mechanism the config owner already sets. A
+//! second, nyet-specific timer would need either a daemon (UX-6) or a check that
+//! only fires when we run anyway, i.e. exactly when we want the forward alive.
+//! `control_persist = "no"` (the human asking for no background master) disables
+//! reuse and restores the cancel-on-drop behaviour.
+//!
+//! Teardown modes:
+//!   * master mode + reuse: nothing on `Drop` — the forward stays for the next
+//!     run and dies with the master (ControlPersist);
+//!   * master mode, reuse off (`reuse_forward = false`, `ControlPersist=no`, or
+//!     the master pid could not be read): `ssh -O cancel -L ...` on `Drop`
+//!     removes just this forward, leaving the master up;
+//!   * standalone (no `ControlPath` available): a plain `ssh -N -L` child owns
+//!     the forward, so killing that child on `Drop` removes it.
 //!
 //! SECURITY: `host`/`remote` come from the config, where `${VAR}` substitution
 //! makes them agent-influenced (the threat model treats the environment as
@@ -31,12 +75,13 @@
 //! is the only line of defence and runs both at config parse (fail-fast, exit 3)
 //! and here before the argv is built.
 
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroU16;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Keep only the env vars `ssh` legitimately needs; everything else — notably
 /// the DB password from `password_env`, which nyet holds in its own env — is
@@ -71,18 +116,30 @@ pub struct TunnelError {
     pub hint: String,
 }
 
-/// A live tunnel, held by the cli for the duration of one query. Dropping it
-/// tears the forward down (see the module lifecycle note) so forwards never
-/// accumulate across a session.
+/// A live tunnel, held by the cli for the duration of one query. What `Drop`
+/// does depends on who owns the forward — see the module lifecycle note. The
+/// public fields are facts for `nyet doctor`, never secrets.
 pub struct Tunnel {
     /// The loopback port the engine connects to.
     pub local_port: u16,
+    /// True when this run adopted a forward left behind by an earlier one
+    /// (no `ssh` spawn to set it up).
+    pub reused: bool,
+    /// Age of the forward in seconds, when it is recorded (i.e. persistent);
+    /// `None` when the forward lives and dies with this process.
+    pub age_secs: Option<u64>,
+    /// The exact command that removes this forward, when it outlives us. `None`
+    /// means nothing is left behind, so there is nothing to kill.
+    pub kill_command: Option<String>,
     teardown: Teardown,
 }
 
 enum Teardown {
-    /// Persistent-master mode: remove just this forward, leaving the master up
-    /// for reuse. Holds the full `ssh -O cancel -L ...` argv.
+    /// The forward is recorded in the registry and stays for the next run; it
+    /// dies with its master (ControlPersist).
+    Keep,
+    /// Persistent-master mode without reuse: remove just this forward, leaving
+    /// the master up. Holds the full `ssh -O cancel -L ...` argv.
     Cancel(Vec<String>),
     /// Standalone mode (no master): kill the child that owns the forward.
     Child(Child),
@@ -93,6 +150,7 @@ impl Drop for Tunnel {
         // Best-effort: we are tearing down, and a failure here (master already
         // gone, child already dead) changes nothing.
         match &mut self.teardown {
+            Teardown::Keep => {}
             Teardown::Cancel(args) => {
                 let _ = ssh_command().args(args.iter()).output();
             }
@@ -256,7 +314,11 @@ pub fn validate_control_persist(value: &str) -> Result<(), String> {
 /// password (key/agent auth only); `ExitOnForwardFailure=yes` exits non-zero if
 /// the forward failed; `ConnectTimeout` bounds a blackholed bastion (BatchMode
 /// does not cover the TCP connect); `ControlMaster=auto` + `ControlPath` enable
-/// master reuse.
+/// master reuse. `ServerAlive*` bounds the *other* death — a master whose TCP
+/// connection died silently (laptop suspend, NAT timeout, network drop) keeps
+/// its local listener up and would otherwise swallow queries until the kernel
+/// gives up (hours). With keepalives the master exits in ~45 s, the port frees,
+/// and the next run creates a fresh forward instead of reusing a black hole.
 fn ssh_args(
     spec: &HostSpec,
     remote: &str,
@@ -284,6 +346,10 @@ fn ssh_args(
         "BatchMode=yes".to_string(),
         "-o".to_string(),
         format!("ConnectTimeout={connect_timeout_secs}"),
+        "-o".to_string(),
+        "ServerAliveInterval=15".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=3".to_string(),
     ]);
     // Always emit ControlPath explicitly. With a path (per-destination via the
     // %C hash) the master persists and the next run reuses it. Without one, emit
@@ -322,38 +388,299 @@ fn cancel_args(spec: &HostSpec, remote: &str, control_path: &str, local_port: u1
     args
 }
 
-/// Open a local SSH forward and return a `Tunnel` guard. The engine connects to
-/// `127.0.0.1:<tunnel.local_port>`; dropping the guard tears the forward down.
-/// `host`/`remote` are the config values (validated at config parse and
-/// re-checked here); `timeout_secs` is the per-query timeout, used to bound the
-/// connect.
+/// The `ssh -O check` argv: ask the master on this `ControlPath` whether it is
+/// alive, and (from its reply) *which* master it is. No network — it is a
+/// round-trip over the local mux socket (measured 3.2 ms).
+fn check_args(spec: &HostSpec, control_path: &str) -> Vec<String> {
+    let mut args = vec![
+        "-O".to_string(),
+        "check".to_string(),
+        "-o".to_string(),
+        format!("ControlPath={control_path}"),
+    ];
+    if let Some(port) = spec.port {
+        args.push("-p".to_string());
+        args.push(port.to_string());
+    }
+    args.push(spec.destination.clone());
+    args
+}
+
+/// The copy-pasteable cleanup command for a human (doctor prints it): shut the
+/// master down, which takes every forward it holds with it.
+///
+/// Deliberately `-O exit` and NOT the surgical `-O cancel`. Adoption trusts
+/// "port still occupied + same master pid"; a forward removed while its master
+/// lives is the one state where that reasoning breaks (the freed ephemeral port
+/// can be re-taken by any local process, and the next run would adopt it). We
+/// must not be the ones teaching the command that produces that state — with
+/// `-O exit` the pid changes, so nothing is ever adopted afterwards.
+///
+/// Quoting is minimal-but-correct: everything that is not obviously shell-safe
+/// is single quoted, because the `ControlPath` can carry a HOME with a space.
+fn kill_command(spec: &HostSpec, control_path: &str) -> String {
+    let mut out = String::from("ssh");
+    for arg in exit_args(spec, control_path) {
+        out.push(' ');
+        out.push_str(&shell_quote(&arg));
+    }
+    out
+}
+
+/// The `ssh -O exit` argv: shut down the master on this `ControlPath`.
+fn exit_args(spec: &HostSpec, control_path: &str) -> Vec<String> {
+    let mut args = vec![
+        "-O".to_string(),
+        "exit".to_string(),
+        "-o".to_string(),
+        format!("ControlPath={control_path}"),
+    ];
+    if let Some(port) = spec.port {
+        args.push("-p".to_string());
+        args.push(port.to_string());
+    }
+    args.push(spec.destination.clone());
+    args
+}
+
+fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b':' | b'@' | b'=')
+        });
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+/// The registry record of the forward nyet left running for one (destination,
+/// remote) pair. Deliberately a plain `key=value` text file: the last-resort
+/// discovery tool is `cat`, and this module owes nothing to serde (Д2).
+#[derive(Debug, PartialEq)]
+struct Entry {
+    /// The loopback port the forward listens on.
+    port: u16,
+    /// pid of the ControlMaster that owns the forward (from `ssh -O check`).
+    /// The ownership proof: a different pid means a different master, which
+    /// cannot be holding the forward this entry describes.
+    master_pid: u32,
+    /// Unix seconds at creation — only reported (age), never trusted.
+    created: u64,
+    /// The pair this entry belongs to, re-checked on read so a sanitized
+    /// file-name collision cannot hand us someone else's forward.
+    dest: String,
+    ssh_port: u16,
+    remote: String,
+}
+
+fn render_entry(e: &Entry) -> String {
+    format!(
+        "v=1\nport={}\npid={}\ncreated={}\ndest={}\nsshport={}\nremote={}\n",
+        e.port, e.master_pid, e.created, e.dest, e.ssh_port, e.remote
+    )
+}
+
+/// Parse a registry file. Any deviation (truncated write, future version,
+/// garbage) returns None, which means "do not reuse" — fail closed.
+fn parse_entry(text: &str) -> Option<Entry> {
+    let (mut port, mut pid, mut created, mut dest, mut ssh_port, mut remote) =
+        (None, None, None, None, None, None);
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "v" if value != "1" => return None,
+            "v" => {}
+            "port" => port = Some(value.parse().ok()?),
+            "pid" => pid = Some(value.parse().ok()?),
+            "created" => created = Some(value.parse().ok()?),
+            "dest" => dest = Some(value.to_string()),
+            "sshport" => ssh_port = Some(value.parse().ok()?),
+            "remote" => remote = Some(value.to_string()),
+            _ => return None,
+        }
+    }
+    Some(Entry {
+        port: port?,
+        master_pid: pid?,
+        created: created?,
+        dest: dest?,
+        ssh_port: ssh_port?,
+        remote: remote?,
+    })
+}
+
+/// One registry slot per pair. `@`/`:` become `_` so the name is a plain
+/// filename; the pair is stored *inside* the file as well, so a collision
+/// between two sanitized names is caught on read instead of trusted.
+fn registry_name(spec: &HostSpec, remote: &str) -> String {
+    let clean = |s: &str| s.replace(['@', ':'], "_");
+    format!(
+        "fwd-{}-{}-{}",
+        clean(&spec.destination),
+        ssh_port_of(spec),
+        clean(remote)
+    )
+}
+
+fn ssh_port_of(spec: &HostSpec) -> u16 {
+    spec.port.map_or(0, |p| p.get())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Open (creating if needed) and lock this pair's registry slot. `None` = run
+/// without reuse: no runtime dir, an unusable name, or a slot we could not lock.
+/// The file is 0600 in a 0700 directory — that ownership, not the file content,
+/// is what makes the record trustworthy.
+fn registry_slot(spec: &HostSpec, remote: &str) -> Option<File> {
+    let dir = control_dir()?;
+    let name = registry_name(spec, remote);
+    // Filenames are capped around 255 bytes; a pair that does not fit simply
+    // does not get reuse (the tunnel still works).
+    if name.len() > 200 {
+        return None;
+    }
+    create_private_dir(&dir).ok()?;
+    // The record is only worth trusting because only we can write it. If the
+    // directory is group/other-accessible (pre-created by someone else, a
+    // hijacked XDG_RUNTIME_DIR, a loose umask), do not reuse — run without it.
+    if !is_private_dir(&dir) {
+        return None;
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(dir.join(name)).ok()?;
+    lock_slot(&file).then_some(file)
+}
+
+/// Exclusive lock on the slot: two concurrent runs for the same pair must not
+/// both create a forward (that is the "at most one" invariant). The wait is
+/// bounded — a wedged holder must never hang the CLI; we give up and run without
+/// reuse, where the worst case is one extra forward that its master reaps.
+fn lock_slot(file: &File) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return true,
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            // A filesystem that cannot lock (or a real IO error): no reuse.
+            Err(std::fs::TryLockError::Error(_)) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Owner-only (`0700`-ish) and not a symlink? Belt to `create_private_dir`'s
+/// braces: the directory may already exist with someone else's idea of a mode.
+/// Non-unix has no mode bits to check — the registry is a unix-shaped feature.
+fn is_private_dir(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // symlink_metadata: a symlinked runtime dir points somewhere we did not
+        // vet, so it is not "ours" no matter what the target's mode says.
+        std::fs::symlink_metadata(dir)
+            .is_ok_and(|m| m.file_type().is_dir() && m.permissions().mode() & 0o077 == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        dir.is_dir()
+    }
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Is nothing listening on this loopback port? A successful bind means the
+/// forward that used to be here is gone. Cheap (no spawn, no traffic) and it
+/// sends nothing to whoever might be there.
+fn port_is_free(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Ask the master on this `ControlPath` for its pid. `None` = no master, or a
+/// reply we could not read — both mean "cannot prove ownership", so no reuse.
+fn master_pid(spec: &HostSpec, control_path: &str) -> Option<u32> {
+    let out = ssh_command()
+        .args(check_args(spec, control_path))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // OpenSSH prints "Master running (pid=12345)" — on stderr, but read both so
+    // the check does not depend on which stream a build chose.
+    parse_master_pid(&String::from_utf8_lossy(&out.stderr))
+        .or_else(|| parse_master_pid(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_master_pid(text: &str) -> Option<u32> {
+    let digits: String = text
+        .split("pid=")
+        .nth(1)?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// Open — or adopt — a local SSH forward and return a `Tunnel` guard. The engine
+/// connects to `127.0.0.1:<tunnel.local_port>`. `host`/`remote` are the config
+/// values (validated at config parse and re-checked here); `timeout_secs` is the
+/// per-query timeout, used to bound the connect; `reuse_forward` is the config
+/// owner's opt-out from keeping the forward between runs.
 pub fn open(
     host: &str,
     remote: &str,
     control_persist: &str,
     timeout_secs: u64,
+    reuse_forward: bool,
 ) -> Result<Tunnel, TunnelError> {
     // Parse everything to its canonical form ONCE, then build argv only from the
     // parsed values — validation and execution can't drift.
     let spec = parse_host(host)?;
     let remote = parse_remote(remote)?;
     let control_persist = parse_control_persist(control_persist)?;
-    let local_port = free_local_port()?;
     // Bound the connect so a blackholed bastion fails fast (min 1s; cap 10s so a
     // huge per-query timeout does not let the tunnel hang for minutes).
     let connect_timeout = timeout_secs.clamp(1, 10);
     match control_path() {
-        // Master mode: `-f` attaches the forward to the (reusable) master; the
-        // guard removes just this forward with `-O cancel` on drop.
-        Some(cp) => open_via_master(
-            &spec,
-            &remote,
-            &control_persist,
-            &cp,
-            connect_timeout,
-            local_port,
-            host,
-        ),
+        // Master mode: `-f` attaches the forward to the (reusable) master, which
+        // owns it and can keep it for the next run.
+        Some(cp) => {
+            let reuse = reuse_allowed(reuse_forward, &control_persist);
+            open_via_master(
+                &spec,
+                &remote,
+                &control_persist,
+                &cp,
+                connect_timeout,
+                host,
+                reuse,
+            )
+        }
         // Standalone mode: no master to reuse, so a foreground child owns the
         // forward and the guard kills it on drop.
         None => open_standalone(
@@ -361,10 +688,19 @@ pub fn open(
             &remote,
             &control_persist,
             connect_timeout,
-            local_port,
+            free_local_port()?,
             host,
         ),
     }
+}
+
+/// May the forward be kept for the next run? A kept forward has no TTL of its
+/// own — it dies with its master — so `ControlPersist=no`, the human asking for
+/// no background master, must not leave one behind either (with `-N` that master
+/// would never exit, and the forward would outlive everything). Pure: the one
+/// place the two settings meet.
+fn reuse_allowed(reuse_forward: bool, control_persist: &str) -> bool {
+    reuse_forward && !control_persist.eq_ignore_ascii_case("no")
 }
 
 fn open_via_master(
@@ -373,9 +709,18 @@ fn open_via_master(
     control_persist: &str,
     control_path: &str,
     connect_timeout: u64,
-    local_port: u16,
     host: &str,
+    reuse: bool,
 ) -> Result<Tunnel, TunnelError> {
+    // The registry slot is held (locked) for the whole create-or-adopt window:
+    // a concurrent run for the same pair waits and then adopts what we made.
+    let mut slot = reuse.then(|| registry_slot(spec, remote)).flatten();
+    if let Some(file) = slot.as_mut() {
+        if let Some(tunnel) = try_reuse(file, spec, remote, control_path) {
+            return Ok(tunnel);
+        }
+    }
+    let local_port = free_local_port()?;
     let args = ssh_args(
         spec,
         remote,
@@ -389,10 +734,79 @@ fn open_via_master(
     if !output.status.success() {
         return Err(ssh_failed(host, &String::from_utf8_lossy(&output.stderr)));
     }
+    // Record the forward so the next run can adopt it — but only if we can name
+    // the master that owns it. Without that pid the next run could not tell our
+    // forward from any other listener, so keeping it would be a liability: tear
+    // it down on drop instead (the pre-reuse behaviour).
+    if let Some(file) = slot.as_mut() {
+        if let Some(master_pid) = master_pid(spec, control_path) {
+            let entry = Entry {
+                port: local_port,
+                master_pid,
+                created: now_secs(),
+                dest: spec.destination.clone(),
+                ssh_port: ssh_port_of(spec),
+                remote: remote.to_string(),
+            };
+            if write_entry(file, &entry).is_ok() {
+                return Ok(Tunnel {
+                    local_port,
+                    reused: false,
+                    age_secs: Some(0),
+                    kill_command: Some(kill_command(spec, control_path)),
+                    teardown: Teardown::Keep,
+                });
+            }
+        }
+    }
     Ok(Tunnel {
         local_port,
+        reused: false,
+        age_secs: None,
+        kill_command: None,
         teardown: Teardown::Cancel(cancel_args(spec, remote, control_path, local_port)),
     })
+}
+
+/// Adopt the forward recorded for this pair, if it is provably still ours (the
+/// three conditions in the module lifecycle note). Anything unclear returns
+/// None: the caller then opens a fresh forward on a fresh random port.
+fn try_reuse(file: &mut File, spec: &HostSpec, remote: &str, control_path: &str) -> Option<Tunnel> {
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    let entry = parse_entry(&text)?;
+    // The record must describe *this* pair, whatever the file name says.
+    if entry.dest != spec.destination
+        || entry.ssh_port != ssh_port_of(spec)
+        || entry.remote != remote
+    {
+        return None;
+    }
+    // Cheapest first, and it needs no spawn: a free port means the forward died.
+    if port_is_free(entry.port) {
+        return None;
+    }
+    // Someone holds the port. Only "the same master that opened it is still
+    // alive" makes that someone provably our forward — credentials go nowhere
+    // until this matches.
+    if master_pid(spec, control_path)? != entry.master_pid {
+        return None;
+    }
+    Some(Tunnel {
+        local_port: entry.port,
+        reused: true,
+        age_secs: Some(now_secs().saturating_sub(entry.created)),
+        kill_command: Some(kill_command(spec, control_path)),
+        teardown: Teardown::Keep,
+    })
+}
+
+/// Rewrite the slot in place (we hold its lock). In place, not rename-over: a
+/// rename would swap the inode out from under a waiting run's lock.
+fn write_entry(file: &mut File, entry: &Entry) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(render_entry(entry).as_bytes())
 }
 
 fn open_standalone(
@@ -432,6 +846,9 @@ fn open_standalone(
         {
             return Ok(Tunnel {
                 local_port,
+                reused: false,
+                age_secs: None,
+                kill_command: None,
                 teardown: Teardown::Child(child),
             });
         }
@@ -501,7 +918,7 @@ fn control_path() -> Option<String> {
     if control_path_too_long(&path) {
         return None;
     }
-    std::fs::create_dir_all(&dir).ok()?;
+    create_private_dir(&dir).ok()?;
     Some(path.to_string_lossy().into_owned())
 }
 
@@ -523,10 +940,17 @@ fn control_dir() -> Option<PathBuf> {
 /// Grab a free TCP port by binding 127.0.0.1:0 and reading the assigned port,
 /// then release it for ssh to bind.
 ///
-/// ponytail: TOCTOU race between releasing this socket and ssh binding it — each
-/// run binds a fresh local port (master reuse removes the handshake, not the
-/// local bind), so the window exists on every call. It is tiny and a collision
-/// just fails the tunnel with a clear error; retry-on-EADDRINUSE if it ever bites.
+/// The port stays *random* on purpose — not for secrecy (any local process can
+/// enumerate loopback listeners), but because a port derived from the pair could
+/// be **pre**-captured: a squatter could sit on it before nyet ever runs, and
+/// hold it as a denial-of-service handle. A random port can only be raced in the
+/// instant it frees. The registry file (0700 dir, our uid) supplies the identity
+/// a derived port would have given.
+///
+/// ponytail: TOCTOU race between releasing this socket and ssh binding it. With
+/// forward reuse the window is now paid once per forward rather than once per
+/// call. It is tiny and a collision just fails the tunnel with a clear error;
+/// retry-on-EADDRINUSE if it ever bites.
 fn free_local_port() -> Result<u16, TunnelError> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| TunnelError {
         message: format!("could not reserve a local port for the SSH tunnel: {e}"),
@@ -714,6 +1138,139 @@ mod tests {
         )));
         let deep = format!("/{}/nyet/cm-%C", "a".repeat(90));
         assert!(control_path_too_long(std::path::Path::new(&deep)));
+    }
+
+    #[test]
+    fn reuse_needs_both_the_opt_in_and_a_persistent_master() {
+        assert!(reuse_allowed(true, "15m"));
+        assert!(reuse_allowed(true, "yes"));
+        // The opt-out, and the "no background master" setting that implies it —
+        // a `-N` master with ControlPersist=no never exits, so a forward kept
+        // behind it would have no TTL at all.
+        assert!(!reuse_allowed(false, "15m"));
+        assert!(!reuse_allowed(true, "no"));
+        assert!(!reuse_allowed(true, "NO"));
+    }
+
+    #[test]
+    fn check_args_ask_the_master_on_this_control_path() {
+        let spec = parse_host("deploy@bastion.corp:22").unwrap();
+        let args = check_args(&spec, "/run/user/1000/nyet/cm-%C");
+        assert!(args.windows(2).any(|w| w == ["-O", "check"]));
+        assert!(args.contains(&"ControlPath=/run/user/1000/nyet/cm-%C".to_string()));
+        assert!(args.windows(2).any(|w| w == ["-p", "22"]));
+        assert_eq!(args.last().unwrap(), "deploy@bastion.corp");
+    }
+
+    #[test]
+    fn master_pid_is_read_from_the_check_reply() {
+        assert_eq!(
+            parse_master_pid("Master running (pid=12345)\r\n"),
+            Some(12345)
+        );
+        // Anything else is "cannot prove ownership" -> no reuse (fail closed).
+        for junk in [
+            "",
+            "Control socket connect(/x): No such file or directory",
+            "Master running (pid=)",
+            "Master running (pid=abc)",
+        ] {
+            assert_eq!(parse_master_pid(junk), None, "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn registry_entry_round_trips_and_fails_closed_on_junk() {
+        let entry = Entry {
+            port: 54321,
+            master_pid: 12345,
+            created: 1_753_600_000,
+            dest: "deploy@bastion.corp".to_string(),
+            ssh_port: 22,
+            remote: "db.internal:5432".to_string(),
+        };
+        assert_eq!(parse_entry(&render_entry(&entry)), Some(entry));
+        // A truncated write, a future format, an unknown key, a bad number:
+        // every one of them means "do not adopt that forward".
+        for junk in [
+            "",
+            "v=1\nport=54321\n",
+            "v=2\nport=1\npid=1\ncreated=1\ndest=a\nsshport=0\nremote=b:1\n",
+            "v=1\nport=1\npid=1\ncreated=1\ndest=a\nsshport=0\nremote=b:1\nextra=x\n",
+            "v=1\nport=99999\npid=1\ncreated=1\ndest=a\nsshport=0\nremote=b:1\n",
+            "garbage",
+        ] {
+            assert_eq!(parse_entry(junk), None, "{junk:?}");
+        }
+    }
+
+    /// The registry slot is per (destination, ssh port, remote) — that pair IS
+    /// the "at most one forward" key.
+    #[test]
+    fn registry_name_is_one_slot_per_pair() {
+        let name = |host: &str, remote: &str| {
+            registry_name(&parse_host(host).unwrap(), &parse_remote(remote).unwrap())
+        };
+        assert_eq!(
+            name("deploy@bastion.corp:22", "db.internal:5432"),
+            "fwd-deploy_bastion.corp-22-db.internal_5432"
+        );
+        // Same pair -> same slot; a different bastion, ssh port or remote -> a
+        // different slot (one forward each).
+        assert_eq!(
+            name("deploy@bastion.corp:22", "db.internal:5432"),
+            name("  deploy@bastion.corp:22 ", "db.internal:5432 ")
+        );
+        for other in [
+            name("deploy@bastion.corp:2222", "db.internal:5432"),
+            name("other@bastion.corp:22", "db.internal:5432"),
+            name("deploy@bastion.corp:22", "db.internal:5433"),
+            name("deploy@bastion.corp", "db.internal:5432"),
+        ] {
+            assert_ne!(name("deploy@bastion.corp:22", "db.internal:5432"), other);
+        }
+    }
+
+    /// The cleanup command must be `-O exit`, never the surgical `-O cancel`:
+    /// cancelling one forward leaves the master alive, and that is exactly the
+    /// state in which adoption cannot tell our freed port from a stranger's.
+    #[test]
+    fn kill_command_kills_the_master_not_just_the_forward() {
+        let spec = parse_host("deploy@bastion.corp:22").unwrap();
+        let cmd = kill_command(&spec, "/run/user/1000/nyet/cm-%C");
+        assert_eq!(
+            cmd,
+            "ssh -O exit -o 'ControlPath=/run/user/1000/nyet/cm-%C' -p 22 deploy@bastion.corp"
+        );
+        assert!(!cmd.contains("cancel"));
+        // A HOME with a space must not produce a command that breaks apart.
+        let with_space = kill_command(&spec, "/Users/a b/.ssh/nyet/cm-%C");
+        assert!(with_space.contains("'ControlPath=/Users/a b/.ssh/nyet/cm-%C'"));
+    }
+
+    #[test]
+    fn private_dir_check_rejects_a_shared_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("nyet-dirtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        create_private_dir(&tmp).unwrap();
+        assert!(is_private_dir(&tmp), "a dir we created must be private");
+        // Someone else's mode (or a loose umask) -> no reuse.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!is_private_dir(&tmp));
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(!is_private_dir(&tmp), "a missing dir is not private");
+    }
+
+    #[test]
+    fn port_is_free_detects_a_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Occupied while the listener lives, free once it is dropped: this is
+        // the "is the forward still there" probe, and it sends nothing.
+        assert!(!port_is_free(port));
+        drop(listener);
+        assert!(port_is_free(port));
     }
 
     #[test]

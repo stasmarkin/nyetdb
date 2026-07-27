@@ -24,9 +24,9 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::process::{Command, Output};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 use testcontainers_modules::postgres::Postgres as PgImage;
 use testcontainers_modules::testcontainers::core::{
@@ -50,12 +50,39 @@ fn multi_thread_rt() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+/// A SHORT runtime dir for nyet's ControlPath and forward registry. Without it
+/// nyet falls back to `ControlPath=none`: on macOS `TMPDIR=/var/folders/...`
+/// makes `<home>/.ssh/nyet/cm-%C` blow the unix-socket path limit, so the whole
+/// persistent-master path (and with it forward reuse) would not be exercised
+/// locally at all (on a Linux CI with `TMPDIR=/tmp` it fits, so coverage there
+/// depended on the runner's temp dir — exactly the kind of silent difference
+/// this pins down).
+///
+/// Keyed by the test's own tempdir name, not by pid: the tests run in parallel
+/// threads of one binary, and a shared pid-keyed dir meant one test could remove
+/// the directory the other was still using. 0700 because `/tmp` is world
+/// writable — nyet itself now refuses to reuse a forward recorded in a directory
+/// anyone else can reach.
+fn runtime_dir(home: &Path) -> PathBuf {
+    let dir = PathBuf::from(format!(
+        "/tmp/nyt{}",
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .unwrap();
+    dir
+}
+
 /// Run the binary with a clean environment plus HOME, the password env var, and
 /// a PATH whose first entry (`bin_dir`) holds the ssh shim.
 fn run(home: &Path, bin_dir: &Path, cfg: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_nyet"))
         .env_clear()
         .env("HOME", home)
+        .env("XDG_RUNTIME_DIR", runtime_dir(home))
         .env(PW_ENV, PW)
         .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
         .current_dir(home)
@@ -120,13 +147,15 @@ fn setup_ssh_shim(dir: &Path) -> std::path::PathBuf {
     let shim = bin.join("ssh");
     // Dump this ssh invocation's environment (before exec, so it is exactly the
     // env nyet handed to the ssh child) so the test can prove the DB password
-    // was stripped. `exec` is kept so nyet's Child handle is ssh itself (kill
-    // works, no orphan).
+    // was stripped, and append the argv to a log so the test can count what nyet
+    // actually spawned (the reuse proof). `exec` is kept so nyet's Child handle
+    // is ssh itself (kill works, no orphan).
     std::fs::write(
         &shim,
         format!(
-            "#!/bin/sh\nenv > {dump}\nexec {ssh} -F {cfg} \"$@\"\n",
+            "#!/bin/sh\nenv > {dump}\necho \"$@\" >> {log}\nexec {ssh} -F {cfg} \"$@\"\n",
             dump = dir.join("ssh_env_dump").display(),
+            log = dir.join("ssh_spawn_log").display(),
             ssh = real_ssh(),
             cfg = cfg.display(),
         ),
@@ -136,10 +165,15 @@ fn setup_ssh_shim(dir: &Path) -> std::path::PathBuf {
     bin
 }
 
-fn write_config(dir: &Path, ssh_port: u16, pg_name: &str) -> std::path::PathBuf {
-    let path = dir.join("config.toml");
+/// `name` keeps several configs for the same pair side by side (they differ only
+/// in `extra`, e.g. `reuse_forward = false`).
+fn write_config(dir: &Path, name: &str, ssh_port: u16, pg_name: &str, extra: &str) -> PathBuf {
+    let path = dir.join(name);
     // The url host/port are placeholders — the tunnel overrides them to the
     // local forward; the user (postgres) and dbname (postgres) are kept.
+    // control_persist is long enough that the master (and with it the kept
+    // forward) survives between the runs this test makes; the test kills it at
+    // the end rather than waiting it out.
     std::fs::write(
         &path,
         format!(
@@ -149,12 +183,74 @@ fn write_config(dir: &Path, ssh_port: u16, pg_name: &str) -> std::path::PathBuf 
              [connections.pg.ssh]\n\
              host = \"nyet@127.0.0.1:{ssh_port}\"\n\
              remote = \"{pg_name}:5432\"\n\
-             control_persist = \"5s\"\n",
+             control_persist = \"90s\"\n{extra}",
             dir.display(),
         ),
     )
     .unwrap();
     path
+}
+
+/// The loopback ports of every live `ssh` forward to this database, read from
+/// the process table (`-L 127.0.0.1:<port>:<pg>:5432`). This is the invariant's
+/// measuring stick: "at most one forward per (bastion, remote) pair".
+fn live_forward_ports(pg_name: &str) -> Vec<u16> {
+    let out = Command::new("ps").args(["-Aww", "-o", "args="]).output();
+    let table = out.map(|o| stdout(&o)).unwrap_or_default();
+    let needle = format!(":{pg_name}:5432");
+    let mut ports: Vec<u16> = table
+        .lines()
+        .filter(|l| l.contains(&needle) && l.contains("ssh"))
+        .filter_map(|l| {
+            l.split_whitespace()
+                .find(|w| w.starts_with("127.0.0.1:") && w.ends_with(&needle))
+                .and_then(|w| w.split(':').nth(1)?.parse().ok())
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// Remove every live forward to this database (that also takes its master with
+/// it) and wait until the process table agrees.
+fn kill_forwards(pg_name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let ports = live_forward_ports(pg_name);
+        if ports.is_empty() {
+            return;
+        }
+        for port in ports {
+            let _ = Command::new("pkill")
+                .args(["-f", &format!("127.0.0.1:{port}:{pg_name}:5432")])
+                .status();
+        }
+        assert!(Instant::now() < deadline, "forwards outlived pkill");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Every `ssh` argv nyet spawned since the log was last truncated.
+fn spawn_log(home: &Path) -> Vec<String> {
+    std::fs::read_to_string(home.join("ssh_spawn_log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn reset_spawn_log(home: &Path) {
+    std::fs::write(home.join("ssh_spawn_log"), "").unwrap();
+}
+
+/// nyet's registry slot for this pair (the file that makes the one forward
+/// discoverable). Mirrors `tunnel::registry_name` — if that naming changes, this
+/// test stops finding the file and the reuse assertions fail loudly.
+fn registry_path(home: &Path, ssh_port: u16, pg_name: &str) -> PathBuf {
+    runtime_dir(home)
+        .join("nyet")
+        .join(format!("fwd-nyet_127.0.0.1-{ssh_port}-{pg_name}_5432"))
 }
 
 /// Poll until a *fresh* (no ControlMaster) `-L` forward through the bastion
@@ -324,7 +420,7 @@ fn ssh_tunnel_query_end_to_end() {
         // is not instant, so the first attempt can hit `AllowTcpForwarding no`
         // still in effect and fail with exit 6 (ExitOnForwardFailure). Back off
         // until forwarding is live.
-        let cfg = write_config(home.path(), ssh_port, &pg_name);
+        let cfg = write_config(home.path(), "config.toml", ssh_port, &pg_name, "");
         let deadline = Instant::now() + Duration::from_secs(30);
         let out = loop {
             let out = run(
@@ -365,36 +461,238 @@ fn ssh_tunnel_query_end_to_end() {
             "ssh child inherited the DB password: {ssh_env}"
         );
 
-        // No forward accumulation: each `nyet query` tears its forward down on
-        // exit (guard Drop kill+wait). Assert no ssh process is left holding a
-        // forward to the db. Poll (not an instant assert): nyet reaps its own
-        // child synchronously, but the `wait_for_forwarding` probes were pkilled
-        // (async) and the OS teardown of a killed process on a loaded runner is
-        // not instantaneous — wait for it, then assert. A real leak never
-        // reaches 0 and still fails.
-        let count_forwards = || {
-            let out = Command::new("pgrep")
-                .args(["-f", &format!("{pg_name}:5432")])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).lines().count()
-        };
-        let assert_no_forwards = |ctx: &str| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while count_forwards() != 0 {
-                assert!(
-                    Instant::now() < deadline,
-                    "{ctx}: an ssh forward is still present after 5s (leak)"
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        };
-        assert_no_forwards("before the repeat runs");
-        for _ in 0..3 {
+        // ---- THE INVARIANT: at most one forward per (bastion, remote) pair ----
+        //
+        // The forward now OUTLIVES the process (that is the point: the next call
+        // spawns no ssh to set it up). What must never grow is the number of
+        // forwards. Both halves are asserted: the spawn log proves reuse really
+        // happened (5 calls, one `ssh -f -N -L`), the process table proves
+        // exactly one forward exists. Remove the reuse validation in tunnel.rs
+        // and this fails twice over: 5 creations logged and 5 live forwards.
+        let creations = |log: &[String]| log.iter().filter(|l| l.starts_with("-f ")).count();
+        kill_forwards(&pg_name);
+        reset_spawn_log(home.path());
+        for i in 0..5 {
             let out = run(home.path(), &bin_dir, &cfg, &["query", "pg", "SELECT 1"]);
-            assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-            assert_no_forwards("after a query");
+            assert_eq!(out.status.code(), Some(0), "run {i}: {}", stderr(&out));
         }
+        let log = spawn_log(home.path());
+        assert_eq!(
+            creations(&log),
+            1,
+            "5 runs must open the forward once and adopt it after that: {log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|l| l.contains("-O check")).count(),
+            5,
+            "each adopting run must verify the master that owns the forward: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("-O cancel")),
+            "a kept forward must not be cancelled on exit: {log:?}"
+        );
+        let kept = live_forward_ports(&pg_name);
+        assert_eq!(
+            kept.len(),
+            1,
+            "exactly one forward may exist for the pair, found {kept:?}"
+        );
+        // ...and it is discoverable: the registry names the very port that is up.
+        let slot = std::fs::read_to_string(registry_path(home.path(), ssh_port, &pg_name)).unwrap();
+        assert!(
+            slot.contains(&format!("port={}", kept[0])),
+            "registry must record the live forward: {slot}"
+        );
+
+        // The invariant holds under a race too: three agents firing at once must
+        // still produce one forward. The registry slot is locked for the whole
+        // create-or-adopt window, so the losers wait and then adopt.
+        kill_forwards(&pg_name);
+        reset_spawn_log(home.path());
+        let racers: Vec<_> = (0..3)
+            .map(|_| {
+                Command::new(env!("CARGO_BIN_EXE_nyet"))
+                    .env_clear()
+                    .env("HOME", home.path())
+                    .env("XDG_RUNTIME_DIR", runtime_dir(home.path()))
+                    .env(PW_ENV, PW)
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+                    .current_dir(home.path())
+                    .args(["query", "pg", "SELECT 1", "--config"])
+                    .arg(&cfg)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for mut racer in racers {
+            assert!(racer.wait().unwrap().success(), "a concurrent run failed");
+        }
+        assert_eq!(
+            creations(&spawn_log(home.path())),
+            1,
+            "concurrent runs must not each open their own forward"
+        );
+        assert_eq!(live_forward_ports(&pg_name).len(), 1);
+        // Every ssh spawn — including the `-O check` of the adopting runs — got a
+        // sanitized environment. The dump is overwritten per spawn, so this reads
+        // the LAST one, which is an adopting run's check, not the first `-L`.
+        let ssh_env = std::fs::read_to_string(home.path().join("ssh_env_dump")).unwrap();
+        assert!(
+            !ssh_env.contains(PW) && !ssh_env.contains(PW_ENV),
+            "an ssh child inherited the DB password: {ssh_env}"
+        );
+
+        // ---- A forward cancelled from outside is not adopted ----
+        //
+        // The discriminating case for "is the port still occupied": remove just
+        // the forward (`ssh -O cancel`) and leave the master alive, so the pid
+        // check would still pass. The next run must notice the free port and
+        // rebuild. Drop that check and nyet reuses a port nothing listens on.
+        let live = live_forward_ports(&pg_name);
+        assert_eq!(live.len(), 1);
+        let master_socket = std::fs::read_dir(runtime_dir(home.path()).join("nyet"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("cm-"))
+            })
+            .expect("the master's ControlPath socket must be there");
+        let cancelled = Command::new(format!("{}/ssh", bin_dir.display()))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+            .args(["-O", "cancel", "-L"])
+            .arg(format!("127.0.0.1:{}:{pg_name}:5432", live[0]))
+            .arg("-o")
+            .arg(format!("ControlPath={}", master_socket.display()))
+            .args(["-p", &ssh_port.to_string(), "nyet@127.0.0.1"])
+            .status()
+            .unwrap();
+        assert!(
+            cancelled.success(),
+            "the stand could not cancel the forward"
+        );
+        assert!(
+            TcpListener::bind(("127.0.0.1", live[0])).is_ok(),
+            "the cancelled forward still holds its port"
+        );
+        reset_spawn_log(home.path());
+        let out = run(home.path(), &bin_dir, &cfg, &["query", "pg", "SELECT 1"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(
+            creations(&spawn_log(home.path())),
+            1,
+            "a forward that is gone must be rebuilt, not reused"
+        );
+        assert_eq!(live_forward_ports(&pg_name).len(), 1);
+
+        // ---- A stranger on the recorded port never gets the credentials ----
+        //
+        // Point the registry at a port held by somebody else (pid=1 is not the
+        // master that opened anything). nyet must refuse to adopt it: the query
+        // succeeds through a NEW forward, and the impostor sees no connection at
+        // all — no bytes, hence no password. Drop the pid check and this fails:
+        // nyet would hand the impostor the Postgres handshake.
+        let impostor = TcpListener::bind("127.0.0.1:0").unwrap();
+        let impostor_port = impostor.local_addr().unwrap().port();
+        std::fs::write(
+            registry_path(home.path(), ssh_port, &pg_name),
+            format!(
+                "v=1\nport={impostor_port}\npid=1\ncreated=1\ndest=nyet@127.0.0.1\n\
+                 sshport={ssh_port}\nremote={pg_name}:5432\n"
+            ),
+        )
+        .unwrap();
+        reset_spawn_log(home.path());
+        let out = run(home.path(), &bin_dir, &cfg, &["query", "pg", "SELECT 1"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        impostor.set_nonblocking(true).unwrap();
+        assert!(
+            impostor.accept().is_err(),
+            "nyet connected to a listener it could not prove was its own forward"
+        );
+        assert_eq!(
+            creations(&spawn_log(home.path())),
+            1,
+            "an unverifiable entry must be replaced by a fresh forward"
+        );
+
+        // ---- A dead master is not a database error ----
+        //
+        // Kill the master that owns the forward (SIGTERM, like a reboot of the
+        // laptop's ssh or an `ssh -O exit` by hand). The registry entry is now
+        // stale; the next run must notice (the port is free again) and rebuild
+        // the tunnel rather than fail or, worse, report success.
+        assert_eq!(live_forward_ports(&pg_name).len(), 1);
+        kill_forwards(&pg_name);
+        reset_spawn_log(home.path());
+        let out = run(home.path(), &bin_dir, &cfg, &["query", "pg", "SELECT 1"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "a dead master must be rebuilt, not reported as a failure: {}",
+            stdout(&out)
+        );
+        assert_eq!(creations(&spawn_log(home.path())), 1);
+        assert_eq!(live_forward_ports(&pg_name).len(), 1);
+
+        // ---- `reuse_forward = false` keeps the old behaviour ----
+        //
+        // The opt-out must leave nothing new behind: the forward it opens is
+        // cancelled on exit, so the live set is unchanged by the run.
+        let before = live_forward_ports(&pg_name);
+        let no_reuse = write_config(
+            home.path(),
+            "no-reuse.toml",
+            ssh_port,
+            &pg_name,
+            "reuse_forward = false\n",
+        );
+        reset_spawn_log(home.path());
+        let out = run(
+            home.path(),
+            &bin_dir,
+            &no_reuse,
+            &["query", "pg", "SELECT 1"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let log = spawn_log(home.path());
+        assert!(
+            log.iter().any(|l| l.contains("-O cancel")),
+            "reuse_forward = false must cancel its own forward: {log:?}"
+        );
+        assert_eq!(
+            live_forward_ports(&pg_name),
+            before,
+            "reuse_forward = false must not leave a forward behind"
+        );
+
+        // ---- doctor shows the forward and how to kill it ----
+        let out = run(
+            home.path(),
+            &bin_dir,
+            &cfg,
+            &["doctor", "pg", "--format", "json"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        let forward = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "ssh_forward")
+            .expect("doctor must report the ssh forward");
+        let message = forward["message"].as_str().unwrap();
+        assert!(
+            message.contains("ssh -O exit") && message.contains("127.0.0.1:"),
+            "doctor must print the command that removes the forward: {message}"
+        );
+
+        // Leave no forward (and no master) behind for the next test / the human.
+        kill_forwards(&pg_name);
+        let _ = std::fs::remove_dir_all(runtime_dir(home.path()));
 
         // Async Drop must run inside the runtime.
         bastion.rm().await.unwrap();
@@ -439,4 +737,5 @@ fn ssh_tunnel_failure_is_exit_6() {
     assert_eq!(v["error"]["code"], "CONNECTION_FAILED");
     // The hint must be actionable (Д10).
     assert!(!v["error"]["hint"].as_str().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(runtime_dir(home.path()));
 }

@@ -707,9 +707,9 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     false => guardrail::Guardrail::OFF,
                 };
                 // The tunnel is opened AFTER the validator (a refused query exits 5
-                // without paying for ssh) and torn down when the guard drops, so
-                // forwards never accumulate. Fetch limit+1 to detect truncation
-                // without reading everything.
+                // without paying for ssh); the guard decides on drop whether the
+                // forward is kept for the next run or removed (see tunnel.rs).
+                // Fetch limit+1 to detect truncation without reading everything.
                 let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
                 let ((outcome, masked), duration_ms) = run_db(
                     redact_db_errors,
@@ -1108,7 +1108,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                         .pairs()
                         .map(|(t, c)| (t.to_string(), c.to_string()))
                         .collect();
-                    let (mut diagnosis, duration_ms) =
+                    let (mut diagnosis, duration_ms, forward) =
                         diagnose_connection(conn, timeout_secs, &mut db, &pii_pairs)?;
                     // doctor never goes through run_db/engine_failure, so the
                     // redaction has to be applied to the FACTS it collected:
@@ -1122,6 +1122,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                         engine: engine_kind(&conn.engine),
                         diagnosis,
                         transport: doctor_transport(conn),
+                        forward,
                         permissions,
                         pii_mode: (!pii.is_empty()).then(|| pii.mode().as_str()),
                     };
@@ -1603,8 +1604,9 @@ fn build_engine(
 /// Open the SSH tunnel (if the connection has one) and point the engine at its
 /// local end. A tunnel failure is CONNECTION_FAILED (exit 6). sqlite + ssh was
 /// already rejected at config parse, so only the server engines reach here.
-/// The returned guard tears the forward down on drop — the caller holds it for
-/// the whole database operation.
+/// The caller holds the returned guard for the whole database operation; what
+/// its drop does (keep the forward for the next run, cancel it, kill the child)
+/// is tunnel.rs's business.
 fn open_tunnel(
     conn: &config::Connection,
     timeout_secs: u64,
@@ -1626,7 +1628,11 @@ fn open_tunnel(
         .as_deref()
         .expect("ssh remote validated non-empty at config parse");
     let control_persist = ssh.control_persist.as_deref().unwrap_or("15m");
-    let tunnel = tunnel::open(host, remote, control_persist, timeout_secs)
+    // Default on: reuse is the whole point (it removes two ssh spawns per call),
+    // the forward's life is already bounded by ControlPersist, and doctor shows
+    // it plus the command that kills it. `reuse_forward = false` opts out.
+    let reuse_forward = ssh.reuse_forward.unwrap_or(true);
+    let tunnel = tunnel::open(host, remote, control_persist, timeout_secs, reuse_forward)
         .map_err(|e| Failure::new(ErrorCode::ConnectionFailed, e.message, e.hint))?;
     db.set_host_override(("127.0.0.1".to_string(), tunnel.local_port));
     Ok(Some(tunnel))
@@ -1798,7 +1804,7 @@ fn diagnose_connection(
     timeout_secs: u64,
     db: &mut Db,
     pii: &[(String, String)],
-) -> Result<(output::Diagnosis, u64), Failure> {
+) -> Result<(output::Diagnosis, u64, Option<output::ForwardFact>), Failure> {
     let started = Instant::now();
     let elapsed =
         |started: Instant| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1815,14 +1821,23 @@ fn diagnose_connection(
                     pii: Vec::new(),
                 },
                 elapsed(started),
+                None,
             ));
         }
     };
+    // Read the forward's facts while the guard is alive; doctor reports them so
+    // a forward that outlives the process is visible and killable, not folklore.
+    let forward = _tunnel.as_ref().map(|t| output::ForwardFact {
+        local_port: t.local_port,
+        reused: t.reused,
+        age_secs: t.age_secs,
+        kill_command: t.kill_command.clone(),
+    });
     let rt = runtime()?;
     let diagnosis = rt.block_on(db.diagnose(pii));
     // A slow/abandoned probe future must not join a busy worker on exit.
     rt.shutdown_background();
-    Ok((diagnosis, elapsed(started)))
+    Ok((diagnosis, elapsed(started), forward))
 }
 
 /// Static transport check for the INSECURE_TRANSPORT warning: a direct (no ssh)

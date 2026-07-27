@@ -922,10 +922,24 @@ pub enum Permissions {
 
 /// Everything `doctor_checks` needs: engine facts plus the two the cli computes
 /// without the database (transport guarantee, config-file permissions).
+/// What the SSH tunnel left behind, when the connection has one. Gathered by the
+/// cli from the live `Tunnel` guard.
+pub struct ForwardFact {
+    pub local_port: u16,
+    /// The forward was already there — this run spawned no `ssh` to set it up.
+    pub reused: bool,
+    /// Age of the forward, when it is one that outlives the process.
+    pub age_secs: Option<u64>,
+    /// The command that removes it; `None` when nothing is left behind.
+    pub kill_command: Option<String>,
+}
+
 pub struct DoctorInput {
     pub engine: EngineKind,
     pub diagnosis: Diagnosis,
     pub transport: Transport,
+    /// `None` when the connection has no `[ssh]` section (no check emitted).
+    pub forward: Option<ForwardFact>,
     pub permissions: Permissions,
     /// Whether the connection has a `[pii]` policy at all, and in which mode —
     /// config, so the cli computes it (the engine only reports privileges).
@@ -989,9 +1003,51 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
     .into_iter()
     // Only when there IS a policy: a check that reports `na` on every
     // connection without `[pii]` is pure noise in the common case (UX-4).
+    .chain(input.forward.as_ref().map(ssh_forward_check))
     .chain(input.pii_mode.map(|mode| pii_columns_check(input, mode)))
     .chain([permissions_check(&input.permissions)])
     .collect()
+}
+
+/// What the tunnel left running, and how to get rid of it. A forward that
+/// outlives the process is the deal that makes the next call cheap, so it is
+/// `ok` — but an `ok` that names the port, its age and the exact removal command,
+/// because "it is discoverable" is an empty word without a way to look and kill
+/// (UX-7).
+fn ssh_forward_check(f: &ForwardFact) -> DoctorCheck {
+    let Some(kill) = &f.kill_command else {
+        return ok_check(
+            "ssh_forward",
+            format!(
+                "the SSH forward on 127.0.0.1:{} is removed when this command exits, so every \
+                 call pays two ssh spawns to set it up and take it down (reuse_forward = false, \
+                 control_persist = \"no\", or no reusable ControlMaster here)",
+                f.local_port
+            ),
+        );
+    };
+    let state = match (f.reused, f.age_secs) {
+        (true, Some(age)) => format!("reused, opened {} ago", human_age(age)),
+        (true, None) => "reused".to_string(),
+        (false, _) => "opened by this command".to_string(),
+    };
+    ok_check(
+        "ssh_forward",
+        format!(
+            "the SSH forward on 127.0.0.1:{} ({state}) is kept for the next `nyet` call and dies \
+             with its ControlMaster (control_persist); while it lives, any local process can \
+             reach the database through that loopback port. Remove it now with: {kill}",
+            f.local_port
+        ),
+    )
+}
+
+fn human_age(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h", s / 3600),
+    }
 }
 
 /// Are the columns the config marks as PII actually out of the role's reach?
@@ -2061,6 +2117,7 @@ mod tests {
                     probe: ProbeFact::Wrote { orphan: None },
                 }),
             },
+            forward: None,
             transport: Transport::InsecureDirect,
             permissions: Permissions::Loose("mode 644".into()),
         };
@@ -2088,6 +2145,62 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("CREATE ROLE nyet_ro"));
+    }
+
+    /// A forward that outlives the process is only acceptable if the human can
+    /// see it and kill it: the check must name the port, say whether it was
+    /// reused and how old it is, and carry the literal removal command. Without
+    /// an `[ssh]` section there is no check at all (UX-4: no `na` noise).
+    #[test]
+    fn doctor_ssh_forward_is_visible_and_killable() {
+        let input = |forward| DoctorInput {
+            pii_mode: None,
+            engine: EngineKind::Postgres,
+            diagnosis: Diagnosis {
+                pii: Vec::new(),
+                connect: ConnectFact::Ok { via_tunnel: true },
+                server: None,
+            },
+            transport: Transport::Tunnel,
+            forward,
+            permissions: Permissions::Na,
+        };
+        assert!(!doctor_checks(&input(None))
+            .iter()
+            .any(|c| c.name == "ssh_forward"));
+
+        let kept = doctor_checks(&input(Some(ForwardFact {
+            local_port: 54321,
+            reused: true,
+            age_secs: Some(600),
+            kill_command: Some("ssh -O cancel -L 127.0.0.1:54321:db:5432 bastion".to_string()),
+        })));
+        let check = by(&kept, "ssh_forward");
+        assert_eq!(check.status, CheckStatus::Ok);
+        for part in [
+            "127.0.0.1:54321",
+            "reused, opened 10m ago",
+            "ssh -O cancel -L 127.0.0.1:54321:db:5432 bastion",
+        ] {
+            assert!(
+                check.message.contains(part),
+                "missing {part}: {}",
+                check.message
+            );
+        }
+
+        // Nothing left behind: say so, and do not offer a command that would
+        // then be a lie.
+        let ephemeral = doctor_checks(&input(Some(ForwardFact {
+            local_port: 40000,
+            reused: false,
+            age_secs: None,
+            kill_command: None,
+        })));
+        let check = by(&ephemeral, "ssh_forward");
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("removed when this command exits"));
+        assert!(!check.message.contains("ssh -O cancel"));
     }
 
     /// The `pii_columns` check is honest in all four directions (UX-7): no
@@ -2120,6 +2233,7 @@ mod tests {
                     },
                 }),
             },
+            forward: None,
             transport: Transport::TlsDirect,
             permissions: Permissions::Secure,
         };
@@ -2197,6 +2311,7 @@ mod tests {
                     },
                 }),
             },
+            forward: None,
             transport: Transport::TlsDirect,
             permissions: Permissions::Secure,
         };
@@ -2236,6 +2351,7 @@ mod tests {
                         },
                     }),
                 },
+                forward: None,
                 transport: Transport::TlsDirect,
                 permissions: Permissions::Secure,
             };
@@ -2271,6 +2387,7 @@ mod tests {
                     },
                 }),
             },
+            forward: None,
             transport: Transport::TlsDirect,
             permissions: Permissions::Secure,
         };
@@ -2306,6 +2423,7 @@ mod tests {
                     },
                 }),
             },
+            forward: None,
             transport: Transport::InsecureDirect,
             permissions: Permissions::Secure,
         };
@@ -2332,6 +2450,7 @@ mod tests {
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: None,
             },
+            forward: None,
             transport: Transport::Na,
             permissions: Permissions::Secure,
         };
@@ -2359,6 +2478,7 @@ mod tests {
                 },
                 server: None,
             },
+            forward: None,
             transport: Transport::InsecureDirect,
             permissions: Permissions::Secure,
         };

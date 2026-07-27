@@ -131,6 +131,12 @@ pub struct Ssh {
     pub host: Option<String>,
     pub remote: Option<String>,
     pub control_persist: Option<String>,
+    /// Keep the `-L` forward alive between runs so the next `nyet` call spawns
+    /// no `ssh` at all (default true; see tunnel.rs for the invariant that makes
+    /// adopting a forward safe). `false` restores the pre-0.1 behaviour: the
+    /// forward is removed when the command exits, and every call pays two ssh
+    /// spawns for it.
+    pub reuse_forward: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -945,6 +951,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// `reuse_forward` is optional and boolean; absent means the default (keep
+    /// the forward) — an existing config keeps parsing byte for byte (UX-5).
+    #[test]
+    fn reuse_forward_is_optional_and_boolean() {
+        let cfg = |extra: &str| {
+            format!(
+                "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+                 [connections.a.ssh]\nhost = \"bastion:22\"\nremote = \"db:5432\"\n{extra}"
+            )
+        };
+        let ssh = |text: &str| {
+            let c = parse(text, &env_of(&[])).unwrap();
+            c.connections["a"].ssh.as_ref().unwrap().reuse_forward
+        };
+        assert_eq!(ssh(&cfg("")), None);
+        assert_eq!(ssh(&cfg("reuse_forward = false\n")), Some(false));
+        assert_eq!(ssh(&cfg("reuse_forward = true\n")), Some(true));
+        // Not a bool, and a typo'd key: both are config errors (fail fast).
+        assert!(parse(&cfg("reuse_forward = \"yes\"\n"), &env_of(&[])).is_err());
+        assert!(parse(&cfg("reuse_forwards = true\n"), &env_of(&[])).is_err());
     }
 
     #[test]

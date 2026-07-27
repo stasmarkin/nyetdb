@@ -137,6 +137,7 @@ max_rows = 10000000                    # rows mode
 host = "deploy@bastion.corp:22"     # [user@]bastion[:port]
 remote = "db.internal:5432"         # host:port to forward to, as seen from the bastion
 control_persist = "15m"             # optional; default 15m
+reuse_forward = true                # optional; default true — keep the forward between runs
 
 [connections.analytics]
 engine = "mariadb"                     # or "mysql" — same driver/dialect
@@ -562,6 +563,7 @@ connection:
 host = "deploy@bastion.corp:22"     # [user@]bastion[:port]; port defaults to 22
 remote = "db.internal:5432"         # the db host:port as resolved from the bastion
 control_persist = "15m"             # optional (default 15m); see reuse below
+reuse_forward = true                # optional (default true); see reuse below
 ```
 
 When a query runs, `nyet` shells out to the **system `ssh`** to open a local
@@ -571,16 +573,75 @@ port are replaced by the tunnel; its user, database and query parameters are
 kept, and the password still comes from `password_env`. A free local port is
 picked automatically.
 
-- **The forward lives only for the query; the master is reused.** The port
-  forward is opened for the query and **torn down when the query finishes** (so
-  forwards do not pile up across a session). What persists between runs is the
-  `ssh` *master* connection: opened with `ControlMaster=auto
-  ControlPersist=<control_persist>` over a per-destination `ControlPath`, it stays
-  in the background so the *next* `nyet` call reuses it with no new handshake.
-  (`control_persist` accepts `yes`/`no` or a time like `15m`/`1h`/`900`; an
-  invalid value is a config error, exit 3. On systems where the `ControlPath`
-  socket would exceed the OS length limit, `nyet` skips reuse — the tunnel still
-  works, each run just pays a fresh handshake.)
+- **The forward is reused between runs — at most one per database.** Both the
+  `ssh` *master* (`ControlMaster=auto ControlPersist=<control_persist>` over a
+  per-destination `ControlPath`) and the *port forward* itself stay in the
+  background, so the next `nyet` call opens **no `ssh` process at all**: it only
+  asks the master "are you still the one that owns this forward?" (`ssh -O
+  check`, a local socket round-trip) and reuses the port. That removes the two
+  `ssh` spawns each call used to pay — about 10 ms on a local bastion and over
+  100 ms across a WAN one, on every single agent query.
+
+  The rule that keeps this safe: **at most one nyet forward per (bastion, remote
+  host:port) pair.** It is recorded in one file under
+  `$XDG_RUNTIME_DIR/nyet/` (or `~/.ssh/nyet/`), a directory only your user can
+  read, and it is only reused when the port is still occupied *and* the master
+  that opened it is still alive with the same pid. If either is not true —
+  master gone, forward already released, file corrupt or describing another
+  pair — nyet does not reuse it: it opens a fresh forward on a fresh random
+  port.
+
+  **Where that inference stops (no security theatre).** "The same master is
+  alive and the port is still taken" is not proof that the *listener* is ours:
+  nyet cannot see who owns a socket, and no portable way to ask exists. There
+  is one state it cannot see through — a forward removed with `ssh -O cancel`
+  while its master keeps running. The port then frees, any ordinary local
+  process can take it (the kernel hands out that same range), and the next call
+  would adopt it and send the database handshake there. That is why `nyet
+  doctor` tells you to clean up with `ssh -O exit` — which shuts the master
+  down, changes the pid and makes adoption impossible — and never with `ssh -O
+  cancel`. If you run `-O cancel` on a nyet forward by hand, either take the
+  master with it or expect the next call to be the one that finds out.
+
+  The local port is random, though not as a secret (any local process can list
+  loopback listeners). Random means it cannot be captured *before* nyet runs,
+  only raced in the instant it frees, and there is no fixed port to hold as a
+  denial-of-service handle.
+
+  `control_persist` accepts `yes`/`no` or a time like `15m`/`1h`/`900`; an
+  invalid value is a config error (exit 3).
+- **What that means in practice (the honest part).** A forward **outlives the
+  `nyet` process** — that is the point, and it is a change from earlier
+  versions. Consequences to know:
+  - it is a loopback listener to your database that stays up between calls, and
+    **any process on this machine can reach the database through it** for as
+    long as it lives (it does not hand out your password — the database still
+    asks — but the network path is open). Previously that window was the length
+    of one query; now it is the master's lifetime: `control_persist` of
+    inactivity, 15 minutes by default. `control_persist = "yes"` means
+    *forever*, until you kill it. On a shared machine, set `reuse_forward =
+    false` or a short `control_persist`;
+  - `nyet doctor <alias>` shows it — port, whether this call reused it, how old
+    it is — and prints the exact `ssh -O exit …` command that removes it (that
+    shuts down the shared master, so any other forward through the same bastion
+    goes with it and is rebuilt on demand);
+  - changing `remote` (or pointing the connection at another database) leaves
+    the *old* forward running until its master times out; `doctor` reports the
+    pair you are configured for now, not the retired one. `ssh -O exit` clears
+    everything at once;
+  - if someone kills the master from outside (`ssh -O exit`, a reboot, `pkill`),
+    nothing breaks: the next call sees the port free and rebuilds the tunnel;
+  - if the network dies silently (laptop suspend, NAT timeout), the master's
+    keepalives (`ServerAliveInterval=15`, 3 strikes) tear it down in ~45 s, and
+    the next call rebuilds. A query that lands inside that window fails as
+    `CONNECTION_FAILED` (exit 6), not as a database error;
+  - set `reuse_forward = false` to opt out: the forward is then removed when the
+    command exits, exactly as before, at the cost of two `ssh` spawns per call.
+    `control_persist = "no"` (no background master at all) implies the same.
+
+  On systems where the `ControlPath` socket would exceed the OS length limit,
+  `nyet` skips both master and forward reuse — the tunnel still works, each run
+  just pays a fresh handshake.
 - **`~/.ssh/config` is inherited.** `nyet` runs your system `ssh`, so host
   aliases, `IdentityFile`, `ProxyJump`, `User`, known-hosts and everything else
   from `~/.ssh/config` apply — put a `Host` block there and set
@@ -1175,6 +1236,13 @@ What each check means and what to do about it:
   it" from "it is not there". PostgreSQL distinguishes the two. Check spellings
   against `nyet schema` when you add rules; the marking there is the reliable
   confirmation that a rule matched something.
+- **ssh_forward** (only with an `[ssh]` section) — what the tunnel left running:
+  the loopback port, whether this call reused an existing forward and how old it
+  is, and the literal `ssh -O cancel …` command that removes it. Always `ok` —
+  a kept forward is the intended state, not a problem — but it exists so a
+  forward that outlives the process is something you can see and kill, not
+  folklore. With `reuse_forward = false` it says so and offers no command,
+  because nothing is left behind.
 - **config_permissions** — is the config file `0600` (owner-only)? Group/other
   bits → `warn`. Fix: `chmod 600` on the config file.
 

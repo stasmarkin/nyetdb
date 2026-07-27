@@ -153,6 +153,7 @@ max_rows = 10000000                    # порог для mode = "rows"
 host = "deploy@bastion.corp:22"
 remote = "db.internal:5432"            # куда пробрасывать с бастиона
 control_persist = "15m"                # ControlMaster=auto ControlPersist
+reuse_forward = true                   # держать -L форвард между вызовами (дефолт true)
 
 [connections.localdev]
 engine = "sqlite"

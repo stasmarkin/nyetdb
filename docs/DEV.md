@@ -2,6 +2,9 @@
 
 ## Build & test
 
+`just build` / `just test` / `just install` wrap the three commands below;
+`just` alone lists the recipes.
+
 ```sh
 cargo build                                # binary: target/debug/nyet
 cargo test                                 # unit + integration (see Docker note below)
@@ -165,14 +168,16 @@ name the stand depends on. Things worth knowing:
   retries the `nyet` pass with backoff — so the config-reload window cannot flake
   CI. Gating on forwarding *before* nyet's first run also avoids nyet creating a
   persistent `ControlMaster` under the old (forwarding-denied) policy.
-- With the deep temp `HOME`, nyet's `ControlPath` would exceed the unix-socket
-  length limit, so the e2e runs in **standalone mode** (`control_path_too_long`).
-  That is the cleaner mode to prove the no-leak fix: the forward *is* the child
-  process, so the test runs several `nyet query` in a row and asserts
-  `pgrep -f <pg>:5432 == 0` after each (the forward is gone once nyet exits). The
-  master-mode teardown (`ssh -O cancel` leaves the master, removes the forward)
-  is covered by the `cancel_args` unit test and was verified by hand against the
-  bastion; `ControlPath` presence is unit-tested in `ssh_args`.
+- The stand sets a short `XDG_RUNTIME_DIR` so the run happens in **master
+  mode**; without it the deep temp `HOME` pushes the `ControlPath` past the
+  unix-socket limit (`control_path_too_long`) and the whole master path is
+  skipped — which is what used to happen on macOS. The e2e therefore covers the
+  forward-reuse invariant directly: exactly one `-f -N -L` per five calls,
+  exactly one live forward, one under a three-process race, no adoption of a
+  stranger's listener, no adoption of a port whose forward was cancelled from
+  outside, a killed master rebuilt, and `reuse_forward = false` leaving nothing
+  behind. Standalone mode (child-owned forward, killed on drop) is now only
+  exercised by unit tests (`ssh_args` with `ControlPath=none`).
 
 `ssh_tunnel_failure_is_exit_6` needs no Docker: it points `host` at a closed
 local port and asserts the `CONNECTION_FAILED` (exit 6) envelope. The pure ssh
@@ -246,20 +251,95 @@ ssh) and *before* the engine connects. The split follows Д1/Д2:
   → destination + optional `-p` port, with strict validation), `ssh_args`
   (build the `ssh [-f] -N -L 127.0.0.1:<port>:<remote> ... <dest>` argv, including
   `ControlMaster=auto`/`ControlPersist`/`ExitOnForwardFailure=yes`/`BatchMode=yes`/
-  `ConnectTimeout`/`ControlPath`; `-f` only in master mode), and `cancel_args`
-  (the `ssh -O cancel -L ...` argv that removes one forward from the master).
-- **Forward lifecycle — no accumulation (RESOURCE SAFETY).** `open` returns a
-  `Tunnel` guard the cli holds for the query; `Drop` tears the forward down.
+  `ConnectTimeout`/`ControlPath`/`ServerAlive*`; `-f` only in master mode),
+  `cancel_args` (the `ssh -O cancel -L ...` argv that removes one forward from
+  the master, used only by the no-reuse teardown), `check_args` (`ssh -O check`,
+  the ownership probe) and `exit_args` (`ssh -O exit`, the cleanup command
+  doctor prints).
+- **Forward lifecycle — one forward per pair, reused (RESOURCE SAFETY).**
   Verified against a real bastion: a `-L` forward opened with `ControlMaster` is
   **owned by the persistent master** and outlives its client, so a plain
-  `kill`/`-f`-orphan would leak listeners across a session (the original bug).
-  Two modes:
-  - **master mode** (a `ControlPath` fits): spawn with `-f` (attaches the forward
-    to the reusable master, exits 0 when ready), and on drop run `ssh -O cancel
-    -L ...` to remove *just this forward* — the master stays for warm reuse;
-  - **standalone mode** (no `ControlPath`): spawn `ssh -N -L` (no `-f`) as a
+  `kill`/`-f`-orphan leaks listeners across a session (the original bug). The
+  first fix was to cancel the forward on `Drop`; that cost two `ssh` spawns per
+  call (measured 5.6 ms + 4.9 ms warm-local, ~118 ms of plumbing across a WAN
+  bastion) for a forward that was about to be needed again. The cancel is gone;
+  the invariant that replaced it is:
+
+  > **At most one nyet forward per (ssh destination, remote host:port) pair**,
+  > recorded in exactly one registry file under the nyet runtime dir, which is
+  > also what serializes concurrent runs for that pair; it is discoverable
+  > (`nyet doctor <alias>`) and killable (doctor prints the `ssh -O exit` line).
+
+  The registry file is `<XDG_RUNTIME_DIR|~/.ssh>/nyet/fwd-<dest>-<sshport>-<remote>`
+  (0600 in a 0700 dir; `@`/`:` sanitized to `_`), a plain `key=value` text record
+  — `cat` is the last-resort discovery tool and this module owes nothing to serde
+  (Д2). It holds the port, the **master pid**, the creation time and the pair.
+  `open` locks it (`File::try_lock` in a bounded loop — a wedged holder must not
+  hang the CLI; giving up means "no reuse", never a hang) for the whole
+  create-or-adopt window, so two concurrent runs cannot both create a forward.
+  `registry_slot` also refuses a runtime dir that is not owner-only or is a
+  symlink (`is_private_dir`): the record is only worth trusting because only we
+  can write it. That is belt-and-braces, not a new boundary — the `ControlPath`
+  socket has always lived in the same directory, and DESIGN §4 puts an agent
+  with environment access outside the model.
+
+  **Adopting a forward requires proving it is ours** — the whole security
+  question, since adopting a stranger's listener means handing it the database
+  handshake. Three conditions, all required, in cost order: (1) the entry parses
+  and names *this* pair; (2) the port is still **occupied** (a successful
+  `TcpListener::bind` means the forward is gone — a probe that sends nothing to
+  whoever might be there); (3) `ssh -O check` reports the **same master pid**
+  that opened it. (3) is the ownership proof: a forward disappears only when its
+  master exits or someone runs `-O cancel`, so "same master alive" + "port still
+  taken" means the listener is still ours *unless that cancel happened*. This is
+  inference, not proof, and the gap is not hypothetical: **a forward released
+  while its master lives frees an ephemeral port that any ordinary local process
+  can then be handed by the kernel** — no attacker required — and adoption would
+  send the database handshake there. Two things keep it closed in practice:
+  `-O cancel` on a specific forward requires knowing both the ControlPath and the
+  exact `-L` spec, which are written down only in our own 0600 registry file; and
+  `kill_command` (the only cleanup nyet ever teaches) is `ssh -O exit`, which
+  takes the master with it and therefore invalidates the pid. Measured
+  alternatives were worse: `lsof -nP -iTCP:<port> -sTCP:LISTEN` costs more than
+  the entire saving and is not portable, and `ssh` has no "list forwards"
+  command. Anything else —
+  a pid mismatch, an unreadable reply, a corrupt file — is fail-closed: open a
+  fresh forward on a fresh **random** port. The port stays random on purpose: a
+  deterministic one would publish to every local user exactly where nyet will
+  look for a forward, turning reuse into a squatting target; the registry file
+  (our uid, 0700 dir) supplies the identity that determinism would have.
+
+  **TTL: none of our own.** The forward dies with its master, and the master's
+  life is `ControlPersist` — an OpenSSH mechanism the config owner already sets
+  (`control_persist`, default 15m). A second nyet-specific timer would need
+  either a daemon (UX-6) or a check that only fires when we run anyway, i.e.
+  exactly when we want the forward alive. `control_persist = "no"` (the human
+  asking for no background master) disables reuse.
+
+  **Network death** is bounded by `ServerAliveInterval=15`/`CountMax=3` on the
+  master: a suspended laptop or a dropped NAT mapping otherwise leaves a master
+  whose local listener still accepts while the SSH connection is dead, and the
+  kernel would not notice for hours. With keepalives it exits in ~45 s, the port
+  frees, and the next run rebuilds. A query landing inside that window fails as
+  `CONNECTION_FAILED` (exit 6) — never as a database error, and never as success.
+
+  Three teardown modes:
+  - **master mode + reuse** (the default): spawn with `-f` (attaches the forward
+    to the master, exits 0 when ready), record it, and do **nothing** on drop;
+  - **master mode, no reuse** (`reuse_forward = false`, `ControlPersist=no`, or
+    the master pid could not be read): `ssh -O cancel -L ...` on drop removes
+    *just this forward* — the master stays for warm reuse;
+  - **standalone mode** (no `ControlPath` fits): spawn `ssh -N -L` (no `-f`) as a
     foreground child, poll TCP-connect on the local port for readiness (bounded
     by `ConnectTimeout`), and kill the child on drop.
+
+  **Known limits, stated rather than hidden:** a crash between the `ssh` spawn
+  and the registry write leaves an unrecorded forward (the next run makes its
+  own; the orphan dies with the master, ≤ `control_persist`); the `-O cancel`
+  window above; changing `remote` in the config leaves the old pair's forward
+  running until its master times out and `doctor` (which reports the configured
+  pair) does not show it; and killing the master externally is not an error — it
+  is simply detected and rebuilt.
 - **Option-injection guard + typed-parse-once (SECURITY).** `host`/`remote`/
   `control_persist` come from the config, where `${VAR}` substitution makes them
   agent-influenced (agent-controlled environment per the threat model). `ssh` has
@@ -292,6 +372,40 @@ ssh) and *before* the engine connects. The split follows Д1/Д2:
   and `ProxyJump` (Д8), and ControlPersist over the ControlPath reuses the master
   between runs (Д9). The `Option<Tunnel>` guard is kept in the cli `Query` arm so
   it drops after the query executes.
+- **Measured effect, and why not `ssh -O forward` (Д9).** Medians against the
+  container bastion, real `ssh`, warm master: `-O check` **3.2 ms**,
+  `-O forward -L` **3.0 ms**, `-O cancel -L` **3.0 ms**, `-f -N -L` **4.2 ms**;
+  cold (no master) **44.9 ms** whether it is one spawn (`-f -N -L` builds master
+  and forward together) or two (master first, then `-O forward`). End to end:
+  `nyet query` **55 ms** with reuse, **66 ms** without.
+
+  Two conclusions. (a) All mux operations cost the same, because the cost is the
+  **spawn** — process start, `~/.ssh/config` parse, mux connect — not the work;
+  so per-call overhead is proportional to the number of spawns, and the only
+  lever is spawning less. Reuse takes it **2 → 1**. (b) The obvious alternative
+  — keep the old lifecycle but ask the live master for the forward each call
+  (`-O forward` + `-O cancel`, no registry, no adoption) — does **not** reduce
+  the spawn count: it is 2 → 2. It is also not a new design; ssh.c turns a warm
+  `ssh -N -L` into `SSHMUX_COMMAND_FORWARD`, i.e. exactly `-O forward`, which the
+  4.2 ms vs 3.0 ms above confirms is the old path minus the `-f` fork. It would
+  buy ~1.2 ms of the ~11 ms the reuse design saves, in exchange for dropping the
+  adoption risk described above — a real trade, but on the setup this was built
+  for (WAN bastion, where per-spawn cost is what hurts) it gives back almost the
+  whole win.
+
+  The e2e test pins spawn counts rather than timings (CI clocks flap): 5 calls
+  must produce exactly one `-f -N -L`, five `-O check` (one per call — the
+  creating run also identifies its master), zero `-O cancel`, and exactly one
+  live forward.
+- **The e2e stand needs a SHORT `XDG_RUNTIME_DIR`** (`tests/ssh.rs` derives
+  `/tmp/nyt<tempdir-name>`, 0700, one per test — the two tests run in parallel
+  threads, so a shared dir let one remove what the other was using). Reason: with
+  macOS's `TMPDIR=/var/folders/...` the HOME is ~59 chars, so
+  `<home>/.ssh/nyet/cm-%C` expands past the unix-socket path limit and
+  `control_path()` returns None — locally the test silently ran standalone and
+  never touched the master path. On a Linux CI with `TMPDIR=/tmp` it fitted, so
+  coverage of the master path depended on the runner's temp dir; now it does
+  not.
 - **url → localhost**: rather than string-rewriting the url, `engine.rs`
   overrides `PgConnectOptions.host()/port()` and rewrites `ssl_mode` for the
   tunnel leg (`apply_host_override`) — while user/dbname/params and the password
@@ -1071,9 +1185,13 @@ regardless of `allowed_dirs` — the human owns the config and is often testing 
 before `cd`-ing into the project. `nyet doctor` with no alias lists the
 connections reachable from cwd (scoping applies to that listing only).
 
-The six checks (order = presentation order): `connectivity`,
-`transport_encrypted`, `read_only_role`, `not_superuser`, `pii_columns`,
-`config_permissions`.
+The checks (order = presentation order): `connectivity`, `transport_encrypted`,
+`ssh_forward`, `read_only_role`, `not_superuser`, `pii_columns`,
+`config_permissions`. `ssh_forward` and `pii_columns` are conditional — like
+`pii_columns` (emitted only with a `[pii]` section), `ssh_forward` is emitted
+only for a connection with an `[ssh]` section, from the live `Tunnel` guard's
+facts (port / reused / age / the `ssh -O cancel` line); on a connection without
+a tunnel there is nothing to say and no `na` noise (UX-4).
 `transport_encrypted` reuses the same static rule as the `INSECURE_TRANSPORT`
 warning (`engine::transport_below_require`, ssh vs. sslmode >= require);
 `config_permissions` reuses `config::permissions_warning`; `pii_columns` is
