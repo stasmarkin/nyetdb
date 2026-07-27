@@ -66,6 +66,17 @@
 # (guards the pg_read_/pg_ls_ prefix boundary against over-matching)
 - query: SELECT pg_relation_size('users')
   verdict: allow
+# reading the lock CATALOG is a read — only taking a lock is denied
+- query: SELECT locktype, granted FROM pg_locks
+  verdict: allow
+# the advisory family is enumerated, not prefix-matched, so a user function that
+# merely starts the same way still runs (pins the enumerate-vs-prefix decision:
+# switching to a `pg_advisory` prefix would break this case on purpose)
+- query: SELECT pg_advisory_lock_report()
+  verdict: allow
+# a column named like a denied advisory function is not a call
+- query: SELECT pg_advisory_lock FROM t
+  verdict: allow
 # a plain TABLE named like a denied family is not a call
 - query: SELECT * FROM dblink
   verdict: allow

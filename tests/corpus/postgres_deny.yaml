@@ -125,6 +125,15 @@
 - query: WITH x AS (SELECT * FROM users FOR UPDATE) SELECT * FROM x
   verdict: deny
   reason: LOCKING_CLAUSE
+# The other two PostgreSQL lock strengths: sqlparser does not know them, so
+# they fail closed at the parser instead of at the locking check — pinned so a
+# parser upgrade that starts accepting them cannot turn either into an allow.
+- query: SELECT * FROM users FOR NO KEY UPDATE
+  verdict: deny
+  reason: PARSE_FAILED
+- query: SELECT * FROM users FOR KEY SHARE
+  verdict: deny
+  reason: PARSE_FAILED
 
 # --- function denylist (DESIGN §3 п.7; rationale in docs/DEV.md) ---
 - query: SELECT pg_sleep(10)
@@ -171,6 +180,68 @@
 - query: SELECT pg_sleep_until('tomorrow')
   verdict: deny
   reason: DENIED_FUNCTION
+# advisory-lock family (all 11 pg_catalog names enumerated, like *_to_xml, so
+# allow_functions can still un-deny one). Taking a lock is not a read: the
+# SESSION-scoped ones survive ROLLBACK (measured) and only die with the backend,
+# and every blocking form hangs the query until the server's statement_timeout.
+- query: SELECT pg_advisory_lock(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_try_advisory_lock(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_advisory_lock_shared(1, 2)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_try_advisory_lock_shared(1, 2)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_advisory_unlock(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_advisory_unlock_shared(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_advisory_unlock_all()
+  verdict: deny
+  reason: DENIED_FUNCTION
+# transactional variants: released at COMMIT/ROLLBACK, so they survive nothing —
+# denied anyway (the blocking ones hang to statement_timeout, the try_ ones still
+# block another application for the life of nyet's transaction, and no read needs
+# a lock). One rule per family beats "some advisory locks, but not those".
+- query: SELECT pg_advisory_xact_lock(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_advisory_xact_lock_shared(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_try_advisory_xact_lock(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_try_advisory_xact_lock_shared(1, 2)
+  verdict: deny
+  reason: DENIED_FUNCTION
+# the same call in table-function position, schema-qualified, and under a plain
+# EXPLAIN (the paths that reach check_function_name through another AST node)
+- query: SELECT * FROM pg_advisory_lock(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_catalog.pg_try_advisory_lock(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: EXPLAIN SELECT pg_advisory_lock(42)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT 1 FROM t WHERE pg_try_advisory_xact_lock(id)
+  verdict: deny
+  reason: DENIED_FUNCTION
+# LOCK TABLE takes a table lock without any function call — not a read
+- query: LOCK TABLE users IN ACCESS EXCLUSIVE MODE
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: LOCK TABLE users
+  verdict: deny
+  reason: WRITE_OPERATION
 # file-read family, prefix-matched (pg_read_*, pg_ls_*) + pg_stat_file
 - query: SELECT pg_read_binary_file('/etc/passwd')
   verdict: deny

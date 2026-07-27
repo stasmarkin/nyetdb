@@ -64,6 +64,13 @@
   verdict: allow
 - query: SELECT release_lock FROM t
   verdict: allow
+# the read half of the named-lock family: IS_FREE_LOCK / IS_USED_LOCK inspect
+# lock state without taking or waiting for anything, so they stay allowed (the
+# deliberate counterpart of the GET_LOCK / RELEASE_LOCK deny cases)
+- query: SELECT is_free_lock('x')
+  verdict: allow
+- query: SELECT is_used_lock('x')
+  verdict: allow
 # a string literal that merely CONTAINS an executable-comment opener is data,
 # not a comment (pins the scanner's string-awareness — no false deny)
 - query: SELECT '/*! not a comment */' AS s

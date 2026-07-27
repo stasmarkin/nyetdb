@@ -1036,6 +1036,59 @@ fn postgres_xml_export_functions_are_denied() {
     });
 }
 
+/// Advisory locks against a live server. What this test MEASURES is one thing the
+/// corpus cannot show: the refusal reaches the agent as `DENIED_FUNCTION` + exit 5
+/// on a real connection, in every spelling.
+///
+/// The closing `pg_locks` assertion is a **pin for later, not today's proof**:
+/// nyet runs one process per invocation, and a session advisory lock dies with the
+/// backend, so the count would read 0 even with the denylist removed (measured —
+/// with `allow_functions` on the family, `pg_locks` shows the lock INSIDE the query
+/// and 0 once the process exits). What makes the family dangerous is that
+/// `ROLLBACK` does not release a session lock (also measured: taken inside the
+/// read-only transaction, it is still held after the abort) — so the day
+/// connections are reused, that assertion starts failing if layer 1 ever stops
+/// refusing. Kept for exactly that day.
+#[test]
+fn postgres_advisory_locks_are_denied() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_pg_config(tmp.path(), port);
+        for sql in [
+            "SELECT pg_advisory_lock(42)",
+            "SELECT pg_try_advisory_lock(42)",
+            "SELECT pg_advisory_lock_shared(1, 2)",
+            "SELECT pg_advisory_unlock_all()",
+            // transactional variants: released at ROLLBACK, denied all the same
+            "SELECT pg_advisory_xact_lock(42)",
+            "SELECT pg_try_advisory_xact_lock(42)",
+            // and through the table-function / qualified spellings
+            "SELECT * FROM pg_advisory_lock(42)",
+            "SELECT pg_catalog.pg_try_advisory_lock(42)",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "pg", sql]);
+            assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["reason"], "DENIED_FUNCTION", "{sql}");
+        }
+        // Nothing was taken: not a single advisory lock on the whole server.
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &[
+                "query",
+                "pg",
+                "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory'",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["rows"][0]["n"], 0, "advisory lock left behind: {v}");
+        container.rm().await.unwrap();
+    });
+}
+
 /// The PII policy against a live PostgreSQL (step PII-1): net A by name, net B
 /// by the driver's column provenance, the withheld database error, and the
 /// honestly documented view limitation — all measured, not assumed.

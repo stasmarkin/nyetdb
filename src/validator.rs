@@ -496,6 +496,28 @@ const POSTGRES_DENIED_FUNCTIONS: &[&str] = &[
     "pg_logical_emit_message",
     "lo_import", // reads a server file into a large object
     "lo_export", // writes a large object to a server file
+    // Advisory-lock family (all 11 pg_catalog names). Taking a lock is not a
+    // read, and a read never needs one. The SESSION-scoped ones are the sharp
+    // half: they are NOT released by ROLLBACK (measured — a lock taken inside
+    // nyet's read-only transaction is still held after it aborts), only by the
+    // backend dying. The blocking forms additionally hang the query until the
+    // server's statement_timeout (the pg_sleep DoS class). The `_xact_` ones do
+    // die with the transaction, and are denied with the rest so the rule is one
+    // rule ("nyet never takes a lock") instead of a per-variant table the agent
+    // has to learn — and because their blocking forms hang exactly like the
+    // session ones. ENUMERATED, not prefixed (`*_to_xml` precedent): the family
+    // has been closed since 9.1, and `validator.allow_functions` stays reachable.
+    "pg_advisory_lock",
+    "pg_advisory_lock_shared",
+    "pg_advisory_unlock",
+    "pg_advisory_unlock_shared",
+    "pg_advisory_unlock_all",
+    "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared",
+    "pg_try_advisory_lock",
+    "pg_try_advisory_lock_shared",
+    "pg_try_advisory_xact_lock",
+    "pg_try_advisory_xact_lock_shared",
     // The `*_to_xml` family (built into pg_catalog since 8.3, no extension, no
     // DBA, available to a plain SELECT-only role). Two separate powers, both
     // fatal to layer 1:
@@ -1822,8 +1844,10 @@ impl Checker<'_> {
                 DenyReason::DeniedFunction,
                 format!("the function '{lower}' is on the denylist for this connection"),
                 &format!(
-                    "'{lower}' can affect state outside a read-only query; if you \
-                     accept the risk, add it to validator.allow_functions for this \
+                    "'{lower}' does more than read — the denylist covers calls that \
+                     take locks, reach the filesystem or the server, write durably, or \
+                     run code nyet never sees. If the query works without it, drop the \
+                     call; otherwise add it to validator.allow_functions for this \
                      connection in the config"
                 ),
             ));

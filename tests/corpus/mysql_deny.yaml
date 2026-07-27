@@ -81,6 +81,14 @@
 - query: SELECT * FROM users FOR SHARE
   verdict: deny
   reason: LOCKING_CLAUSE
+# Statement-level lock grabs — no function call involved, so the denylist never
+# sees them; they are refused as non-read statements instead.
+- query: LOCK TABLES users READ
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: FLUSH TABLES WITH READ LOCK
+  verdict: deny
+  reason: WRITE_OPERATION
 
 # --- function denylist (rationale in docs/DEV.md) ---
 - query: SELECT sleep(10)

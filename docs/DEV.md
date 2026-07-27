@@ -2148,6 +2148,37 @@ Exact names (config-tunable via `allow_functions` / `deny_functions`):
 - `lo_import` / `lo_export` — read a server file into / write a large object out
   to a server file: filesystem in/exfiltration.
 - `pg_stat_file` — stats an arbitrary server file (not a `pg_read_`/`pg_ls_` name).
+- **the advisory-lock family, all 11 `pg_catalog` names** — `pg_advisory_lock`,
+  `pg_advisory_lock_shared`, `pg_advisory_unlock`, `pg_advisory_unlock_shared`,
+  `pg_advisory_unlock_all`, `pg_advisory_xact_lock`, `pg_advisory_xact_lock_shared`,
+  `pg_try_advisory_lock`, `pg_try_advisory_lock_shared`, `pg_try_advisory_xact_lock`,
+  `pg_try_advisory_xact_lock_shared` (the list is exactly what `pg_proc` holds —
+  read off the catalog, not from memory, and identical on **16.14 and 18.4**).
+  Taking a lock is not a read, and no legitimate agent task needs one. Two reasons,
+  both measured:
+  - **a SESSION advisory lock survives `ROLLBACK`.** Measured on `postgres:16-alpine`:
+    `pg_try_advisory_lock(77)` inside `BEGIN TRANSACTION READ ONLY` left
+    `count(*) FROM pg_locks WHERE locktype='advisory'` at **1** after the abort, in
+    the next transaction — layer 2 does not touch it, only the backend dying frees
+    it. Today nyet opens one connection per invocation, so the lock dies with the
+    process; the day connections are reused (connection TTL / daemon), an agent
+    would accumulate session locks and could block other applications on the same
+    database — a write-shaped effect from a read-only tool.
+  - **the blocking forms hang until `statement_timeout`.** Measured on the same
+    server: with key 4242 held by another session, `pg_advisory_lock(4242)` under
+    `statement_timeout = '2s'` waited the full two seconds and died with *"canceling
+    statement due to statement timeout"* (1.96 s wall). It ties up the connection for
+    as long as the server allows — the `pg_sleep` DoS class, already denied.
+- **transactional variants (`*_xact_*`) are denied too**, deliberately. They *are*
+  released at COMMIT/ROLLBACK, so they survive no reuse; but the blocking ones hang
+  exactly like the session ones, the `pg_try_` ones still hold a lock other
+  applications wait on for the life of nyet's transaction, and one rule ("nyet never
+  takes a lock") is a rule the agent can learn — "advisory locks are denied except
+  the transactional non-blocking ones" is not. The false-refusal cost (UX-1) is zero:
+  no read needs any of them.
+- `pg_advisory_unlock*` are harmless on their own (nyet can no longer hold a lock, so
+  they are a no-op returning false), and denied for the same reason MySQL's
+  `release_lock` is: the whole family is one rule, and an agent read never calls one.
 
 Prefix families (built-in only, **not** config-tunable — every current and
 future member is dangerous and none is a legitimate agent read, so fail-closed
@@ -2164,9 +2195,31 @@ did not list. Enumerate where an override is documented/plausible (`pg_sleep`
 family) so `allow_functions` keeps working, or where no clean prefix exists
 (`nextval`/`setval`/`lo_*`/`pg_stat_file`).
 
-Deliberately *not* included: `pg_advisory_*` locks (session-scoped, released on
-disconnect — low severity, and `pg_try_advisory_*` wouldn't share the prefix
-cleanly). Add with a failing corpus case first (Д6) if it ever matters.
+The advisory family is **enumerated**, following the `*_to_xml` precedent rather
+than adding `pg_advisory` + `pg_try_advisory` prefixes: the 11 names were read off
+the live catalog on two majors (16.14 and 18.4 — byte-identical sets), so the
+enumeration is provably complete on every version nyet is likely to meet, and the
+family has been stable for many releases (the `_xact_` variants arrived in 9.1 —
+that date is from the release notes, not measured here); it reuses the existing
+mechanism; and `allow_functions` stays reachable for a config owner who
+really does want one of them on one connection. The cost of that choice is pinned
+in the corpus — `SELECT pg_advisory_lock_report()` (a user function that merely
+starts the same way) is an **allow** case, and switching to a prefix would break
+it on purpose.
+
+Deliberately *not* denied: reading lock STATE. `SELECT … FROM pg_locks` takes
+nothing and stays allowed (allow case in `postgres_allow.yaml`) — the rule is
+about acquiring locks, not about observing them.
+
+Other ways to grab a lock, all closed elsewhere and pinned in the corpus:
+`SELECT … FOR UPDATE`/`FOR SHARE` → `LOCKING_CLAUSE` (`FOR NO KEY UPDATE` /
+`FOR KEY SHARE` are not parsed by sqlparser at all → `PARSE_FAILED`, fail closed);
+`LOCK TABLE` (PostgreSQL) and `LOCK TABLES` / `FLUSH TABLES WITH READ LOCK` (MySQL)
+are not reads → `WRITE_OPERATION`; `EXPLAIN ANALYZE` executes and is refused;
+`query_to_xml('select pg_advisory_lock(1)', …)` is denied with the rest of the
+`*_to_xml` family. SQLite has no advisory-lock function at all (its locking is
+file-level and driven by transactions/`PRAGMA locking_mode`, and every `PRAGMA` is
+already refused), so there is nothing to add there.
 
 ## Function denylist rationale (MySQL/MariaDB)
 
@@ -2188,11 +2241,14 @@ them — the validator (layer 1) is the only guard. All enumerated by exact name
 - `get_lock` / `release_lock` / `release_all_locks` — the named-lock family.
   `GET_LOCK(name, -1)` blocks the connection **forever** waiting for a lock: a
   silent DoS, the same class as `SLEEP`. `release_*` are non-blocking but denied
-  for completeness (an agent read never needs any of them). Note this differs
-  from the Postgres `pg_advisory_*` decision — there the wait variants aren't the
-  default and the family is noisier to enumerate; MySQL's blocking form is the
-  common one and the family is tiny. (`is_used_lock` / `is_free_lock` are pure
-  non-blocking reads and stay **allowed**.)
+  for completeness (an agent read never needs any of them). Same rule as the
+  PostgreSQL advisory family above: nyet never takes a lock, in any engine.
+  (`is_used_lock` / `is_free_lock` are pure non-blocking reads — they inspect lock
+  state without taking or waiting for anything — and stay **allowed**, pinned as
+  allow cases in `mysql_allow.yaml`. Measured on `mysql:8.4`: both return in
+  microseconds and take nothing — `is_free_lock('x')` = 1 and `is_used_lock('x')` =
+  NULL while the name is free, 0 / the holder's connection id after a `GET_LOCK`. MySQL's named-lock family is exactly these
+  five functions; there is nothing else to add.)
 - `master_pos_wait` / `source_pos_wait` / `master_gtid_wait` /
   `wait_for_executed_gtid_set` / `wait_until_sql_thread_after_gtids` — the
   replication-wait family: each blocks until a replica reaches a binlog/GTID

@@ -1299,7 +1299,9 @@ lists (per engine; rationale in [docs/DEV.md](docs/DEV.md)):
   (connection-tie-up / CPU DoS), `sys_exec`/`sys_eval` (the `lib_mysqludf_sys`
   UDFs — shell/command execution if installed), the named-lock family
   `get_lock`/`release_lock`/`release_all_locks` (`GET_LOCK(name, -1)` blocks the
-  connection forever — DoS), and the replication-wait family `master_pos_wait`/
+  connection forever — DoS; the read half of that family, `is_free_lock`/
+  `is_used_lock`, takes nothing and stays allowed), and the replication-wait
+  family `master_pos_wait`/
   `source_pos_wait`/`master_gtid_wait`/`wait_for_executed_gtid_set`/
   `wait_until_sql_thread_after_gtids` (block until a replica position — DoS).
   `SELECT ... INTO OUTFILE`/`INTO DUMPFILE` (writing a server file) is refused too
@@ -1320,8 +1322,15 @@ lists (per engine; rationale in [docs/DEV.md](docs/DEV.md)):
   `query_to_xml('select pg_sleep(3)', …)` ran a denied function), and the
   `table_/schema_/database_to_xml` forms dump a whole relation, schema or
   database without naming a single column. Same class as `dblink`, only
-  built in. Prefix families are built-in and not tunable via `allow_functions`;
-  the enumerated names (including `pg_sleep` and the `*_to_xml` family) are.
+  built in. And the whole **advisory-lock family** — `pg_advisory_lock`,
+  `pg_try_advisory_lock`, their `_shared`, `_xact_` and `_unlock` variants and
+  `pg_advisory_unlock_all` (all 11 names): taking a lock is not a read, the
+  blocking forms hang the query until the server's `statement_timeout`, and a
+  *session* advisory lock is **not** released by `ROLLBACK` — it lives until the
+  backend dies. Reading the lock catalog (`SELECT … FROM pg_locks`) stays
+  allowed. Prefix families are built-in and not tunable via `allow_functions`;
+  the enumerated names (including `pg_sleep`, the `*_to_xml` and the advisory
+  family) are.
 
 Matching is case-insensitive and is done on the **terminal** name component, so
 qualified targets (`pg_catalog.pg_sleep`, `main.load_extension`) and table-valued
