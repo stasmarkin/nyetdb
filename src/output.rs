@@ -125,6 +125,52 @@ pub struct SchemaColumn {
     pub unique: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    /// `"deny"` / `"mask"` when this connection's `[pii]` policy covers the
+    /// column, absent otherwise. Filled by `mark_pii` in the cli, never by an
+    /// engine: the policy is config, not catalog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pii: Option<&'static str>,
+}
+
+/// Mark the columns a PII policy covers, so the agent does not spend a round
+/// trip discovering them by refusal (UX-2/UX-3). Runs on the schema the engine
+/// already filtered by privilege, so a column the role cannot read is never
+/// marked — it is not there at all.
+///
+/// `protects` is passed in rather than `PiiRules` so this module keeps its one
+/// dependency (serde); the cli owns the policy and knows both.
+pub fn mark_pii(schema: &mut Schema, mode: &'static str, protects: impl Fn(&str, &str) -> bool) {
+    for table in &mut schema.tables {
+        for column in table.columns.iter_mut().flatten() {
+            if protects(&table.name, &column.name) {
+                column.pii = Some(mode);
+            }
+        }
+    }
+}
+
+/// What a masked cell reads as (`[connections.X.pii] mode = "mask"`). Deliberately
+/// NOT configurable (Д5) and deliberately not a partial mask: `j***@gmail.com`
+/// leaks the value piece by piece and a stable token is an equality oracle over
+/// it, so the whole cell goes, in every type.
+pub const REDACTED: &str = "[REDACTED]";
+
+/// Replace every value of the listed COLUMNS with `REDACTED` (net B's masking
+/// half — the indexes come from the provenance check, this is only the edit).
+///
+/// The replacement is the same string for every type, NULL included: leaving a
+/// NULL as itself would answer "is this row's protected value set?" for every
+/// row, which is exactly the oracle the mask exists to close. The JSON type of a
+/// masked column therefore becomes `string` whatever the column's real type is —
+/// an intended consequence, announced by the `PII_MASKED` warning.
+pub fn redact(rows: &mut [Vec<Value>], columns: &[usize]) {
+    for row in rows {
+        for i in columns {
+            if let Some(cell) = row.get_mut(*i) {
+                *cell = Value::String(REDACTED.to_string());
+            }
+        }
+    }
 }
 
 /// What an expression key part renders as when the catalog gives no text. Only
@@ -456,6 +502,9 @@ pub fn schema_text(schema: &Schema) -> String {
             }
             if let Some(d) = &c.default {
                 line.push_str(&format!("  default {d}"));
+            }
+            if let Some(mode) = c.pii {
+                line.push_str(&format!("  pii {mode}"));
             }
             out.push_str(line.trim_end());
             out.push('\n');
@@ -837,9 +886,23 @@ pub struct ServerFacts {
     pub probe: ProbeFact,
 }
 
+/// One `[pii]`-protected column, and whether the ROLE nyet connects as can read
+/// it straight from the server. `None` = the server would not say (the object
+/// does not exist under that name for this account, or the privilege query
+/// failed) — reported as "could not verify", never as a pass (UX-1).
+#[derive(Clone)]
+pub struct PiiAccess {
+    /// `table.column`, as the policy spells it.
+    pub column: String,
+    pub readable: Option<bool>,
+}
+
 pub struct Diagnosis {
     pub connect: ConnectFact,
     pub server: Option<ServerFacts>,
+    /// One entry per configured PII rule; empty when the connection has no
+    /// `[pii]` policy (or the engine has no privileges to ask about).
+    pub pii: Vec<PiiAccess>,
 }
 
 /// Transport guarantee, computed by the cli from the connection config alone.
@@ -864,6 +927,9 @@ pub struct DoctorInput {
     pub diagnosis: Diagnosis,
     pub transport: Transport,
     pub permissions: Permissions,
+    /// Whether the connection has a `[pii]` policy at all, and in which mode —
+    /// config, so the cli computes it (the engine only reports privileges).
+    pub pii_mode: Option<&'static str>,
 }
 
 fn ok_check(name: &'static str, message: impl Into<String>) -> DoctorCheck {
@@ -919,8 +985,97 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
         transport_check(&input.transport),
         read_only_role_check(input),
         not_superuser_check(input),
-        permissions_check(&input.permissions),
     ]
+    .into_iter()
+    // Only when there IS a policy: a check that reports `na` on every
+    // connection without `[pii]` is pure noise in the common case (UX-4).
+    .chain(input.pii_mode.map(|mode| pii_columns_check(input, mode)))
+    .chain([permissions_check(&input.permissions)])
+    .collect()
+}
+
+/// Are the columns the config marks as PII actually out of the role's reach?
+///
+/// The honest answer matters more than the comfortable one (UX-7): if the role
+/// CAN read them, nyet's `[pii]` policy is the ONLY thing standing between the
+/// agent and that data — one `psql` away from being irrelevant (threat model:
+/// an agent with shell access walks around nyet). That is a `warn` with the
+/// server-side recipe, not a `fail`: the policy still works for every query that
+/// goes through nyet, which is what the config owner asked for.
+fn pii_columns_check(input: &DoctorInput, mode: &'static str) -> DoctorCheck {
+    if input.engine == EngineKind::Sqlite {
+        return na_check(
+            "pii_columns",
+            format!(
+                "SQLite has no roles or column privileges, so the marked columns cannot be made \
+                 unreadable at the database level: nyet's [pii] policy (mode = \"{mode}\") is the \
+                 only thing between an agent and this data, and anything that opens the file \
+                 directly reads it in full"
+            ),
+        );
+    }
+    if input.diagnosis.server.is_none() {
+        return warn_check(
+            "pii_columns",
+            "could not verify: there is no connection to the database",
+            "fix the connectivity check above, then re-run nyet doctor",
+        );
+    }
+    let readable: Vec<&str> = input
+        .diagnosis
+        .pii
+        .iter()
+        .filter(|c| c.readable == Some(true))
+        .map(|c| c.column.as_str())
+        .collect();
+    let unknown: Vec<&str> = input
+        .diagnosis
+        .pii
+        .iter()
+        .filter(|c| c.readable.is_none())
+        .map(|c| c.column.as_str())
+        .collect();
+    if !readable.is_empty() {
+        return warn_check(
+            "pii_columns",
+            format!(
+                "the role can read {} of the {} marked column(s) directly ({}): nyet refuses or \
+                 masks them (mode = \"{mode}\"), but the database itself does not — anything \
+                 connecting with these credentials outside nyet gets the real values",
+                readable.len(),
+                input.diagnosis.pii.len(),
+                readable.join(", ")
+            ),
+            "make the boundary the database's: REVOKE SELECT ON <table> FROM <role> and GRANT \
+             SELECT (<the columns the agent may read>) ON <table> TO <role> (PostgreSQL/MySQL \
+             both support column-level grants), or expose a curated view and grant only that. \
+             The [pii] policy then becomes a second, local layer instead of the only one",
+        );
+    }
+    if !unknown.is_empty() {
+        return warn_check(
+            "pii_columns",
+            format!(
+                "could not verify {} of the {} marked column(s) ({}): the database would not \
+                 answer whether this role may read them — most often the table or column does \
+                 not exist under that name for this account",
+                unknown.len(),
+                input.diagnosis.pii.len(),
+                unknown.join(", ")
+            ),
+            "check the spelling against `nyet schema <alias>` — a rule that names a column which \
+             is not there protects nothing; if the name is right, the account may lack any \
+             privilege on the table at all, which is the safe case",
+        );
+    }
+    ok_check(
+        "pii_columns",
+        format!(
+            "the role cannot read any of the {} marked column(s) directly — the database enforces \
+             the same boundary the [pii] policy (mode = \"{mode}\") does",
+            input.diagnosis.pii.len()
+        ),
+    )
 }
 
 /// The config-level diagnosis (`nyet doctor` with no alias): the file
@@ -1381,6 +1536,66 @@ mod tests {
         )
     }
 
+    /// The mask replaces the WHOLE cell of every type, NULL included: a
+    /// surviving NULL would answer "is this row's protected value set?" for
+    /// every row, and a surviving type/length narrows the value.
+    #[test]
+    fn redact_replaces_every_type_including_null() {
+        let mut rows = vec![
+            vec![
+                Value::from(1),
+                Value::from("a@b.c"),
+                Value::from(7),
+                Value::Null,
+            ],
+            vec![
+                Value::from(2),
+                Value::Null,
+                Value::from(1.5),
+                serde_json::json!({"k": "v"}),
+            ],
+            vec![
+                Value::from(3),
+                Value::Bool(true),
+                serde_json::json!([1, 2]),
+                Value::from("keep"),
+            ],
+        ];
+        // Columns 1 and 2 are protected; 0 and 3 are not.
+        redact(&mut rows, &[1, 2]);
+        for row in &rows {
+            for i in [1, 2] {
+                assert_eq!(row[i], Value::from(REDACTED), "{row:?}");
+            }
+        }
+        assert_eq!(rows[0][0], Value::from(1));
+        assert_eq!(rows[0][3], Value::Null);
+        assert_eq!(rows[1][3], serde_json::json!({"k": "v"}));
+        assert_eq!(rows[2][3], Value::from("keep"));
+        // An index past the row width cannot panic (Д3).
+        redact(&mut rows, &[99]);
+        // No indexes = no edit.
+        let before = rows.clone();
+        redact(&mut rows, &[]);
+        assert_eq!(rows, before);
+    }
+
+    #[test]
+    fn mark_pii_marks_only_the_protected_columns() {
+        let mut schema = sample_schema();
+        mark_pii(&mut schema, "mask", |t, c| t == "users" && c == "email");
+        let users = schema.tables.iter().find(|t| t.name == "users").unwrap();
+        for column in users.columns.as_ref().unwrap() {
+            let want = (column.name == "email").then_some("mask");
+            assert_eq!(column.pii, want, "{}", column.name);
+        }
+        // The mark reaches the text form too (the human/`--format table` path).
+        assert!(schema_text(&schema).contains("pii mask"));
+        // JSON: present only on the marked column.
+        let json = to_json(&schema);
+        assert_eq!(json.matches("\"pii\":\"mask\"").count(), 1, "{json}");
+    }
+
     #[test]
     fn query_envelope_is_compact_and_stable() {
         let (columns, rows, meta) = sample();
@@ -1507,6 +1722,7 @@ mod tests {
             pk: false,
             unique: false,
             default: None,
+            pii: None,
         }
     }
 
@@ -1834,8 +2050,10 @@ mod tests {
     #[test]
     fn doctor_checks_cover_all_statuses_with_hints() {
         let input = DoctorInput {
+            pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
+                pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     superuser: SuperuserFact::Yes("current_setting('is_superuser') = on".into()),
@@ -1872,14 +2090,103 @@ mod tests {
             .contains("CREATE ROLE nyet_ro"));
     }
 
+    /// The `pii_columns` check is honest in all four directions (UX-7): no
+    /// policy and SQLite are `na`, an unreadable set is `ok`, and a column the
+    /// role CAN read is a `warn` that names it and hands over the server-side
+    /// fix — because there nyet is the only boundary.
+    #[test]
+    fn doctor_pii_columns_is_honest_about_the_real_boundary() {
+        let access = |pairs: &[(&str, Option<bool>)]| {
+            pairs
+                .iter()
+                .map(|(c, readable)| PiiAccess {
+                    column: (*c).to_string(),
+                    readable: *readable,
+                })
+                .collect::<Vec<_>>()
+        };
+        let input = |engine, pii_mode, pii| DoctorInput {
+            pii_mode,
+            engine,
+            diagnosis: Diagnosis {
+                pii,
+                connect: ConnectFact::Ok { via_tunnel: false },
+                server: Some(ServerFacts {
+                    superuser: SuperuserFact::No("off".into()),
+                    read_only_note: None,
+                    probe: ProbeFact::Blocked {
+                        detail: "permission denied".into(),
+                        ddl_only: true,
+                    },
+                }),
+            },
+            transport: Transport::TlsDirect,
+            permissions: Permissions::Secure,
+        };
+        let check = |i: DoctorInput| {
+            let checks = doctor_checks(&i);
+            let c = by(&checks, "pii_columns");
+            (c.status, c.message.clone(), c.hint.clone())
+        };
+
+        // No policy at all -> the check is not emitted (noise on every
+        // connection that does not use the feature).
+        let checks = doctor_checks(&input(EngineKind::Postgres, None, Vec::new()));
+        assert!(
+            !checks.iter().any(|c| c.name == "pii_columns"),
+            "pii_columns must be absent without a policy"
+        );
+
+        // SQLite -> na, and the message says plainly that nyet is alone here.
+        let (status, message, _) = check(input(
+            EngineKind::Sqlite,
+            Some("mask"),
+            access(&[("users.email", None)]),
+        ));
+        assert_eq!(status, CheckStatus::Na);
+        assert!(message.contains("only thing"), "{message}");
+
+        // Unreadable for this role -> ok.
+        let (status, message, _) = check(input(
+            EngineKind::Postgres,
+            Some("deny"),
+            access(&[("users.email", Some(false)), ("users.phone", Some(false))]),
+        ));
+        assert_eq!(status, CheckStatus::Ok);
+        assert!(message.contains("cannot read"), "{message}");
+
+        // Readable -> warn, naming the columns and the GRANT recipe.
+        let (status, message, hint) = check(input(
+            EngineKind::Mysql,
+            Some("mask"),
+            access(&[("users.email", Some(true)), ("users.phone", Some(false))]),
+        ));
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(message.contains("users.email"), "{message}");
+        assert!(message.contains("outside nyet"), "{message}");
+        assert!(hint.unwrap().contains("REVOKE SELECT"));
+
+        // Could not verify -> warn, never a pass.
+        let (status, message, hint) = check(input(
+            EngineKind::Postgres,
+            Some("deny"),
+            access(&[("typo.email", None)]),
+        ));
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(message.contains("could not verify"), "{message}");
+        assert!(hint.is_some());
+    }
+
     /// A read-only-transaction / replica refusal is the strong layer-3 pass: the
     /// message claims every direct write is rejected, and the replica note is
     /// folded in. A non-superuser role over TLS with a 0600 config is all green.
     #[test]
     fn doctor_read_only_role_ok_when_the_probe_is_blocked() {
         let input = DoctorInput {
+            pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
+                pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     superuser: SuperuserFact::No("current_setting('is_superuser') = off".into()),
@@ -1915,8 +2222,10 @@ mod tests {
     fn doctor_blocked_headline_does_not_over_promise_on_ddl_only() {
         let blocked = |ddl_only: bool| {
             let input = DoctorInput {
+                pii_mode: None,
                 engine: EngineKind::Postgres,
                 diagnosis: Diagnosis {
+                    pii: Vec::new(),
                     connect: ConnectFact::Ok { via_tunnel: false },
                     server: Some(ServerFacts {
                         superuser: SuperuserFact::No("off".into()),
@@ -1949,8 +2258,10 @@ mod tests {
     #[test]
     fn doctor_unknown_is_warn_never_a_false_ok() {
         let input = DoctorInput {
+            pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
+                pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     superuser: SuperuserFact::Unknown("could not read is_superuser".into()),
@@ -1980,8 +2291,10 @@ mod tests {
     #[test]
     fn doctor_reports_orphan_probe_table_and_unresolved_grants() {
         let input = DoctorInput {
+            pii_mode: None,
             engine: EngineKind::Mysql,
             diagnosis: Diagnosis {
+                pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     superuser: SuperuserFact::Unresolved(
@@ -2012,8 +2325,10 @@ mod tests {
     #[test]
     fn doctor_sqlite_is_honest_about_na() {
         let input = DoctorInput {
+            pii_mode: None,
             engine: EngineKind::Sqlite,
             diagnosis: Diagnosis {
+                pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: None,
             },
@@ -2034,8 +2349,10 @@ mod tests {
     #[test]
     fn doctor_connect_failure_is_a_fail_check_not_an_error() {
         let input = DoctorInput {
+            pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
+                pii: Vec::new(),
                 connect: ConnectFact::Failed {
                     message: "cannot connect".into(),
                     hint: "check host/port".into(),

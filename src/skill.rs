@@ -81,7 +81,7 @@ Success is `{"v":1,"ok":true, ...}`:
 - `warnings` — array of `{code, message}`, omitted when empty. These are NOT
   errors; the answer is valid. Codes include `TRUNCATED`, `SCHEMA_TRUNCATED`,
   `GUARDRAIL_SKIPPED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
-  `INSECURE_TRANSPORT`.
+  `INSECURE_TRANSPORT`, `PII_MASKED` (see below).
 
 Failure is `{"v":1,"ok":false,"error":{"code":...,"message":...,"hint":...}}`.
 Always read `hint` — it tells you how to fix it. A refusal (`"code":"NYET"`)
@@ -115,9 +115,41 @@ flag. Common reasons:
   in the envelope's `estimate`; if planning itself outran its budget there may be
   no `estimate`, so go by `message`/`hint`. Narrow it (add a WHERE filter or a
   LIMIT, join on an indexed column).
+- `PII_COLUMN` / `PII_UNPROVABLE` — the query touches a column the config owner
+  marked as personal data (see below).
 - `DENIED_FUNCTION`, `LOCKING_CLAUSE` (`FOR UPDATE`/`FOR SHARE`),
   `EXPLAIN_ANALYZE`, `TXN_CONTROL`, `EXECUTABLE_COMMENT`, `PARSE_FAILED` — read
   the message and rewrite accordingly.
+
+## Protected columns (personal data)
+
+The config owner can mark columns as personal data. `nyet schema` marks them for
+you: a column then carries `"pii":"deny"` or `"pii":"mask"` — plan around them
+instead of discovering them by refusal.
+
+- `"deny"` — every query that could expose the column is refused
+  (`PII_COLUMN`; `PII_UNPROVABLE` when nyet cannot prove where a result column
+  came from). Select the other columns instead.
+- `"mask"` — you may SELECT the column plainly (`SELECT id, email FROM users`)
+  and every value comes back as the literal string `[REDACTED]`, with a
+  `PII_MASKED` warning naming the columns. That string is NOT the data: the real
+  value, its type and its length are not in the answer, and a masked NULL looks
+  like every other masked cell. Never treat it as a value, compare it, or report
+  it to the user as one.
+
+In both modes any OTHER use of the column is refused — a `WHERE`/`JOIN ON`/
+`USING`, `HAVING`, an alias (`AS e`), an expression around it
+(`substr(email,1,3)`), a `SELECT *` of its table, a subquery or CTE that projects
+it, and `DISTINCT` over it — because comparing, sorting or grouping by the real
+value reads it back out of the row count or the row order. While a masked column
+is in the SELECT list, `ORDER BY`/`GROUP BY` accept plain column NAMES only:
+`SELECT id, email FROM users ORDER BY id` works, `ORDER BY 1` (or any expression)
+is refused.
+A masked column also cannot share a SELECT list with `*` or `t.*` (nyet then
+cannot tell which result column is which) — list the columns instead.
+There is no flag, header or retry shape that lifts this: the policy belongs to
+whoever owns the config file. If a task genuinely needs the protected data, say
+so to the human and ask them.
 
 ## Your connections
 
@@ -271,6 +303,10 @@ mod tests {
             "WRITE_OPERATION",
             "EXPENSIVE_QUERY",
             "alias",
+            // The PII contract: the agent must know a mask when it sees one.
+            "PII_COLUMN",
+            "PII_MASKED",
+            "[REDACTED]",
         ] {
             assert!(text.contains(marker), "missing marker: {marker}");
         }

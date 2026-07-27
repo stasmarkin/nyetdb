@@ -263,28 +263,48 @@ enum Db {
 
 impl Db {
     /// The ONE way rows leave the engine layer — and therefore the one place
-    /// net B (PII provenance) is applied. Putting the check here rather than in
-    /// a command body means a future rows-returning command cannot inherit the
-    /// hole by forgetting to call it (finding 6); `QueryOutcome::PiiRefused`
-    /// then forces every caller to handle the refusal.
+    /// net B (PII provenance) is applied, refusal AND masking alike. Putting it
+    /// here rather than in a command body means a future rows-returning command
+    /// cannot inherit the hole by forgetting to call it (finding 6);
+    /// `QueryOutcome::PiiRefused` then forces every caller to handle the
+    /// refusal, and the masked names it returns are the material for the
+    /// `PII_MASKED` warning (the agent must know it is looking at a mask, UX-2).
+    ///
+    /// The rows are redacted HERE, before anything downstream exists: the
+    /// formatters, the audit response and `meta` all read the same masked
+    /// `ResultSet`, so no path can serialize a raw protected value.
     async fn execute(
         &self,
         sql: &str,
         fetch_limit: u64,
         guardrail: &guardrail::Guardrail,
         pii: &validator::PiiRules,
-    ) -> Result<engine::QueryOutcome, engine::EngineError> {
-        let outcome = match self {
+        pii_exempt: &[usize],
+    ) -> Result<(engine::QueryOutcome, Vec<String>), engine::EngineError> {
+        let mut outcome = match self {
             Db::Sqlite(e) => e.execute(sql, fetch_limit, guardrail).await,
             Db::Postgres(e) => e.execute(sql, fetch_limit, guardrail).await,
             Db::Mysql(e) => e.execute(sql, fetch_limit, guardrail).await,
         }?;
-        if let engine::QueryOutcome::Ran { result, .. } = &outcome {
-            if let Some(refusal) = validator::check_origins(pii, &result.columns, &result.origins) {
-                return Ok(engine::QueryOutcome::PiiRefused(Box::new(refusal)));
+        let mut masked = Vec::new();
+        if let engine::QueryOutcome::Ran { result, .. } = &mut outcome {
+            match validator::check_origins(pii, &result.columns, &result.origins, pii_exempt) {
+                Err(refusal) => {
+                    return Ok((
+                        engine::QueryOutcome::PiiRefused(Box::new(refusal)),
+                        Vec::new(),
+                    ))
+                }
+                Ok(indexes) => {
+                    masked = indexes
+                        .iter()
+                        .map(|i| result.columns[*i].clone())
+                        .collect::<Vec<_>>();
+                    output::redact(&mut result.rows, &indexes);
+                }
             }
         }
-        Ok(outcome)
+        Ok((outcome, masked))
     }
 
     async fn estimate(
@@ -330,11 +350,11 @@ impl Db {
         }
     }
 
-    async fn diagnose(&self) -> output::Diagnosis {
+    async fn diagnose(&self, pii: &[(String, String)]) -> output::Diagnosis {
         match self {
-            Db::Sqlite(e) => e.diagnose().await,
-            Db::Postgres(e) => e.diagnose().await,
-            Db::Mysql(e) => e.diagnose().await,
+            Db::Sqlite(e) => e.diagnose(pii).await,
+            Db::Postgres(e) => e.diagnose(pii).await,
+            Db::Mysql(e) => e.diagnose(pii).await,
         }
     }
 }
@@ -674,7 +694,8 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // config owner's max_row_limit (see config::capped).
                 let limit = cfg.row_limit(conn, limit);
                 // Layer 1: the validator. Any deny -> code NYET + reason, exit 5.
-                let (query, is_query, mut warnings) = validate(&query, &session.policy)?;
+                let (query, is_query, mut warnings, pii_exempt) =
+                    validate(&query, &session.policy)?;
                 // Layer 1.5: the guardrail. Only a plain query can be wrapped in an
                 // EXPLAIN; SHOW/DESCRIBE are metadata no planner estimates, so they
                 // run unguarded (documented). An EXPLAIN ANALYZE never gets here —
@@ -690,15 +711,19 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // forwards never accumulate. Fetch limit+1 to detect truncation
                 // without reading everything.
                 let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
-                let (outcome, duration_ms) = run_db(
+                let ((outcome, masked), duration_ms) = run_db(
                     redact_db_errors,
                     session.db.execute(
                         &query,
                         limit.saturating_add(1),
                         &guardrail,
                         session.policy.pii(),
+                        &pii_exempt,
                     ),
                 )?;
+                if !masked.is_empty() {
+                    warnings.push(pii_masked_warning(&masked));
+                }
 
                 let (mut rs, estimate) = match outcome {
                     // The guardrail refused: nothing ran, and the envelope carries
@@ -844,8 +869,15 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             let redact_db_errors = session.redact_db_errors();
             let outcome = (|| -> Result<Emitted, Failure> {
                 let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
-                let (schema, duration_ms) =
+                let (mut schema, duration_ms) =
                     run_db(redact_db_errors, session.db.schema(table.as_deref()))?;
+                // The policy is config, so the marking happens here and not in
+                // the engines: they only report what the catalog (already
+                // privilege-filtered) holds.
+                let pii = session.policy.pii();
+                if !pii.is_empty() {
+                    output::mark_pii(&mut schema, pii.mode().as_str(), |t, c| pii.protects(t, c));
+                }
 
                 // An explicit [table] that matched nothing: the catalog answered,
                 // the object simply is not there. DB_ERROR (exit 7) with the way
@@ -935,7 +967,9 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             let outcome = (|| -> Result<Emitted, Failure> {
                 // The very same layer 1 as `nyet query` — planning a write is
                 // refused (exit 5) before anything is sent to the database.
-                let (query, is_query, mut warnings) = validate(&query, &session.policy)?;
+                // `explain` returns a plan and no rows, so net B never runs and
+                // the mask promise is irrelevant here (net A alone applies).
+                let (query, is_query, mut warnings, _) = validate(&query, &session.policy)?;
                 // The verdict is informational here, but it is measured against this
                 // connection's own guardrail, so `explain` answers exactly what
                 // `query` would decide.
@@ -1066,17 +1100,22 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     let timeout_secs = cfg.timeout_secs(conn, None);
                     let (mut db, _policy) = build_engine(&alias, conn, timeout_secs)?;
                     audit_id = Some((alias.clone(), conn.engine.clone()));
+                    // The policy is needed twice here: the engine asks the
+                    // server about these very columns, and the redaction below
+                    // keys on "has a policy at all".
+                    let pii = config::pii(&alias, conn).map_err(|e| config_failure(e, &path))?;
+                    let pii_pairs: Vec<(String, String)> = pii
+                        .pairs()
+                        .map(|(t, c)| (t.to_string(), c.to_string()))
+                        .collect();
                     let (mut diagnosis, duration_ms) =
-                        diagnose_connection(conn, timeout_secs, &mut db)?;
+                        diagnose_connection(conn, timeout_secs, &mut db, &pii_pairs)?;
                     // doctor never goes through run_db/engine_failure, so the
                     // redaction has to be applied to the FACTS it collected:
                     // ConnectFact::Failed and the probe `detail` carry the
                     // driver's verbatim message (finding 8). The promise in
                     // README/DESIGN is unconditional, so it holds here too.
-                    if !config::pii(&alias, conn)
-                        .map_err(|e| config_failure(e, &path))?
-                        .is_empty()
-                    {
+                    if !pii.is_empty() {
                         redact_diagnosis(&mut diagnosis);
                     }
                     let input = output::DoctorInput {
@@ -1084,6 +1123,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                         diagnosis,
                         transport: doctor_transport(conn),
                         permissions,
+                        pii_mode: (!pii.is_empty()).then(|| pii.mode().as_str()),
                     };
                     (
                         output::doctor_checks(&input),
@@ -1206,7 +1246,7 @@ fn load_connections(config_flag: Option<PathBuf>) -> skill::Connections {
 fn validate(
     query: &str,
     policy: &validator::Policy,
-) -> Result<(String, bool, Vec<output::Warning>), Failure> {
+) -> Result<(String, bool, Vec<output::Warning>, Vec<usize>), Failure> {
     match validator::validate(query, policy) {
         validator::Verdict::Deny {
             reason,
@@ -1221,6 +1261,7 @@ fn validate(
             sql,
             warnings,
             is_query,
+            pii_exempt,
         } => Ok((
             sql,
             is_query,
@@ -1231,6 +1272,7 @@ fn validate(
                     message: w.message,
                 })
                 .collect(),
+            pii_exempt,
         )),
     }
 }
@@ -1244,6 +1286,28 @@ fn refusal_failure(r: validator::Refusal) -> Failure {
 /// happened, why, what to do instead. Shared by `query` (which then ran the
 /// query unguarded) and `explain` (whose verdict is `no_estimate` for the very
 /// same reason), so the agent is never left guessing why there is no number.
+/// `mode = "mask"`: the agent MUST be told which columns it is looking at a mask
+/// of, or it will read `[REDACTED]` as data and reason on it (UX-2/UX-4). Names
+/// only — never a value, and never how many rows were affected (every row of the
+/// column is replaced, so there is nothing to count).
+fn pii_masked_warning(columns: &[String]) -> output::Warning {
+    output::Warning {
+        code: "PII_MASKED",
+        message: format!(
+            "column(s) {} are protected by this connection's PII policy (mode = \"mask\"): \
+             every value in them was replaced with \"{}\" before you saw it — the real \
+             values, their type and their length are not in this answer, so do not treat \
+             them as data, compare them or report them as such",
+            columns
+                .iter()
+                .map(|c| format!("'{c}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            output::REDACTED
+        ),
+    }
+}
+
 fn guardrail_skipped_warning() -> output::Warning {
     output::Warning {
         code: "GUARDRAIL_SKIPPED",
@@ -1730,6 +1794,7 @@ fn diagnose_connection(
     conn: &config::Connection,
     timeout_secs: u64,
     db: &mut Db,
+    pii: &[(String, String)],
 ) -> Result<(output::Diagnosis, u64), Failure> {
     let started = Instant::now();
     let elapsed =
@@ -1744,13 +1809,14 @@ fn diagnose_connection(
                         hint: f.hint,
                     },
                     server: None,
+                    pii: Vec::new(),
                 },
                 elapsed(started),
             ));
         }
     };
     let rt = runtime()?;
-    let diagnosis = rt.block_on(db.diagnose());
+    let diagnosis = rt.block_on(db.diagnose(pii));
     // A slow/abandoned probe future must not join a busy worker on exit.
     rt.shutdown_background();
     Ok((diagnosis, elapsed(started)))
@@ -2033,6 +2099,7 @@ mod tests {
     #[test]
     fn redact_diagnosis_hides_probe_detail_but_not_the_connect_reason() {
         let mut d = output::Diagnosis {
+            pii: Vec::new(),
             connect: output::ConnectFact::Failed {
                 message: "password authentication failed for user \"nyet_ro\"".to_string(),
                 hint: "h".to_string(),
@@ -2048,6 +2115,7 @@ mod tests {
         }
         // The probe DOES run a statement against real data, so its detail goes.
         let mut d = output::Diagnosis {
+            pii: Vec::new(),
             connect: output::ConnectFact::Ok { via_tunnel: false },
             server: Some(output::ServerFacts {
                 read_only_note: None,

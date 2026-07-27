@@ -1030,3 +1030,193 @@ fn mysql_pii_policy_end_to_end() {
         container.rm().await.unwrap();
     });
 }
+
+/// `mode = "mask"` against a live MariaDB: the redaction rides on the origin the
+/// driver reports on the wire (`db.table` + the ORIGINAL column name, so an
+/// alias cannot hide it). Plus the leak guard and the `pii_columns` doctor check
+/// against two real accounts — one granted the column, one not.
+#[test]
+fn mysql_pii_mask_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        const VALUE: &str = "alice@example.com";
+        {
+            use sqlx::{ConnectOptions, Connection, Executor};
+            let opts: sqlx::mysql::MySqlConnectOptions =
+                format!("mysql://root@127.0.0.1:{port}/test")
+                    .parse()
+                    .unwrap();
+            let mut w = opts.connect().await.unwrap();
+            for sql in [
+                format!("INSERT INTO users VALUES (9, '{VALUE}')"),
+                "CREATE TABLE dict (id int, email varchar(255))".to_string(),
+                // Two accounts: one that may read the protected column (so nyet
+                // is the only boundary) and one whose column grant means the
+                // server enforces the same line.
+                format!("CREATE USER 'pii_all'@'%' IDENTIFIED BY '{PW}'"),
+                "GRANT SELECT ON test.users TO 'pii_all'@'%'".to_string(),
+                format!("CREATE USER 'pii_none'@'%' IDENTIFIED BY '{PW}'"),
+                "GRANT SELECT (id) ON test.users TO 'pii_none'@'%'".to_string(),
+                // A column whose name needs quoting: the doctor probe is the one
+                // place a config name reaches SQL text, so the escaping has to
+                // be exercised by a test, not just by review.
+                "ALTER TABLE users ADD COLUMN `we``ird` varchar(8)".to_string(),
+                "FLUSH PRIVILEGES".to_string(),
+            ] {
+                w.execute(sqlx::AssertSqlSafe(sql)).await.unwrap();
+            }
+            w.close().await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_mysql_config_with(
+            tmp.path(),
+            port,
+            "[connections.my.pii]\ncolumns = [\"users.email\"]\nmode = \"mask\"\n\
+             [audit]\nlog_responses = true\n",
+        );
+        let no_leak = |out: &Output, sql: &str| {
+            assert!(!stdout(out).contains(VALUE), "{sql}: leaked to stdout");
+            assert!(!stderr(out).contains(VALUE), "{sql}: leaked to stderr");
+        };
+
+        let sql = "SELECT id, email FROM users";
+        let out = run(tmp.path(), &cfg, &["query", "my", sql]);
+        assert_eq!(out.status.code(), Some(0), "{sql}: {}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 4, "{v}");
+        for row in rows {
+            // The NULL row (id 3) reads exactly like the rest.
+            assert_eq!(row["email"], "[REDACTED]", "{v}");
+        }
+        assert_eq!(v["warnings"][0]["code"], "PII_MASKED", "{v}");
+        no_leak(&out, sql);
+        assert_no_password_leak(&out);
+
+        // LEAK GUARD: the forensic log holds what the agent saw, masked.
+        let audit = tmp.path().join(".local/share/nyet/audit.jsonl");
+        let text = std::fs::read_to_string(&audit).expect("audit file must exist");
+        assert!(!text.contains(VALUE), "the audit log leaked the value");
+        assert!(text.contains("[REDACTED]"), "{text}");
+
+        // The oracles stay refused, mode or no mode.
+        for sql in [
+            "SELECT count(*) FROM users WHERE email LIKE 'a%'",
+            "SELECT email FROM users ORDER BY 1",
+            "SELECT DISTINCT email FROM users",
+            "SELECT email AS x FROM users",
+            "SELECT * FROM users",
+            "SELECT count(*) FROM users JOIN dict USING (email)",
+            "SELECT NULL AS a, NULL AS b UNION ALL TABLE users",
+            "SELECT * FROM information_schema.column_statistics",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "my", sql]);
+            assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+            no_leak(&out, sql);
+        }
+
+        // doctor, against the two real accounts.
+        let doctor_pii = |user: &str| {
+            let cfg = tmp.path().join(format!("doctor-{user}.toml"));
+            std::fs::write(
+                &cfg,
+                format!(
+                    "[connections.my]\nengine = \"mariadb\"\n\
+                     url = \"mysql://{user}@127.0.0.1:{port}/test\"\n\
+                     password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n\
+                     [connections.my.pii]\ncolumns = [\"users.email\"]\nmode = \"mask\"\n",
+                    tmp.path().display()
+                ),
+            )
+            .unwrap();
+            let out = run(tmp.path(), &cfg, &["doctor", "my", "--format", "json"]);
+            assert_eq!(out.status.code(), Some(0), "{user}: {}", stderr(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            v["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "pii_columns")
+                .unwrap_or_else(|| panic!("{user}: no pii_columns check: {v}"))
+                .clone()
+        };
+        let check = doctor_pii("pii_all");
+        assert_eq!(check["status"], "warn", "{check}");
+        assert!(
+            check["message"].as_str().unwrap().contains("users.email"),
+            "{check}"
+        );
+        // information_schema.COLUMNS is privilege-filtered by the server, so the
+        // column-granted account provably cannot see `email` at all — but an
+        // INVISIBLE column is ambiguous there ("not granted" vs "no such
+        // column"), which is why the verdict comes from the server's error code
+        // (1143 denied vs 1054 unknown). Both directions, on one account:
+        let check = doctor_pii("pii_none");
+        assert_eq!(check["status"], "ok", "{check}");
+
+        // The probe's identifier quoting (a doubled backtick) is load-bearing:
+        // without it this rule produces a syntax error instead of the server's
+        // "denied" code, and a real column-level grant would read as
+        // "could not verify" — the ablation that used to pass unnoticed.
+        let cfg_quoted = tmp.path().join("doctor-quoted.toml");
+        std::fs::write(
+            &cfg_quoted,
+            format!(
+                "[connections.my]\nengine = \"mariadb\"\n\
+                 url = \"mysql://pii_none@127.0.0.1:{port}/test\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n\
+                 [connections.my.pii]\ncolumns = ['\"users\".\"we`ird\"']\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(
+            tmp.path(),
+            &cfg_quoted,
+            &["doctor", "my", "--format", "json"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        let check = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "pii_columns")
+            .unwrap();
+        assert_eq!(check["status"], "ok", "{check}");
+        // A rule naming a column that does not exist protects NOTHING, and must
+        // never read as "the database enforces it" (it did, before review).
+        let cfg_typo = tmp.path().join("doctor-typo.toml");
+        std::fs::write(
+            &cfg_typo,
+            format!(
+                "[connections.my]\nengine = \"mariadb\"\n\
+                 url = \"mysql://pii_none@127.0.0.1:{port}/test\"\n\
+                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n\
+                 [connections.my.pii]\ncolumns = [\"users.nosuchcolumn\"]\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let out = run(tmp.path(), &cfg_typo, &["doctor", "my", "--format", "json"]);
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        let check = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "pii_columns")
+            .unwrap();
+        assert_eq!(check["status"], "warn", "{check}");
+        assert!(
+            check["message"]
+                .as_str()
+                .unwrap()
+                .contains("could not verify"),
+            "{check}"
+        );
+
+        container.rm().await.unwrap();
+    });
+}

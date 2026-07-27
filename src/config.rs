@@ -89,8 +89,9 @@ pub struct Connection {
 }
 
 /// `[connections.X.pii]`: the columns the config owner declares to be personal
-/// data. nyet refuses (NYET, exit 5) any query that could expose them; it never
-/// masks or filters values (that is a later step). Absent section or
+/// data. `mode = "deny"` (the default) refuses (NYET, exit 5) any query that
+/// could expose them; `mode = "mask"` additionally lets a plain projection
+/// through with every value replaced by `[REDACTED]`. Absent section or
 /// `columns = []` = no PII policy, byte-for-byte the historical behavior (UX-5).
 /// POLICY, so `${VAR}` inside a rule is rejected like `allowed_dirs` — the agent
 /// controls the environment and would otherwise unprotect its own targets.
@@ -100,6 +101,8 @@ pub struct Pii {
     /// `["users.email", "app.customers.ssn"]` — `table.column`, optionally
     /// schema-qualified. Parsed and validated by `validator::PiiRules::parse`.
     pub columns: Option<Vec<String>>,
+    /// `"deny"` (default) | `"mask"`. Validated by `validator::PiiMode::parse`.
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -351,15 +354,30 @@ pub fn guardrail(
 /// `parse` calls it so a malformed rule is a loud config error (exit 3) before
 /// anything connects, and the cli calls it again to build the validator policy.
 pub fn pii(alias: &str, conn: &Connection) -> Result<crate::validator::PiiRules, ConfigError> {
+    let invalid = |message: String| ConfigError::PiiRuleInvalid {
+        alias: alias.to_string(),
+        message,
+    };
     let columns = conn
         .pii
         .as_ref()
         .and_then(|p| p.columns.as_deref())
         .unwrap_or(&[]);
-    crate::validator::PiiRules::parse(columns).map_err(|message| ConfigError::PiiRuleInvalid {
-        alias: alias.to_string(),
-        message,
-    })
+    let mode = match conn.pii.as_ref().and_then(|p| p.mode.as_deref()) {
+        None => crate::validator::PiiMode::default(),
+        // A mode with nothing to apply it to is the same class of lie as a rule
+        // that can never match: the config owner reads "mask" and believes some
+        // column is handled, while there is no policy at all.
+        Some(_) if columns.is_empty() => {
+            return Err(invalid(
+                "mode is set but columns is empty, so the mode applies to nothing: list the \
+                 protected columns, or drop the [pii] section entirely"
+                    .to_string(),
+            ))
+        }
+        Some(value) => crate::validator::PiiMode::parse(value).map_err(invalid)?,
+    };
+    crate::validator::PiiRules::parse(columns, mode).map_err(invalid)
 }
 
 /// Zero limits are footguns: row_limit = 0 returns nothing (looking like an
@@ -444,6 +462,13 @@ fn reject_env_vars_in_policy(value: &toml::Value) -> Result<(), ConfigError> {
             .filter_map(toml::Value::as_str)
         {
             literal("pii.columns", rule)?;
+        }
+        if let Some(mode) = conn
+            .get("pii")
+            .and_then(|p| p.get("mode"))
+            .and_then(toml::Value::as_str)
+        {
+            literal("pii.mode", mode)?;
         }
         if let Some(mode) = conn
             .get("guardrail")
@@ -1212,6 +1237,62 @@ mod tests {
             parse(text, &env_of(&[])).unwrap_err(),
             ConfigError::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn pii_mode_parses_and_a_bad_one_fails_loud() {
+        let with = |body: &str| {
+            format!(
+                "[connections.a]\nengine = \"sqlite\"\npath = \"x.db\"\n\
+                 [connections.a.pii]\ncolumns = [\"users.email\"]\n{body}"
+            )
+        };
+        // Absent = deny, byte for byte the pre-PII-2 behavior (UX-5).
+        let cfg = parse(&with(""), &env_of(&[])).unwrap();
+        assert_eq!(
+            pii("a", &cfg.connections["a"]).unwrap().mode(),
+            crate::validator::PiiMode::Deny
+        );
+        for (value, want) in [
+            ("deny", crate::validator::PiiMode::Deny),
+            ("mask", crate::validator::PiiMode::Mask),
+        ] {
+            let cfg = parse(&with(&format!("mode = \"{value}\"")), &env_of(&[])).unwrap();
+            assert_eq!(pii("a", &cfg.connections["a"]).unwrap().mode(), want);
+        }
+        // A typo must not silently pick either sanction (Д3): loud, with the
+        // two accepted values in the message.
+        for bad in ["Mask", "redact", "off", ""] {
+            let text = with(&format!("mode = \"{bad}\""));
+            match parse(&text, &env_of(&[])).unwrap_err() {
+                ConfigError::PiiRuleInvalid { alias, message } => {
+                    assert_eq!(alias, "a");
+                    assert!(message.contains("mask"), "{bad}: {message}");
+                    assert!(message.contains("deny"), "{bad}: {message}");
+                }
+                other => panic!("expected PiiRuleInvalid for mode {bad:?}, got {other:?}"),
+            }
+        }
+        // A mode with no columns protects nothing while reading as if it did.
+        let text = "[connections.a]\nengine = \"sqlite\"\npath = \"x.db\"\n\
+                    [connections.a.pii]\nmode = \"mask\"";
+        match parse(text, &env_of(&[])).unwrap_err() {
+            ConfigError::PiiRuleInvalid { message, .. } => {
+                assert!(message.contains("columns is empty"), "{message}");
+            }
+            other => panic!("expected PiiRuleInvalid, got {other:?}"),
+        }
+        // ${VAR} is rejected here too: the agent owns the environment and would
+        // otherwise switch its own sanction.
+        let text = "[connections.a]\nengine = \"sqlite\"\npath = \"x.db\"\n\
+                    [connections.a.pii]\ncolumns = [\"users.email\"]\nmode = \"${M}\"";
+        match parse(text, &env_of(&[("M", "mask")])).unwrap_err() {
+            ConfigError::EnvVarInPolicy { alias, key, .. } => {
+                assert_eq!(alias, "a");
+                assert_eq!(key, "pii.mode");
+            }
+            other => panic!("expected EnvVarInPolicy(pii.mode), got {other:?}"),
+        }
     }
 
     #[test]

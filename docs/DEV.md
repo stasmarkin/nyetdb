@@ -155,8 +155,10 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 ├─ resolver  (src/resolver.rs)  — pure: (cwd, allowed_dirs) -> allowed?; canonicalize injected
 ├─ validator (src/validator.rs) — pure: (SQL text, Policy) -> Allow{sql,warnings} |
 │                                 Deny{reason,message,hint}; also owns the PII
-│                                 policy (PiiRules) and the post-execution
-│                                 provenance check (Origin/check_origins);
+│                                 policy (PiiRules + PiiMode) and the
+│                                 post-execution provenance check
+│                                 (Origin/check_origins -> refusal, or the
+│                                 columns to mask);
 │                                 depends ONLY on sqlparser + unicode-properties
 │                                 (+std)
 ├─ guardrail (src/guardrail.rs) — pure: (config) -> Guardrail; (plan) ->
@@ -902,13 +904,15 @@ regardless of `allowed_dirs` — the human owns the config and is often testing 
 before `cd`-ing into the project. `nyet doctor` with no alias lists the
 connections reachable from cwd (scoping applies to that listing only).
 
-The five checks (order = presentation order): `connectivity`,
-`transport_encrypted`, `read_only_role`, `not_superuser`, `config_permissions`.
+The six checks (order = presentation order): `connectivity`,
+`transport_encrypted`, `read_only_role`, `not_superuser`, `pii_columns`,
+`config_permissions`.
 `transport_encrypted` reuses the same static rule as the `INSECURE_TRANSPORT`
 warning (`engine::transport_below_require`, ssh vs. sslmode >= require);
-`config_permissions` reuses `config::permissions_warning`. SQLite reports
-`transport_encrypted` / `read_only_role` / `not_superuser` as `na` (no server,
-roles or network) — an honest non-answer, never a faked pass.
+`config_permissions` reuses `config::permissions_warning`; `pii_columns` is
+described in the PII section below. SQLite reports
+`transport_encrypted` / `read_only_role` / `not_superuser` / `pii_columns` as
+`na` (no server, roles or network) — an honest non-answer, never a faked pass.
 
 ### The layer-3 write probe — the ONE place layer 2 is removed
 
@@ -1268,15 +1272,20 @@ Dev:
   proof that `require` is enforced by the rustls backend, not silently
   downgraded to plaintext.
 
-## PII columns (`[connections.X.pii]`, step PII-1)
+## PII columns (`[connections.X.pii]`, steps PII-1 / PII-2)
 
-The config owner marks `table.column` pairs as personal data; nyet **refuses**
-any query that could expose them. Masking values is deliberately NOT part of
-this step — the only sanction is a whole-query deny (`NYET`/`PII_COLUMN`, exit 5).
+The config owner marks `table.column` pairs as personal data. `mode = "deny"`
+(the default, step PII-1) refuses any query that could expose them
+(`NYET`/`PII_COLUMN`, exit 5); `mode = "mask"` (step PII-2) additionally lets a
+plain projection through with every value replaced by `[REDACTED]`. The mode
+lives in `PiiRules` itself, so both nets read the same single source.
 
 ### Two nets, both fail-closed
 
-**Net A — names, before execution** (`src/validator.rs`, pure). A pre-pass
+**Net A — names, before execution** (`src/validator.rs`, pure). Everything below
+is the rule in BOTH modes; `mode = "mask"` carves out exactly one shape (a bare
+unaliased projection of the column, in a statement that does not sort, group or
+dedupe) — see "Masking" below. A pre-pass
 (`TableScan::push_factor`) classifies EVERY table factor. From it `PiiScope`
 builds the protected column names of the protected relations in scope, the
 handles that stand for them, and the full relation-name set. The main `Checker`
@@ -1526,6 +1535,247 @@ PII connection, and if sqlx ever stops resolving origins the columns arrive as
 `Unknown` and that line turns into an exit-5 `PII_UNPROVABLE`. The judging logic
 itself is unit-tested (`net_b_judges_the_reported_provenance`).
 
+### Masking (`mode = "mask"`, step PII-2)
+
+**A cell is redacted only where BOTH nets agree — that is the whole design.**
+Net A says which projection may be masked (`pii_exempt`: result-column indexes)
+and net B proves from the driver's PROVENANCE that the result column really is
+that protected column. `check_origins` returns the intersection, and
+`Db::execute` replaces those cells — the one place rows leave the engine layer,
+so the formatters, `meta`, the audit `response` and every future rows-returning
+command see the masked `ResultSet` and nothing else can serialize a raw value.
+Any disagreement REFUSES:
+
+- promised but not proven -> `PII_UNPROVABLE` (the promise check below);
+- proven but not promised -> refused exactly as under `deny`;
+- `Unknown` -> refused in BOTH modes: a column nyet cannot identify could be the
+  protected one, and there is no masking what you cannot name.
+
+**Why net B does not mask on its own** (review round 6; this deliberately narrows
+the original PII-2 sketch, where net B was to be "the source of truth" and mask
+any protected origin). Net B knows MORE than net A — SQLite resolves a view
+column to its base table — and a column net A never saw is one it could not judge
+the `ORDER BY` / `DISTINCT` over: with `columns = ["users.email"]`, `SELECT id,
+contact FROM v_users ORDER BY contact` came back fully redacted and perfectly
+SORTED by the hidden value, and `SELECT DISTINCT contact FROM v_users` gave its
+exact cardinality. `deny` refuses both. Masking only what net A sanctioned makes
+the ordering guard complete BY CONSTRUCTION (it judges exactly the set that can
+be masked), makes the three engines agree (PostgreSQL and MySQL never reported
+through a view anyway), and turns "mask ⊆ deny" into a structural property rather
+than a claim. The cost: `columns = ["users.email"]` no longer silently covers
+`v_users.contact` on SQLite — and the fix is the one every engine already needed,
+list the view's own columns.
+
+**What net A relaxes, and why exactly that** (`validator::maskable_projection`).
+Net A must not allow anything net B cannot then prove, so the relaxation is the
+narrowest shape all three drivers resolve to a real `table.column`: a **bare,
+unaliased column reference in the ROOT select's projection**. Each condition
+closes a concrete channel:
+
+- **bare** — `upper(email)` carries no provenance at all (net B sees an
+  `Expression` and passes it through), so allowing it would return the real value
+  transformed;
+- **unaliased** — an alias is a second name for the value, and **SQLite accepts
+  an output alias in `WHERE`** (`SELECT email AS e FROM users WHERE e LIKE 'a%'`),
+  where net A can no longer recognise it. That is the character-by-character
+  oracle the mask exists to prevent, so `ExprWithAlias` is not exempt;
+- **root select only** — a derived table, a CTE or a UNION arm hands its column
+  to another layer, and what a driver reports THROUGH that layer is precisely the
+  documented view limitation. `SELECT x FROM (SELECT email AS x FROM users) t`
+  must not become a laundering path;
+- **no WILDCARD anywhere in that projection** (review round 6). `*` and `t.*`
+  expand into as many result columns as the source has, so every item to their
+  right sits at an index net A cannot compute — and the promise net B checks by
+  index is then kept by the WRONG column while the exempted one goes out RAW.
+  Measured: with two renaming views, `SELECT v_contacts.*, c.work_mail FROM
+  v_contacts, v_crm c` masked the wildcard's `email` and returned `work_mail` in
+  plaintext, exit 0, where `deny` refused the same statement. A qualified `t.*`
+  is NOT caught by the wildcard rule when `t` provably carries no rules (that is
+  the PII-1 false-refusal fix), so it had to be handled here. Refusing the
+  combination is what makes "the n-th projection item is the n-th result column"
+  TRUE — the invariant the whole promise rests on — and it gets its own refusal
+  (`pii_mask_wildcard_deny`), because the fix is "list the columns", which no
+  other PII message says. **`SelectItem` has FIVE variants in sqlparser 0.62**,
+  not four: besides the two wildcards and the two scalar forms there is
+  `ExprWithAliases` (`expr AS (a, b)`), which is ALSO a multi-column expansion.
+  It is parsed only by dialects whose `supports_select_item_multi_column_alias()`
+  is true (Spark/Databricks/Generic) — none of the three nyet ships, and
+  `GenericDialect` is not used anywhere in the crate — so it cannot reach the
+  projection today; adding a dialect means adding it to that match.
+
+Sorting, grouping and dedup are a property of the STATEMENT, not of the node, so
+they are judged separately (`mask_ordering_conflict`, below) and refuse with
+their own text.
+
+Everything else — the wildcards in every spelling, the composite whole row,
+`TABLE t`, `USING`/`NATURAL`, the alias column list, the value-sampling catalogs,
+the unresolved source — keeps its `deny`-mode refusal in mask mode, and the
+corpus re-pins all nine PII-1 holes under `pii_mode: mask`
+(`tests/corpus/*_pii_mask.yaml`) precisely so relaxing the projection cannot
+reopen one.
+
+**The relaxation is per OCCURRENCE, not per name**, and that is why the exempt
+set is a set of node ADDRESSES (`std::ptr::from_ref(expr).addr()`), collected
+from the root projection before the walk and consulted in `check_pii_expr`. The
+same `email` is masked in the projection and refused in the `WHERE` of one
+statement, so the rule cannot key on the name — and it cannot key on the value
+either: `WHERE email = 'x'` holds an `Expr::Identifier` structurally EQUAL to the
+projected one. The AST is borrowed immutably for the whole validation, so a
+node's address identifies it exactly.
+
+**Whole-row reads stay refused under mask, deliberately.** Net B *could* mask the
+protected columns of a `SELECT * FROM users` (it knows every column's origin), so
+this is a choice, not a limit: `*`, `t.*`, the PostgreSQL composite `SELECT u
+FROM users u` and `TABLE users` are one family in the agent's head, and only the
+first of them has provable per-column provenance — the composite arrives as a
+single `Expression`-origin value with every column inside it, and `TABLE t` is a
+whole-relation read nyet judges before it ever sees columns. Masking one spelling
+while refusing three would be a rule an agent cannot learn from a refusal. The
+refusal hint says to name the columns, `nyet schema` marks which ones are
+protected, and naming them is exactly the shape the mask supports.
+
+**Generated columns are a renaming layer inside the protected table itself**
+(measured on PostgreSQL, both modes, and a PII-1 behaviour rather than a
+regression): `gen GENERATED ALWAYS AS (upper(email)) STORED` carries its own
+provenance (`users.gen`), which no rule names, so `SELECT gen FROM users` returns
+the derived value and `WHERE gen LIKE 'A%'` is a working character oracle. Nastier
+than a view because it lives in the very table the owner believes is protected —
+listed in the README limits with the fix (name the derived column in `columns`
+too).
+
+**A masked NULL is `[REDACTED]`, not `null`.** Keeping NULL would answer "is this
+person's phone on file?" for every row — a one-bit oracle per cell, over the very
+column being protected, available without any filter. So `output::redact`
+replaces the whole cell for every type, and the direct consequence is documented
+rather than hidden: **the JSON type of a masked column becomes `string`**
+whatever the column's real type is (number, date, JSON). The `PII_MASKED` warning
+is what makes that legible to the agent — it names the columns (never values,
+never a count, since every row of the column is replaced anyway) and says the
+type and length are gone too. `output::REDACTED` is a const, not a config key
+(Д5): a configurable mask string is another way to leak (a per-column string
+would fingerprint the column) and buys nothing.
+
+**The exemption is a PROMISE, and net B enforces it (review round 5).** Net A
+relaxes a projection *on the understanding that net B will redact it*, so
+`Verdict::Allow` carries `pii_exempt` — the RESULT-column indexes it let through
+— and `check_origins` refuses (`PII_UNPROVABLE`) any exempted index it did not
+mask. Without that the promise was silently breakable, and two agent-reachable
+ways to break it were found in review, one of them critical:
+
+- **the README's own view recipe, on SQLite.** With `columns =
+  ["v_users.contact"]`, net A protects the VIEW's column while SQLite resolves
+  the origin to the BASE table (`users.email`), which no rule names — so nothing
+  matched, nothing was masked, and `SELECT contact FROM v_users` returned the
+  plaintext value, NULLs included, with no warning. The same config under `deny`
+  refuses that query: turning `mode = "mask"` on was *removing* protection, the
+  one defect class UX-1 forbids outright;
+- **a CTE shadowing the protected table's name.** `WITH users AS (SELECT
+  'secret' AS email) SELECT email FROM users` keeps the scope active (the name
+  is what net A matches on), so the projection was exempted while the value is a
+  computed expression with no provenance at all. Harmless in itself — the value
+  is the agent's own literal — but it is the mechanism the first case exploits,
+  which is exactly why "only a driver regression could produce this" was wrong.
+
+**"mask ⊆ deny" is a structural property, not a claim in prose.** Net A's mask
+branch fires only where the deny branch would have refused (it lives inside the
+`columns.contains` arm), net B masks nothing net A did not sanction, and the
+extra refusals (unkept promise, wildcard conflict, ordering conflict) fire only
+on statements `deny` refuses too. Therefore: every cell `mask` redacts belongs to
+a query `deny` refuses outright, every query BOTH modes allow returns
+byte-identical rows, and `mask` never returns a value `deny` would have withheld.
+Anything that breaks that reads as a leak — which is how both review rounds found
+their bugs.
+
+The rule is the STRICT one ("an exempted column must come back masked"), not the
+narrower "refuse only an `Expression` or a foreign relation": it costs nothing
+against `deny`, because net A only ever exempts an occurrence it would otherwise
+have REFUSED. The earlier objection (`SELECT email FROM orders o JOIN users u
+...`, where the origin says `orders.email` and nothing is protected) does not
+apply for the same reason — that statement is refused under `deny` too, as the
+documented unqualified-name over-denial. Pinned by
+`net_b_refuses_an_exempted_column_it_did_not_mask`,
+`pii_mask_refuses_when_it_cannot_keep_its_promise` and, on live drivers, in both
+container tests (PostgreSQL reports the VIEW, so there the same recipe masks
+correctly — the test pins both sides).
+
+**What sorting/grouping costs, and why the check is a DENYLIST.** A statement
+that SORTS, GROUPS or DEDUPES while a maskable column is projected is refused by
+`mask_ordering_conflict`, with its own message and hint (Д10: the fix is "use a
+column name", which the generic "do not name this column" text never says). The
+rule: while anything is maskable, an `ORDER BY`/`GROUP BY` key is accepted ONLY
+when it is a plain `Expr::Identifier`/`CompoundIdentifier` — a NAME, which
+`check_pii_expr` judges like every other name, in both modes, so a protected one
+is refused there. `DISTINCT` conflicts unconditionally (it dedupes on the values
+themselves).
+
+The first two shipped versions were ALLOWLISTS ("refuse a key that is a
+position"), and both were wrong — not by an oversight but in principle: deciding
+which expressions a planner folds into an ordinal is a per-engine, per-VERSION
+question the AST cannot answer. A fuzz of 47 spellings against live servers found
+twelve holes in the second version alone: `0x1`/`0x2` are ordinals on SQLite AND
+on PostgreSQL 16 (which added non-decimal integer literals), `0_1` is one on
+PostgreSQL (digit separators), `-(-2)` on both, and `2 COLLATE NOCASE` /
+`(2) COLLATE BINARY` on SQLite — while `1+0`, `2.0`, `'2'`, `2e0`, `abs(2)` and
+`CAST(2 AS INT)` are ordinals nowhere. Each miss sorted the result by the real
+value of a redacted column (`ORDER BY 0x2 DESC LIMIT 1` = "the row with the
+largest email") or handed over its exact distinct count. The denylist needs none
+of that knowledge and cannot go stale with the next server release.
+
+Cost, deliberate: under `mode = "mask"`, and only in a statement that plainly
+projects a protected column, sorting and grouping take column names only —
+`ORDER BY id`, `ORDER BY u.created_at DESC`, `GROUP BY id` all work (that is the
+case this guard was narrowed for), while `ORDER BY 1` and `ORDER BY lower(name)`
+are refused. An output ALIAS would be a third route into the masked column on
+SQLite/MySQL, and it cannot occur: an aliased projection item is never maskable.
+
+**The row ORDER is a residual channel nyet cannot close** (measured, README's
+honest limits): with an index on the protected column the engine may return rows
+in ITS order for free — `SELECT id, email FROM users` came back ordered by
+`email` off a covering index on SQLite and MySQL 8.4. No `ORDER BY` is involved,
+so there is nothing to refuse short of forbidding the projection entirely, which
+is the feature. The values stay hidden; their relative ORDER can leak.
+
+### `nyet schema` marking and the `pii_columns` doctor check
+
+Both are cli-layer wiring over pure functions, because the policy is CONFIG and
+the engines only report what the catalog holds:
+
+- `output::mark_pii(&mut Schema, mode, protects)` takes a predicate rather than
+  `PiiRules`, so `output` keeps its single dependency (serde) and no
+  `output -> validator` edge appears. It runs after the engine's
+  privilege filter, so a column the role cannot read is never marked — it is not
+  in the payload at all. The field is `pii: Option<&'static str>`, omitted when
+  absent (UX-4: every byte is the user's money).
+- The doctor check is `Engine::diagnose(pii)` -> `Vec<PiiAccess>` (a FACT per
+  rule: readable yes/no/unknown) -> the pure `output::pii_columns_check`, and it
+  is emitted ONLY when the connection has a policy (an `na` line on every
+  ordinary connection is noise, UX-4). PostgreSQL asks
+  `has_column_privilege($1, $2, 'SELECT')` with the names BOUND (a name is data,
+  not SQL — the same rule as `nyet schema`); a rule naming something that does
+  not exist raises, which is `None` = "could not verify", not `false`.
+  MySQL/MariaDB has no such function: `information_schema.COLUMNS` is
+  privilege-filtered BY the server, so a VISIBLE column answers "readable"
+  outright — but an INVISIBLE one is ambiguous ("not granted" vs "no such
+  column"), and reading a typo as "the database enforces it" turns a rule that
+  protects NOTHING into a green check. So the ambiguous case asks the server
+  directly with `SELECT \`col\` FROM \`tbl\` WHERE 0` and reads the ERROR
+  NUMBER: 1143/1142 (SELECT denied for the column/table) = the grant is doing its
+  job -> `false`; 1054/1146 (unknown column/table) or anything else -> `None`,
+  the same verdict PostgreSQL produces. **Residual, documented in the README:**
+  MySQL answers "denied" BEFORE it checks existence, so for an account that
+  already lacks the grant — the recommended least-privilege one — a misspelled
+  rule still reads `ok` rather than "could not verify"; every metadata path is
+  privilege-filtered, so there is no cheap way to ask "does this column exist?"
+  as an account that may not see it, and saying so is better than implying a
+  check nyet cannot make. That statement is the ONE place a config
+  name reaches SQL text (MySQL cannot bind an identifier): it is backtick-quoted
+  with the backtick doubled, the key is literal-only so the agent cannot
+  influence it, and it reads no rows. SQLite is `na`: no roles, and the check
+  says plainly that nyet is then the only thing enforcing the policy. A readable
+  column is a `warn`, never a `fail`: the policy still holds for everything going
+  through nyet, which is what the config owner asked for — the warn's job is to
+  say the boundary is nyet ALONE, with the column-grant recipe (UX-7).
+
 ### Database errors are withheld
 
 `main::db_error_withheld`. PostgreSQL and MySQL quote the offending CELL VALUE in
@@ -1566,15 +1816,22 @@ than a value echo.
 forensics for the HUMAN, the file is 0600, and the point of the record is showing
 what the agent TRIED — including the query that was refused for naming a
 protected column. `Event.response` (only under `[audit] log_responses`) is built
-from the `ResultSet` AFTER both nets have passed, so it can only ever hold rows
-the agent also received; a refusal logs `verdict: "refused"`, `reason:
-"PII_COLUMN"` and no response at all (`pii_refusals_are_audited_without_the_data`).
+from the `ResultSet` AFTER both nets have passed — and after the mask has been
+applied, since the redaction happens inside `Db::execute` — so it can only ever
+hold what the agent also received, `[REDACTED]` included
+(`pii_mask_is_audited_without_the_data`, plus the leak guard in both container
+tests: the real value appears in neither stream nor the log). A refusal logs
+`verdict: "refused"`, `reason: "PII_COLUMN"` and no response at all
+(`pii_refusals_are_audited_without_the_data`).
 
 ### Module edges
 
-`PiiRules` holds ONE piece of state, the `(table, column)` pair set; "which
-tables are protected" and "is this scope active" are derived on the fly, because
-a cached copy is exactly what a later edit desynchronizes into a fail-OPEN net A.
+`PiiRules` holds two pieces of state and nothing else: the `(table, column)` pair
+set and the `mode`. "Which tables are protected" and "is this scope active" are
+derived on the fly, because a cached copy is exactly what a later edit
+desynchronizes into a fail-OPEN net A. The mode lives HERE rather than in
+`Policy` so both nets and every refusal hint read one source (a hint that
+described the wrong sanction would be worse than no hint).
 `PiiRules::parse` rejects anything that could never match an identifier (a
 comma-separated list crammed into one entry, a stray quote): a rule that is
 accepted but can never fire leaves the config owner believing a column is
@@ -1649,7 +1906,7 @@ Rules: one case per `- query:` line (single-line queries only — semicolons
 are fine, block scalars are not supported); `verdict` is `allow` or `deny`;
 `deny` requires `reason` (one of `PARSE_FAILED`, `MULTI_STATEMENT`,
 `WRITE_OPERATION`, `TXN_CONTROL`, `LOCKING_CLAUSE`, `DENIED_FUNCTION`,
-`EXECUTABLE_COMMENT`, `EXPLAIN_ANALYZE`, `PII_COLUMN`);
+`EXECUTABLE_COMMENT`, `EXPLAIN_ANALYZE`, `PII_COLUMN`, `PII_UNPROVABLE`);
 optional `warnings` on an allow case is the comma-joined list of expected
 warning codes (currently only `UNICODE_STRIPPED`) — allow cases without it
 must produce none, deny cases never carry warnings; optional `dialect`
@@ -1661,6 +1918,10 @@ BEFORE the first `- query:` sets the file-wide PII policy (comma-separated
 `table.column` rules, exactly what `[connections.X.pii] columns` holds), and a
 per-case `pii:` overrides it — `pii: none` turns it off for one case, so a file
 can pin both sides of the same query. Absent everywhere = no PII policy.
+`pii_mode: deny|mask` works the same way (file-wide line, per-case override);
+absent = `deny`, so every pre-PII-2 file keeps its meaning. The `*_pii_mask.yaml`
+files are the mask twins of the `*_pii.yaml` ones — same statements, one mode
+apart.
 Unknown lines fail the run loudly. The runner (`validator::tests::golden_corpus`) reads every `*.yaml` in
 the directory, so adding a case is: append it to a fitting file (or add a new
 file), run `cargo test golden_corpus`. The corpus runs with the default policy
@@ -1950,7 +2211,11 @@ outran its BUDGET is NOT in this list: that refuses the query, exit 5. On
 `nyet explain`, where there is no query to run, the same code also carries the
 budget case — the verdict is `no_estimate` either way),
 `NO_PLAN` (`nyet explain` was handed a metadata statement, which has no plan —
-answered without touching the database).
+answered without touching the database),
+`PII_MASKED` (`[connections.X.pii] mode = "mask"`: the named result columns came
+back as `[REDACTED]` — every value in them, whatever its type, NULL included. The
+agent MUST see this, or it reads the mask as data; the warning names columns
+only, never values, and never a count).
 
 Codes are append-only; renaming/removing one is a breaking change (bump `v`).
 Every error must carry an actionable `hint` (Д10) — tests enforce it.

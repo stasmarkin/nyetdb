@@ -1,0 +1,146 @@
+# Golden corpus — the PII policy under mode = "mask" (MySQL/MariaDB dialect).
+pii: users.email, users.phone
+pii_mode: mask
+
+# --- what mask allows (net B redacts the values) ---
+- query: SELECT email FROM users
+  verdict: allow
+- query: SELECT `email` FROM `users`
+  verdict: allow
+- query: SELECT `u`.`email` FROM `users` `u`
+  verdict: allow
+- query: SELECT id, email, phone FROM users WHERE id = 1
+  verdict: allow
+
+# --- everything else keeps the deny-mode verdict ---
+- query: SELECT email AS x FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT SUBSTRING(email, 1, 3) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT JSON_OBJECT('e', email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT * FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT u.* FROM users u
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT DISTINCT email FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email FROM users ORDER BY 1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT id, email FROM users ORDER BY 2
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT id, email FROM users GROUP BY 2
+  verdict: deny
+  reason: PII_COLUMN
+# sorting/grouping by an UNPROTECTED column cannot reach the masked value: by
+# name it is refused, and a masked item never carries an alias to reach it by
+- query: SELECT id, email FROM users ORDER BY id
+  verdict: allow
+- query: SELECT email FROM users GROUP BY 1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT COUNT(*) FROM users WHERE email LIKE 'a%'
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT COUNT(*) FROM users JOIN dict USING (email)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT COUNT(*) FROM users NATURAL JOIN dict
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT c FROM users AS u (a, b, c)
+  verdict: deny
+  reason: PII_COLUMN
+- query: WITH x AS (SELECT email FROM users) SELECT COUNT(*) FROM x
+  verdict: deny
+  reason: PII_COLUMN
+# MariaDB's histogram catalog: sampled values without naming a column
+- query: SELECT min_value FROM mysql.column_stats
+  verdict: deny
+  reason: PII_COLUMN
+
+# a wildcard expands into N columns, so nyet cannot say which RESULT column is
+# the protected one — mixing the two is refused rather than guessed
+- query: SELECT o.*, u.email FROM orders o, users u
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT u.email, o.* FROM orders o, users u
+  verdict: deny
+  reason: PII_COLUMN
+# every spelling the engines read as an ordinal, not just the bare number
+- query: SELECT email, id FROM users ORDER BY +1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY (1)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY ((+1))
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email FROM users GROUP BY +1
+  verdict: deny
+  reason: PII_COLUMN
+# ...but a wildcard with nothing protected beside it, and an ordinal pointing at
+# an unprotected column, are ordinary queries
+- query: SELECT o.* FROM orders o, users u
+  verdict: allow
+
+# ORDER BY / GROUP BY take plain column NAMES while a masked column is
+# projected: nyet does not model which spellings a planner folds into an
+# ordinal (measured ordinals include 0x1, -(-1), `1 COLLATE ...`, 0_1), so a key
+# that is not a name is refused whatever it is
+- query: SELECT id, email FROM users ORDER BY 1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY -(-1)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY abs(1)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY 1 + 0
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users GROUP BY -(-1)
+  verdict: deny
+  reason: PII_COLUMN
+# ...and a NAME still works, which is the case the guard was narrowed for
+- query: SELECT id, email FROM users ORDER BY created_at DESC
+  verdict: allow
+- query: SELECT id, email FROM users u ORDER BY u.id
+  verdict: allow
+
+- query: SELECT email, id FROM users ORDER BY 0x2
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY -(-2)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY (2)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY 2 COLLATE utf8mb4_bin
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY 2 + 0
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY abs(2)
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- unchanged by the mode ---
+- query: SELECT COUNT(*) FROM users
+  verdict: allow
+- query: SELECT id, created_at FROM users
+  verdict: allow
+- query: SELECT * FROM orders
+  verdict: allow

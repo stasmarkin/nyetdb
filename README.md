@@ -233,13 +233,13 @@ Then `url = "postgres://nyet_ro@db.internal:5432/app"` and
 
 ### PII columns
 
-A connection can declare which columns hold personal data. `nyet` then refuses
-— it never masks, filters or partially returns — any query that could expose
-them:
+A connection can declare which columns hold personal data. `nyet` then either
+refuses any query that could expose them, or returns them fully redacted:
 
 ```toml
 [connections.prod.pii]
 columns = ["users.email", "users.phone", "app.customers.ssn"]
+mode = "deny"    # deny (default) | mask
 ```
 
 Each entry is `table.column`, optionally schema-qualified, written with **plain
@@ -258,15 +258,26 @@ would believe the column is protected while every query returns it. An absent
 section, or `columns = []`, means no policy at all — an existing config behaves
 exactly as before.
 
+`mode` picks the sanction, one per connection: `"deny"` (the default — an absent
+key keeps the same verdicts and the same rows as before; refusal `hint` texts
+were rewritten and `schema`/`doctor` gained the additions below) refuses the
+whole query, `"mask"` additionally
+lets a **plain projection** through with every value replaced (see below). An
+unknown mode, or a `mode` with no `columns`, is a config error (exit 3): a
+sanction that applies to nothing reads as protection that is not there.
+
 Like `allowed_dirs`, `validator.allow_functions` and `guardrail.mode`, this is a
-**policy** value: `${VAR}` substitution inside a rule is rejected (exit 3). The
+**policy** value: `${VAR}` substitution inside a rule or the mode is rejected
+(exit 3). The
 environment belongs to the calling agent, and it must not be able to unprotect
 its own target. For the same reason **there is no CLI flag to override the
 policy** — an agent that can lift its own limit does not have one.
 
 **What gets refused** (`error.reason = "PII_COLUMN"`, exit 5). Everything below
 is about relations nyet can identify by name — see the limits section for what
-that excludes:
+that excludes. Under `mode = "mask"` the list is unchanged except for the first
+item's *plain projection* case (`SELECT email FROM users`), which is answered
+with `[REDACTED]` instead:
 
 - the column named in any clause — `SELECT`, `WHERE`, `JOIN ON`,
   `JOIN ... USING (col)`, `GROUP BY`, `HAVING`, `ORDER BY`, a subquery or a CTE.
@@ -310,6 +321,74 @@ that excludes:
   the query never named it (`error.reason` is still `PII_COLUMN`, and
   `PII_UNPROVABLE` when the database will not state a column's origin at all —
   see "How it is enforced" below).
+
+#### `mode = "mask"` — the column comes back redacted
+
+With `mode = "mask"` the agent may **SELECT the protected column plainly**, and
+every value in it is replaced before it reaches anything — the answer, the
+formatters and the audit log alike:
+
+```
+nyet query prod "SELECT id, email FROM users LIMIT 2" --format json
+{"v":1,"ok":true,"rows":[{"id":1,"email":"[REDACTED]"},{"id":2,"email":"[REDACTED]"}],
+ "meta":{...},"warnings":[{"code":"PII_MASKED","message":"column(s) 'email' are protected ..."}]}
+```
+
+Four properties, all deliberate:
+
+- **The whole cell goes, in every type.** `[REDACTED]` is a fixed string, not
+  configurable, and it replaces numbers, dates, JSON and **NULL** alike — so the
+  masked column is a JSON *string* whatever the column's real type is. A partial
+  mask (`j***@gmail.com`) leaks the value piece by piece and a stable token is an
+  equality oracle over it; a surviving NULL would answer "is this person's phone
+  on file?" for every row.
+- **The agent is told.** Every masked answer carries a `PII_MASKED` warning
+  naming the columns (never values). Without it an agent reads `[REDACTED]` as
+  data and reasons on it.
+- **Only the projection is relaxed.** Everything else keeps the `deny` behaviour:
+  a `WHERE`/`JOIN ON`/`USING`, `HAVING`, an expression around the column
+  (`substr(email,1,3)`), an **alias** (`SELECT email AS e` — SQLite lets `WHERE`
+  refer to `e`, which nyet could no longer recognise), a whole-row read
+  (`SELECT *`, `t.*`, `TABLE users`, the composite `SELECT u FROM users u`), and
+  the same column projected inside a subquery, CTE or UNION arm. Otherwise the
+  mask would be theatre: `WHERE email LIKE 'a%'` plus the row count spells the
+  value out one character at a time.
+- **While a masked column is in the SELECT list, `ORDER BY`/`GROUP BY` take
+  plain column NAMES only** — `ORDER BY id`, `ORDER BY u.created_at DESC` and
+  `GROUP BY id` work and still return the protected column redacted; a POSITION
+  (`ORDER BY 1`) or any expression is refused, and so is `DISTINCT`. Row order
+  and row count are the real ones, so ordering by the hidden value ranks every
+  other column by it — and nyet does not try to work out which spellings a given
+  server folds into a column reference (measured: `1`, `+1`, `(1)`, `-(-1)`,
+  `0x1`, `0_1` and `1 COLLATE NOCASE` are all the same ordinal on some engine,
+  while `1+0` and `abs(1)` are not on any). Anything it cannot check by name, it
+  refuses. Sorting the rows on your side is unaffected.
+- **A cell is redacted only where BOTH nets agree.** The query text says which
+  column may be masked (that is the relaxation above), and the driver's
+  provenance proves the result column really is that one; a value is replaced
+  only when the two line up, and anything else is refused exactly as under
+  `deny`:
+  - the projection was allowed on the promise of a mask and the database then
+    reported something else — a computed value, or a base-table column no rule
+    names — → `PII_UNPROVABLE` (exit 5), never the value;
+  - a protected column reaches the result without the query naming it (SQLite
+    resolves a renaming view's column to its base table) → refused, the same as
+    under `deny`. nyet does not mask what it was not asked to mask: a column the
+    query never named is one nyet could not check the `ORDER BY`/`DISTINCT`
+    against, and sorting by a redacted value ranks every other column by it;
+  - the SELECT list mixes a wildcard with a column to be masked
+    (`SELECT o.*, u.email ...`) → refused: `*` expands into as many columns as
+    the source has, so which result column is the protected one cannot be told.
+    List the columns instead.
+
+  Hence the invariant, which holds by construction: **`mode = "mask"` never
+  returns a value `mode = "deny"` would have withheld.** Every cell it redacts
+  belongs to a query `deny` refuses outright, and every query the two modes both
+  allow returns byte-identical rows.
+
+Everything the limits section says still applies unchanged: a mask cannot undo
+what the agent already learned, and it does not close the counting oracles over
+*unmarked* columns.
 
 **What keeps working** — the point is a policy, not a wall:
 
@@ -378,11 +457,27 @@ Net B is a **cross-check on the wire**: it sees what the server actually
 returned, which is how a divergence between nyet's parse and the server's
 becomes visible. On PostgreSQL and MySQL/MariaDB it keys on the same names net A
 checks (the driver reports a view as a view); on SQLite it additionally resolves
-a *bare* view column to its base table. It cannot judge computed columns at all
-— those carry no origin.
+a *bare* view column to its base table, which under `deny` refuses the query and
+under `mask` refuses it just the same — nyet masks only what the query asked for
+by name, never a column it merely discovered. It cannot judge computed columns at
+all — those carry no origin.
+
+**Marked in `nyet schema`, checked by `nyet doctor`.** A protected column carries
+`"pii": "deny"` / `"pii": "mask"` in `nyet schema` (and `pii deny` / `pii mask`
+in the table form), so an agent plans around it instead of spending a round trip
+on a refusal. The marking runs after the privilege filter, so a column the role
+cannot read is simply absent. `nyet doctor <alias>` adds a `pii_columns` check
+that asks the SERVER whether the role can read the marked columns: `ok` when it
+cannot (the database enforces the same line), a `warn` naming them when it can —
+because then the `[pii]` policy is the only thing there, and anything connecting
+with those credentials outside nyet gets the real values. On SQLite the check is
+an honest `na`: there are no roles, so nothing can be hidden below nyet.
 
 **Honest limits** (UX-7 — we do not claim what we do not do):
 
+- **A mask is not amnesia.** Redacting a value now does nothing about what the
+  agent already read, logged or wrote into its own context before the rule
+  existed — and nothing about data reachable outside nyet.
 - **Views are not followed.** The rules apply to the names nyet sees, and on
   PostgreSQL and MySQL/MariaDB the driver reports a view column's origin as *the
   view*, not the base table. So a view over a protected table is **not** covered
@@ -403,7 +498,27 @@ a *bare* view column to its base table. It cannot judge computed columns at all
 - **Counting oracles are not closed.** `row_count`, the guardrail's row
   `estimate` and query timing still respond to filters on *unmarked* columns
   that correlate with protected ones. Refusing every filter would refuse every
-  query.
+  query. This is the same under `mask`: the row count of a masked answer is the
+  real one (masking cells is not row filtering), so a correlated *unmarked*
+  column still narrows things down.
+- **Row ORDER can leak the sort order of a masked column.** `mask` refuses an
+  explicit `ORDER BY` on the protected column, but the engine may still return
+  rows in that order for free: with an index on the column (measured on SQLite
+  and MySQL 8.4, a covering index) a plain `SELECT id, email FROM users` comes
+  back sorted by `email`. The values stay `[REDACTED]`; their relative order —
+  and therefore the ranking of the *other* columns by the hidden value — does
+  not. There is nothing to refuse there short of refusing the projection itself,
+  which is the feature; if the ranking matters, do not mark the column, hide it
+  with a column-level `GRANT`.
+- **A GENERATED column is a renaming layer inside the protected table.** A rule
+  on `users.email` does not cover `users.email_upper GENERATED ALWAYS AS
+  (upper(email)) STORED`: the driver reports that column's own name, so both
+  modes return it, and `WHERE email_upper LIKE 'A%'` is a working
+  character-by-character oracle (measured on PostgreSQL). This is the view
+  limitation living inside the very table you marked, so it is easy to miss —
+  **list the derived columns too**
+  (`columns = ["users.email", "users.email_upper"]`), or, better, drop them from
+  the role's grants.
 - **The real boundary is the database.** nyet is one process an agent with shell
   access can walk around (threat model). Column-level privileges, views and RLS
   are enforced by the server for *every* client:
@@ -983,6 +1098,8 @@ fail  read_only_role       these credentials CAN write to the database directly:
                            → CREATE ROLE nyet_ro LOGIN PASSWORD '...' NOSUPERUSER NOCREATEDB NOCREATEROLE;
                            → ...
 ok    not_superuser        the role is not a superuser (the role is not a PostgreSQL superuser)
+warn  pii_columns          the role can read 1 of the 2 marked column(s) directly (users.email): nyet refuses or masks them (mode = "mask"), but the database itself does not — anything connecting with these credentials outside nyet gets the real values
+                           → make the boundary the database's: REVOKE SELECT ON <table> FROM <role> and GRANT SELECT (<the columns the agent may read>) ON <table> TO <role> ...
 ok    config_permissions   the config file is readable only by its owner (mode 0600)
 ```
 
@@ -1039,13 +1156,32 @@ What each check means and what to do about it:
 - **not_superuser** — is the role a superuser / all-privileges account (which
   bypasses every read-only layer)? Superuser → `fail`. Fix: use a dedicated
   `NOSUPERUSER` role with only the `SELECT` grants the agent needs.
+- **pii_columns** (only with a `[pii]` section) — do the columns marked in
+  `[connections.X.pii]` actually sit
+  behind a database boundary? Doctor asks the server whether this role may read
+  each of them (PostgreSQL `has_column_privilege`; MySQL/MariaDB the
+  privilege-filtered `information_schema`). It cannot → `ok`. It can → `warn`
+  naming the columns: nyet still refuses or masks them, but the database does
+  not, so anything using these credentials outside nyet reads the real values —
+  the hint prints the column-grant fix. A column the server will not answer about
+  (most often a typo in the rule) is `warn` ("could not verify"), never a pass.
+  The check is omitted entirely for a connection with no `[pii]` section.
+  **One honest gap, MySQL/MariaDB only:** the server answers "denied" before it
+  checks whether the column exists, so for an account that already lacks the
+  grant (the recommended least-privilege one) a *misspelled* rule reads as `ok`
+  rather than "could not verify" — `nyet doctor` cannot tell "you may not read
+  it" from "it is not there". PostgreSQL distinguishes the two. Check spellings
+  against `nyet schema` when you add rules; the marking there is the reliable
+  confirmation that a rule matched something.
 - **config_permissions** — is the config file `0600` (owner-only)? Group/other
   bits → `warn`. Fix: `chmod 600` on the config file.
 
 **SQLite is reported honestly.** It has no roles, no server and no network, so
-`transport_encrypted`, `read_only_role` and `not_superuser` come back `na` with
-a plain explanation (nyet opens the file read-only via `mode=ro`; there is no
-role to make read-only) — nyet does not invent a metric where there is none.
+`transport_encrypted`, `read_only_role`, `not_superuser` and `pii_columns` (when
+a policy exists) come back `na` with a plain explanation (nyet opens the file read-only via `mode=ro`;
+there is no role to make read-only, and no column privileges to hide a PII column
+behind — on SQLite the `[pii]` policy is the only thing enforcing it) — nyet does
+not invent a metric where there is none.
 
 `nyet doctor` with **no alias** checks the config-file permissions and lists the
 connections reachable from the current directory (a named alias, by contrast, is
@@ -1219,7 +1355,9 @@ which has no plan),
 is below `require` and has no ssh tunnel — the transport is not guaranteed
 encrypted or verified; the message says how to force TLS),
 `SCHEMA_TRUNCATED` (`nyet schema` listed objects by name only — more than 50
-tables + views).
+tables + views),
+`PII_MASKED` (`[pii] mode = "mask"`: the named columns came back as
+`[REDACTED]` — see "PII columns").
 
 The full allow/deny specification is the public test corpus in
 [`tests/corpus/`](tests/corpus/): every validator rule exists there as at

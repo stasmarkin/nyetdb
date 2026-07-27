@@ -1243,3 +1243,208 @@ fn postgres_pii_policy_end_to_end() {
         container.rm().await.unwrap();
     });
 }
+
+/// `mode = "mask"` on a LIVE driver: the redaction rides on the provenance the
+/// server reported, so this is the only place the promise "net A relaxes what
+/// net B can prove" is actually verified against PostgreSQL. Plus the leak
+/// guard (stdout / stderr / audit log) and the `pii_columns` doctor check
+/// against two real roles — one that may read the column and one that may not.
+#[test]
+fn postgres_pii_mask_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        const VALUE: &str = "alice@example.com";
+        {
+            use sqlx::{ConnectOptions, Connection, Executor};
+            let opts: sqlx::postgres::PgConnectOptions =
+                format!("postgres://postgres@127.0.0.1:{port}/postgres")
+                    .parse()
+                    .unwrap();
+            let mut w = opts.password(PW).connect().await.unwrap();
+            for sql in [
+                format!("INSERT INTO users VALUES (9, '{VALUE}')"),
+                "CREATE TABLE dict (id int, email text)".to_string(),
+                "CREATE VIEW v_users AS SELECT id, email AS contact FROM users".to_string(),
+                "INSERT INTO dict VALUES (1, 'd@e.f')".to_string(),
+                // A second renaming view: the shape that proved a wildcard beside
+                // a masked column shifts every index to its right.
+                "CREATE VIEW v_dict AS SELECT id, email AS work_mail FROM dict".to_string(),
+                // A role with SELECT on everything -> the policy is the ONLY
+                // boundary (doctor must say so), and one whose column grant
+                // makes the database enforce it too.
+                format!("CREATE ROLE pii_all LOGIN PASSWORD '{PW}'"),
+                "GRANT SELECT ON users TO pii_all".to_string(),
+                format!("CREATE ROLE pii_none LOGIN PASSWORD '{PW}'"),
+                "GRANT SELECT (id) ON users TO pii_none".to_string(),
+            ] {
+                w.execute(sqlx::AssertSqlSafe(sql)).await.unwrap();
+            }
+            w.close().await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.pii]\ncolumns = [\"users.email\"]\nmode = \"mask\"\n\
+             [audit]\nlog_responses = true\n",
+        );
+        let no_leak = |out: &Output, sql: &str| {
+            assert!(!stdout(out).contains(VALUE), "{sql}: leaked to stdout");
+            assert!(!stderr(out).contains(VALUE), "{sql}: leaked to stderr");
+        };
+
+        // The plain projection runs, and every cell of the protected column is
+        // gone — the NULL row included (seeded as id 3), so the mask does not
+        // answer "is this value set?".
+        let sql = "SELECT id, email FROM users";
+        let out = run(tmp.path(), &cfg, &["query", "pg", sql]);
+        assert_eq!(out.status.code(), Some(0), "{sql}: {}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 4, "{v}");
+        for row in rows {
+            assert_eq!(row["email"], "[REDACTED]", "{v}");
+        }
+        assert_eq!(v["warnings"][0]["code"], "PII_MASKED", "{v}");
+        assert!(
+            v["warnings"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("'email'"),
+            "{v}"
+        );
+        no_leak(&out, sql);
+        assert_no_password_leak(&out);
+
+        // LEAK GUARD: what the human's forensic log holds is exactly what the
+        // agent saw — masked. (The raw SQL stays, by design.)
+        let audit = tmp.path().join(".local/share/nyet/audit.jsonl");
+        let text = std::fs::read_to_string(&audit).expect("audit file must exist");
+        assert!(!text.contains(VALUE), "the audit log leaked the value");
+        assert!(text.contains("[REDACTED]"), "{text}");
+
+        // Everything that could read the value back out keeps the deny-mode
+        // refusal — including every hole closed in PII-1.
+        for sql in [
+            "SELECT count(*) FROM users WHERE email LIKE 'a%'",
+            "SELECT email FROM users ORDER BY 1",
+            "SELECT DISTINCT email FROM users",
+            "SELECT email AS x FROM users",
+            "SELECT * FROM users",
+            "SELECT u FROM users u",
+            "SELECT json_agg(u.*)::text FROM users u",
+            "SELECT email FROM ONLY (users)",
+            "SELECT NULL AS a, NULL AS b UNION ALL TABLE users",
+            "SELECT count(*) FROM users JOIN dict USING (email)",
+            "SELECT count(*) FROM users u, LATERAL (SELECT u.*) s WHERE s.email LIKE 'a%'",
+            "SELECT most_common_vals::text FROM pg_stats WHERE tablename = 'users'",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "pg", sql]);
+            assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+            no_leak(&out, sql);
+        }
+
+        // The exemption is a PROMISE net B must keep. PostgreSQL reports a view
+        // column's origin as the VIEW, so the README's "list the view" recipe
+        // masks correctly here...
+        let cfg_view = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.pii]\ncolumns = [\"v_users.contact\"]\nmode = \"mask\"\n",
+        );
+        let out = run(
+            tmp.path(),
+            &cfg_view,
+            &["query", "pg", "SELECT contact FROM v_users"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["rows"][0]["contact"], "[REDACTED]", "{v}");
+        no_leak(&out, "SELECT contact FROM v_users");
+        // ...and where the promise CANNOT be kept — a computed value carries no
+        // provenance — the answer is a refusal, never the value.
+        let sql = "WITH users AS (SELECT 'secret'::text AS email) SELECT email FROM users";
+        let out = run(tmp.path(), &cfg, &["query", "pg", sql]);
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["reason"], "PII_UNPROVABLE", "{v}");
+        assert!(!stdout(&out).contains("secret"), "{}", stdout(&out));
+
+        // A wildcard beside a column to be masked is refused on the live driver
+        // too: `*` expands into N columns, so the promise net B checks by index
+        // would be kept by the wrong one (measured raw leak on SQLite, round 2).
+        let cfg_two = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.pii]\ncolumns = [\"users.email\", \"v_dict.work_mail\"]\n\
+             mode = \"mask\"\n",
+        );
+        for sql in [
+            "SELECT c.*, d.work_mail FROM dict c, v_dict d",
+            "SELECT d.work_mail, c.* FROM dict c, v_dict d",
+        ] {
+            let out = run(tmp.path(), &cfg_two, &["query", "pg", sql]);
+            assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+            no_leak(&out, sql);
+        }
+        // Naming the columns is the way through, and the protected one is masked.
+        let out = run(
+            tmp.path(),
+            &cfg_two,
+            &["query", "pg", "SELECT id, work_mail FROM v_dict"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["rows"][0]["work_mail"], "[REDACTED]", "{v}");
+
+        // doctor, against the two real roles.
+        let doctor_pii = |user: &str| {
+            let cfg = tmp.path().join(format!("doctor-{user}.toml"));
+            std::fs::write(
+                &cfg,
+                format!(
+                    "[connections.pg]\nengine = \"postgres\"\n\
+                     url = \"postgres://{user}@127.0.0.1:{port}/postgres\"\n\
+                     password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n\
+                     [connections.pg.pii]\ncolumns = [\"users.email\"]\nmode = \"mask\"\n",
+                    tmp.path().display()
+                ),
+            )
+            .unwrap();
+            let out = run(tmp.path(), &cfg, &["doctor", "pg", "--format", "json"]);
+            assert_eq!(out.status.code(), Some(0), "{user}: {}", stderr(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            v["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "pii_columns")
+                .unwrap_or_else(|| panic!("{user}: no pii_columns check: {v}"))
+                .clone()
+        };
+        // The role CAN read it -> honest warn: nyet is the only boundary.
+        let check = doctor_pii("pii_all");
+        assert_eq!(check["status"], "warn", "{check}");
+        assert!(
+            check["message"].as_str().unwrap().contains("users.email"),
+            "{check}"
+        );
+        assert!(
+            check["hint"].as_str().unwrap().contains("REVOKE SELECT"),
+            "{check}"
+        );
+        // A column-level grant makes the database enforce the same boundary.
+        let check = doctor_pii("pii_none");
+        assert_eq!(check["status"], "ok", "{check}");
+        assert!(
+            check["message"].as_str().unwrap().contains("cannot read"),
+            "{check}"
+        );
+
+        container.rm().await.unwrap();
+    });
+}

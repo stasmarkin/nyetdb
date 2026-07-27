@@ -7,8 +7,8 @@
 
 use crate::guardrail::{CostEstimate, Guardrail};
 use crate::output::{
-    build_table, ConnectFact, Diagnosis, KeyPart, ProbeFact, Schema, SchemaColumn, SchemaFk,
-    SchemaIndex, SchemaTable, ServerFacts, SuperuserFact,
+    build_table, ConnectFact, Diagnosis, KeyPart, PiiAccess, ProbeFact, Schema, SchemaColumn,
+    SchemaFk, SchemaIndex, SchemaTable, ServerFacts, SuperuserFact,
 };
 use crate::validator::Origin;
 use futures_util::TryStreamExt;
@@ -304,7 +304,10 @@ pub trait Engine {
     /// auto-commits) create-then-drop — normally leaving nothing, but if the DROP
     /// is refused / the socket dies / the probe times out, a possible orphan is
     /// NAMED in the verdict for manual cleanup (see `pg_probe` / `mysql_probe`).
-    async fn diagnose(&self) -> Diagnosis;
+    /// `pii` is the connection's protected `(table, column)` pairs: doctor asks
+    /// the SERVER whether this role can read them, so the human learns whether
+    /// the policy has a real boundary under it or is the only thing there.
+    async fn diagnose(&self, pii: &[(String, String)]) -> Diagnosis;
 }
 
 /// A unique, collision-proof name for the throwaway probe object: the prefix is
@@ -650,7 +653,7 @@ impl Engine for Sqlite {
     /// SQLite has no server, roles or network, so doctor only checks that the
     /// file opens (read-only). Everything else (transport, role, superuser) is
     /// reported `na` by the pure layer from `server: None`.
-    async fn diagnose(&self) -> Diagnosis {
+    async fn diagnose(&self, _pii: &[(String, String)]) -> Diagnosis {
         match self.open().await {
             Ok(conn) => {
                 // DROP, not close().await — mirrors the pg/mysql diagnose rule so
@@ -660,6 +663,8 @@ impl Engine for Sqlite {
                 Diagnosis {
                     connect: ConnectFact::Ok { via_tunnel: false },
                     server: None,
+                    // No roles, no column privileges: nothing to ask the file.
+                    pii: Vec::new(),
                 }
             }
             Err(e) => {
@@ -667,6 +672,7 @@ impl Engine for Sqlite {
                 Diagnosis {
                     connect: ConnectFact::Failed { message, hint },
                     server: None,
+                    pii: Vec::new(),
                 }
             }
         }
@@ -805,6 +811,7 @@ async fn sqlite_columns(
             pk: false,
             unique: false,
             default,
+            pii: None,
         });
     }
     pk.sort_by_key(|(position, _)| *position);
@@ -1251,7 +1258,7 @@ impl Engine for Postgres {
         pg_finish(phase, self.query_timeout_ms).await
     }
 
-    async fn diagnose(&self) -> Diagnosis {
+    async fn diagnose(&self, pii: &[(String, String)]) -> Diagnosis {
         let mut conn = match self.connect_plain().await {
             Ok(c) => c,
             Err(e) => {
@@ -1259,6 +1266,7 @@ impl Engine for Postgres {
                 return Diagnosis {
                     connect: ConnectFact::Failed { message, hint },
                     server: None,
+                    pii: Vec::new(),
                 };
             }
         };
@@ -1268,6 +1276,14 @@ impl Engine for Postgres {
         // The whole pg diagnose (probe included) is safe to cancel: the probe is
         // a transaction we only ever ROLL BACK, so a dropped future drops the
         // socket and the backend discards the uncommitted transaction — no orphan.
+        // Before the probe: the probe's ROLLBACK leaves the session usable, but
+        // asking first keeps this read-only query off a connection an aborted
+        // transaction could have soured.
+        let pii_access = match tokio::time::timeout(deadline, pg_pii_access(&mut conn, pii)).await {
+            Ok(facts) => facts,
+            // Never a false "cannot read it" (UX-1): unverified is unverified.
+            Err(_elapsed) => unverified_pii(pii),
+        };
         let server = match tokio::time::timeout(deadline, pg_diagnose(&mut conn)).await {
             Ok(facts) => facts,
             Err(_elapsed) => ServerFacts {
@@ -1290,8 +1306,46 @@ impl Engine for Postgres {
                 via_tunnel: self.host_override.is_some(),
             },
             server: Some(server),
+            pii: pii_access,
         }
     }
+}
+
+/// "we did not get an answer" for every configured rule — the honest fallback
+/// whenever the privilege queries could not run (UX-1: never a false pass).
+fn unverified_pii(pii: &[(String, String)]) -> Vec<PiiAccess> {
+    pii.iter()
+        .map(|(t, c)| PiiAccess {
+            column: format!("{t}.{c}"),
+            readable: None,
+        })
+        .collect()
+}
+
+/// Can this role read the protected columns straight from the server? One
+/// `has_column_privilege` per rule (a handful of rules, one round trip each —
+/// doctor is the human's tool, not the agent's hot path).
+///
+/// The names are BOUND, never interpolated: they come from the config, but the
+/// same rule as `nyet schema` applies — a name is data, not SQL. A rule naming
+/// something that does not exist makes the function raise (undefined table /
+/// column), which is `None` = "could not verify", not `false`.
+async fn pg_pii_access(conn: &mut sqlx::PgConnection, pii: &[(String, String)]) -> Vec<PiiAccess> {
+    let mut out = Vec::with_capacity(pii.len());
+    for (table, column) in pii {
+        let readable = sqlx::query("SELECT has_column_privilege($1::text, $2::text, 'SELECT')")
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut *conn)
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<bool, _>(0).ok());
+        out.push(PiiAccess {
+            column: format!("{table}.{column}"),
+            readable,
+        });
+    }
+    out
 }
 
 /// Gather the PostgreSQL role facts for doctor: superuser status, whether the
@@ -1672,6 +1726,7 @@ async fn pg_schema(
             pk: false,
             unique: false,
             default: row.try_get("default").map_err(pg_error)?,
+            pii: None,
         });
     }
 
@@ -2384,7 +2439,7 @@ impl Engine for Mysql {
         mysql_finish(phase, self.query_timeout_ms).await
     }
 
-    async fn diagnose(&self) -> Diagnosis {
+    async fn diagnose(&self, pii: &[(String, String)]) -> Diagnosis {
         let mut conn = match self.connect_plain().await {
             Ok(c) => c,
             Err(e) => {
@@ -2392,15 +2447,26 @@ impl Engine for Mysql {
                 return Diagnosis {
                     connect: ConnectFact::Failed { message, hint },
                     server: None,
+                    pii: Vec::new(),
                 };
             }
         };
         let via_tunnel = self.host_override.is_some();
+        let deadline = Duration::from_millis(self.query_timeout_ms);
+        // First, while the connection is certainly clean: a later timeout
+        // poisons it, and every path below may return without asking.
+        let pii_access =
+            match tokio::time::timeout(deadline, mysql_pii_access(&mut conn, pii)).await {
+                Ok(facts) => facts,
+                Err(_elapsed) => unverified_pii(pii),
+            };
+        // Cloned per call: the branches below are exclusive, but each is its own
+        // call site (a moving closure would be FnOnce).
         let with_server = |server| Diagnosis {
             connect: ConnectFact::Ok { via_tunnel },
             server: Some(server),
+            pii: pii_access.clone(),
         };
-        let deadline = Duration::from_millis(self.query_timeout_ms);
 
         // Metadata (read-only, safe to cancel). A timeout POISONS the MySQL
         // connection (a dropped op leaves it busy, its late error surfacing on the
@@ -2489,6 +2555,96 @@ fn probe_after_arming(armed: Option<bool>) -> Result<(), &'static str> {
         Some(false) => Err(PROBE_SKIP_NO_BOUND),
         None => Err(PROBE_SKIP_ARM_TIMEOUT),
     }
+}
+
+/// Can this account read the protected columns straight from the server
+/// (MySQL/MariaDB)? There is no `has_column_privilege`, but
+/// `information_schema.COLUMNS` is privilege-filtered BY the server: a column the
+/// account cannot read is not listed for it. So the answer is a visibility
+/// question, with the "not there at all" case told apart from "there but not
+/// granted" by looking at the TABLE:
+///
+/// - the column is listed -> readable;
+/// - the column is NOT listed -> the account either lacks the grant or the rule
+///   names something that does not exist. `information_schema` cannot tell those
+///   apart (it reports nothing in both cases), and reading a typo as "the
+///   database enforces it" would show a rule that protects NOTHING as a green
+///   check — the one answer a security tool must never give. So the server is
+///   asked directly with an empty `SELECT`, whose ERROR CODE distinguishes them:
+///   1143 (`SELECT command denied ... for column`) / 1142 (same for the table)
+///   = the grant is doing its job -> not readable; 1054 (unknown column) / 1146
+///   (unknown table) = there is nothing there -> `None`, "could not verify",
+///   exactly what PostgreSQL's raising `has_column_privilege` produces.
+///
+/// The table/column here are the only place a name from the config reaches SQL
+/// text — MySQL cannot bind an identifier. They are backtick-quoted with the
+/// backtick doubled (MySQL's own escape), and they come from a literal-only
+/// config key the agent cannot influence. The statement reads no rows
+/// (`WHERE 0`); privileges are checked before that matters.
+async fn mysql_pii_access(
+    conn: &mut sqlx::MySqlConnection,
+    pii: &[(String, String)],
+) -> Vec<PiiAccess> {
+    const COLUMN_VISIBLE: &str =
+        "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() \
+         AND TABLE_NAME = ? AND COLUMN_NAME = ?";
+    let mut out = Vec::with_capacity(pii.len());
+    for (table, column) in pii {
+        let readable = match mysql_count(conn, COLUMN_VISIBLE, table, Some(column)).await {
+            Some(n) if n > 0 => Some(true),
+            Some(_) => mysql_probe_column(conn, table, column).await,
+            None => None,
+        };
+        out.push(PiiAccess {
+            column: format!("{table}.{column}"),
+            readable,
+        });
+    }
+    out
+}
+
+/// Invisible in `information_schema`: refused, or absent? Ask the server.
+/// `Some(false)` = refused (the boundary is real), `None` = we could not tell
+/// (most often a typo in the rule) — never `Some(true)`, since a readable column
+/// would have been visible above.
+async fn mysql_probe_column(
+    conn: &mut sqlx::MySqlConnection,
+    table: &str,
+    column: &str,
+) -> Option<bool> {
+    let quote = |name: &str| name.replace('`', "``");
+    let sql = format!("SELECT `{}` FROM `{}` WHERE 0", quote(column), quote(table));
+    match sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_optional(&mut *conn)
+        .await
+    {
+        // No error at all: the account can read it after all (should not happen
+        // — information_schema said otherwise — but never guess in its favour).
+        Ok(_) => Some(true),
+        // 1143 = SELECT denied for a COLUMN, 1142 = denied for the TABLE.
+        Err(e) => match mysql_err_number(&e) {
+            Some(1143 | 1142) => Some(false),
+            _ => None,
+        },
+    }
+}
+
+/// One `COUNT(*)` with the object names BOUND (never interpolated). `None` when
+/// the server did not answer with a number.
+async fn mysql_count(
+    conn: &mut sqlx::MySqlConnection,
+    sql: &'static str,
+    table: &str,
+    column: Option<&str>,
+) -> Option<i64> {
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.to_string())).bind(table);
+    if let Some(column) = column {
+        q = q.bind(column);
+    }
+    q.fetch_one(conn)
+        .await
+        .ok()
+        .and_then(|row| row.try_get::<i64, _>(0).ok())
 }
 
 /// The MySQL/MariaDB metadata half of doctor (read-only, cancellable): whether
@@ -2819,6 +2975,7 @@ async fn mysql_schema(
                     .contains("auto_increment")
                     .then(|| "auto_increment".to_string())
             }),
+            pii: None,
         });
     }
 

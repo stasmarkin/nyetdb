@@ -2534,7 +2534,14 @@ fn pii_fixture(pii_section: &str) -> (tempfile::TempDir, std::path::PathBuf) {
             // catalog — on sqlite it is an ordinary table (finding 10)
             "CREATE TABLE column_stats (id INTEGER, n INTEGER)".to_string(),
             "CREATE VIEW v_users AS SELECT id, email AS contact FROM users".to_string(),
+            // A SECOND renaming view, so a rule can name a column the driver
+            // never reports (v_dict.work_mail -> dict.email): the shape that
+            // proved net A's promise cannot be kept by POSITION.
+            "CREATE VIEW v_dict AS SELECT id, email AS work_mail FROM dict".to_string(),
             format!("INSERT INTO users VALUES (1, '{PII_VALUE}', '2020-01-01')"),
+            // A NULL protected value: masking must not leave it as null (that
+            // would answer "is this row's value set?" for every row).
+            "INSERT INTO users VALUES (2, NULL, '2020-02-02')".to_string(),
             format!("INSERT INTO dict VALUES (1, '{PII_VALUE}', 'x')"),
             "INSERT INTO orders VALUES (1, 1, 42)".to_string(),
             "INSERT INTO column_stats VALUES (1, 7)".to_string(),
@@ -2559,6 +2566,10 @@ fn pii_fixture(pii_section: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 const PII_SECTION: &str = "[connections.db.pii]\ncolumns = [\"users.email\"]\n";
+
+/// The same policy, one sanction over (`mode = "mask"`).
+const PII_MASK_SECTION: &str =
+    "[connections.db.pii]\ncolumns = [\"users.email\"]\nmode = \"mask\"\n";
 
 fn run_query(tmp: &Path, cfg: &Path, sql: &str) -> Output {
     nyet(tmp)
@@ -2796,6 +2807,343 @@ fn pii_view_limitation_is_pinned_in_both_directions() {
         assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
         assert_no_pii_leak(&out, sql);
     }
+}
+
+/// `mode = "mask"`: the plain projection comes back with the cells replaced —
+/// NULL included — plus the warning that says so. Nothing about the real value
+/// (not its type, not its length, not whether it was set) survives.
+#[test]
+fn pii_mask_redacts_the_values_and_warns() {
+    let (tmp, cfg) = pii_fixture(PII_MASK_SECTION);
+    let out = run_query(tmp.path(), &cfg, "SELECT id, email FROM users");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{v}");
+    for row in rows {
+        // The unprotected column is untouched, the protected one is gone —
+        // and the NULL row reads exactly like the non-NULL one.
+        assert!(row["id"].is_number(), "{row}");
+        assert_eq!(row["email"], "[REDACTED]", "{row}");
+    }
+    let warnings = v["warnings"].as_array().unwrap();
+    let masked = warnings
+        .iter()
+        .find(|w| w["code"] == "PII_MASKED")
+        .unwrap_or_else(|| panic!("no PII_MASKED warning: {v}"));
+    let message = masked["message"].as_str().unwrap();
+    assert!(message.contains("'email'"), "{message}");
+    assert!(message.contains("[REDACTED]"), "{message}");
+    assert_no_pii_leak(&out, "SELECT id, email FROM users");
+
+    // Net B masks ONLY what net A sanctioned: a view column no rule names is
+    // refused, exactly as under `deny` (see
+    // `pii_mask_never_masks_what_net_a_did_not_sanction`).
+    let out = run_query(tmp.path(), &cfg, "SELECT contact FROM v_users");
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+    assert_no_pii_leak(&out, "SELECT contact FROM v_users");
+}
+
+/// Net A's exemption is a PROMISE that net B will redact the column, and a
+/// promise nyet cannot keep must refuse (`PII_UNPROVABLE`) — never hand the
+/// value over. Two ways the promise breaks, both agent-reachable, both found in
+/// review:
+///
+/// 1. the README's own recipe for views (`columns = ["v_users.contact"]`): net A
+///    protects the VIEW's column, SQLite reports the BASE table's
+///    (`users.email`), which no rule names — so nothing was masked. Under `deny`
+///    this very query is refused; masking must not turn a refusal into a full
+///    disclosure (UX-1);
+/// 2. a CTE shadowing the protected table's name: the scope is active, the
+///    projection is exempted, and the value is a computed expression with no
+///    provenance at all.
+#[test]
+fn pii_mask_refuses_when_it_cannot_keep_its_promise() {
+    let (tmp, cfg) =
+        pii_fixture("[connections.db.pii]\ncolumns = [\"v_users.contact\"]\nmode = \"mask\"\n");
+    let sql = "SELECT contact FROM v_users";
+    let out = run_query(tmp.path(), &cfg, sql);
+    assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["reason"], "PII_UNPROVABLE", "{v}");
+    assert_no_pii_leak(&out, sql);
+    // The same policy under the default mode refuses too — the mode must not be
+    // the difference between a refusal and the plain value.
+    let (tmp, cfg) = pii_fixture("[connections.db.pii]\ncolumns = [\"v_users.contact\"]\n");
+    let out = run_query(tmp.path(), &cfg, sql);
+    assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+    assert_no_pii_leak(&out, sql);
+
+    // Listing BOTH pairs is the working configuration: the base-table rule is
+    // what the driver's provenance actually reports, so the value is masked.
+    let (tmp, cfg) = pii_fixture(
+        "[connections.db.pii]\ncolumns = [\"users.email\", \"v_users.contact\"]\nmode = \"mask\"\n",
+    );
+    let out = run_query(tmp.path(), &cfg, sql);
+    assert_eq!(out.status.code(), Some(0), "{sql}: {}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["rows"][0]["contact"], "[REDACTED]", "{v}");
+    assert_no_pii_leak(&out, sql);
+
+    // A computed value carries no provenance, so the promise cannot be kept —
+    // even when the value is the agent's own literal.
+    let (tmp, cfg) = pii_fixture(PII_MASK_SECTION);
+    let sql = "WITH users AS (SELECT 'secret' AS email) SELECT email FROM users";
+    let out = run_query(tmp.path(), &cfg, sql);
+    assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["reason"], "PII_UNPROVABLE", "{v}");
+    assert!(!stdout(&out).contains("secret"), "{}", stdout(&out));
+}
+
+/// A wildcard expands into N result columns, so nothing in the SELECT list to
+/// its right sits where net A thinks it does — the promise net B checks would be
+/// kept by the WRONG column, and the one net A actually let through goes out
+/// raw. Found in review; reproduced with two renaming views, where net B masks
+/// the wildcard's column (its origin is a protected base column) while the
+/// exempted one carries a rule the driver never reports.
+#[test]
+fn pii_mask_refuses_a_wildcard_beside_a_masked_column() {
+    let (tmp, cfg) = pii_fixture(
+        "[connections.db.pii]\ncolumns = [\"users.email\", \"v_dict.work_mail\"]\nmode = \"mask\"\n",
+    );
+    for sql in [
+        "SELECT v_users.*, d.work_mail FROM v_users, v_dict d",
+        "SELECT d.work_mail, v_users.* FROM v_users, v_dict d",
+        "SELECT o.*, d.work_mail FROM orders o, v_dict d",
+    ] {
+        let out = run_query(tmp.path(), &cfg, sql);
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "NYET", "{sql}");
+        assert_no_pii_leak(&out, sql);
+    }
+    // Naming the columns instead of the wildcard is the way through, and the
+    // protected one comes back masked (the hint says so).
+    let out = run_query(tmp.path(), &cfg, "SELECT id, email FROM users");
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["rows"][0]["email"], "[REDACTED]", "{v}");
+    assert_no_pii_leak(&out, "SELECT id, email FROM users");
+}
+
+/// A positional sort key has three spellings the engines all read as an ordinal
+/// (`1`, `+1`, `(1)` — measured on SQLite and MySQL 8.4), and only the first was
+/// checked: the other two sorted by the REAL value while every cell came back
+/// redacted.
+#[test]
+fn pii_mask_refuses_every_positional_spelling() {
+    let (tmp, cfg) = pii_fixture(PII_MASK_SECTION);
+    for sql in [
+        "SELECT email, id FROM users ORDER BY 1",
+        "SELECT email, id FROM users ORDER BY +1",
+        "SELECT email, id FROM users ORDER BY (1)",
+        "SELECT email, id FROM users ORDER BY ((+1))",
+        "SELECT email FROM users GROUP BY +1",
+        "SELECT email FROM users GROUP BY (1)",
+        // Spellings a fuzz of 47 forms found the engines ALSO read as an
+        // ordinal (hex literals — PostgreSQL 16 added them —, a double
+        // negation, a COLLATE suffix, a digit separator). Enumerating them was
+        // the wrong model: what is refused now is any sort key that is not a
+        // plain column NAME.
+        "SELECT email, id FROM users ORDER BY 0x1",
+        "SELECT email, id FROM users ORDER BY -(-1)",
+        "SELECT email, id FROM users ORDER BY 1 COLLATE NOCASE",
+        "SELECT email, id FROM users ORDER BY (1) COLLATE BINARY",
+        "SELECT email FROM users GROUP BY 0x1",
+        "SELECT email, id FROM users ORDER BY abs(1)",
+        "SELECT email, id FROM users ORDER BY 1 + 0",
+        // ...and the position of an UNPROTECTED column is refused too: nyet no
+        // longer models which spellings each planner folds to an ordinal.
+        "SELECT id, email FROM users ORDER BY 1",
+        "SELECT id, email FROM users ORDER BY 0x1",
+    ] {
+        let out = run_query(tmp.path(), &cfg, sql);
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+        assert_no_pii_leak(&out, sql);
+    }
+    // Ordering by a column NAME is the shape that keeps working — protected
+    // names are refused by name, everything else sorts as usual.
+    for sql in [
+        "SELECT id, email FROM users ORDER BY id",
+        "SELECT id, email FROM users ORDER BY created_at DESC",
+        "SELECT id, email FROM users u ORDER BY u.id",
+        "SELECT id, email FROM users GROUP BY id",
+    ] {
+        let out = run_query(tmp.path(), &cfg, sql);
+        assert_eq!(out.status.code(), Some(0), "{sql}: {}", stdout(&out));
+    }
+}
+
+/// Net B must never mask a column net A did not sanction: it knows more than net
+/// A does (SQLite resolves a view column to its base table), and a column that
+/// only IT can see is one net A could not judge the ORDER BY / DISTINCT over —
+/// which sorted and deduplicated by the real value. `deny` refuses these, so
+/// `mask` must too.
+#[test]
+fn pii_mask_never_masks_what_net_a_did_not_sanction() {
+    let (tmp, cfg) = pii_fixture(PII_MASK_SECTION);
+    for sql in [
+        "SELECT id, contact FROM v_users ORDER BY contact",
+        "SELECT DISTINCT contact FROM v_users",
+        "SELECT contact FROM v_users",
+    ] {
+        let out = run_query(tmp.path(), &cfg, sql);
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "NYET", "{sql}");
+        assert_no_pii_leak(&out, sql);
+    }
+    // Listing the view is the documented fix, and then net A sanctions it.
+    let (tmp, cfg) = pii_fixture(
+        "[connections.db.pii]\ncolumns = [\"users.email\", \"v_users.contact\"]\nmode = \"mask\"\n",
+    );
+    let out = run_query(tmp.path(), &cfg, "SELECT contact FROM v_users");
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["rows"][0]["contact"], "[REDACTED]", "{v}");
+}
+
+/// The mask relaxes the PROJECTION and nothing else: everything that could read
+/// the real value back out — a filter, a sort, a grouping, a whole-row read, a
+/// join oracle — keeps the deny-mode refusal, and the hint teaches the mask.
+#[test]
+fn pii_mask_still_refuses_every_oracle() {
+    let (tmp, cfg) = pii_fixture(PII_MASK_SECTION);
+    for sql in [
+        "SELECT count(*) AS n FROM users WHERE email LIKE 'a%'",
+        "SELECT email FROM users ORDER BY 1",
+        "SELECT email FROM users ORDER BY email",
+        "SELECT DISTINCT email FROM users",
+        "SELECT email FROM users GROUP BY 1",
+        "SELECT email AS x FROM users",
+        "SELECT substr(email, 1, 3) AS x FROM users",
+        "SELECT * FROM users",
+        "SELECT u.* FROM users u",
+        "SELECT count(*) AS n FROM users JOIN dict USING (email)",
+        "SELECT count(*) AS n FROM users NATURAL JOIN dict",
+        "SELECT count(*) AS n FROM (users JOIN dict USING (email))",
+        "WITH x AS (SELECT email FROM users) SELECT count(*) AS n FROM x",
+        "SELECT * FROM (SELECT email FROM users) t",
+    ] {
+        let out = run_query(tmp.path(), &cfg, sql);
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["reason"], "PII_COLUMN", "{sql}");
+        let hint = v["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("[REDACTED]"), "{sql}: {hint}");
+        assert!(hint.contains("no CLI flag"), "{sql}: {hint}");
+        assert_no_pii_leak(&out, sql);
+    }
+    // ...and the very same statements are still refused under the default mode,
+    // where the plain projection is refused too (UX-5: no config, no change).
+    let (tmp, cfg) = pii_fixture(PII_SECTION);
+    let out = run_query(tmp.path(), &cfg, "SELECT id, email FROM users");
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+}
+
+/// `[pii]` marks the columns in `nyet schema` (both forms) so the agent never
+/// spends a round trip discovering them by refusal (UX-2/UX-3).
+#[test]
+fn pii_columns_are_marked_in_schema() {
+    for (section, mode) in [(PII_SECTION, "deny"), (PII_MASK_SECTION, "mask")] {
+        let (tmp, cfg) = pii_fixture(section);
+        let out = nyet(tmp.path())
+            .args(["schema", "db", "users", "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{mode}: {}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        let columns = v["schema"]["tables"][0]["columns"].as_array().unwrap();
+        for column in columns {
+            let want = if column["name"] == "email" {
+                serde_json::Value::from(mode)
+            } else {
+                serde_json::Value::Null
+            };
+            assert_eq!(column["pii"], want, "{mode}: {column}");
+        }
+        // The human/table form carries it too.
+        let out = nyet(tmp.path())
+            .args(["schema", "db", "users", "--format", "table", "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            stdout(&out).contains(&format!("pii {mode}")),
+            "{mode}: {}",
+            stdout(&out)
+        );
+    }
+    // No policy, no marking (and not a byte of extra output).
+    let (tmp, cfg) = pii_fixture("");
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "users", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(!stdout(&out).contains("pii"), "{}", stdout(&out));
+}
+
+/// The audit log holds exactly what the agent saw — masked. `sql` stays raw
+/// (forensics for the human, file mode 0600), the cell value never appears.
+#[test]
+fn pii_mask_is_audited_without_the_data() {
+    let (tmp, cfg) = pii_fixture(&format!(
+        "{PII_MASK_SECTION}[audit]\nlog_responses = true\n"
+    ));
+    let out = run_query(tmp.path(), &cfg, "SELECT id, email FROM users");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = fs::read_to_string(audit_file(tmp.path())).expect("audit file must exist");
+    let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(v["verdict"], "ok", "{v}");
+    assert_eq!(v["warnings"][0], "PII_MASKED", "{v}");
+    let rows = v["response"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{v}");
+    for row in rows {
+        assert_eq!(row["email"], "[REDACTED]", "{v}");
+        assert!(row["id"].is_number(), "{v}");
+    }
+    assert!(!text.contains(PII_VALUE), "the audit log leaked the value");
+}
+
+/// `nyet doctor` is honest about what the policy is worth on SQLite: there is no
+/// role to hide the columns from, so nyet is the only thing enforcing them — and
+/// a connection without a `[pii]` section gets no such check at all (UX-4: an
+/// `na` line on every ordinary connection is pure noise).
+#[test]
+fn pii_doctor_check_is_na_on_sqlite_and_absent_without_a_policy() {
+    let doctor = |section: &str| {
+        let (tmp, cfg) = pii_fixture(section);
+        let out = nyet(tmp.path())
+            .args(["doctor", "db", "--format", "json", "--config"])
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "pii_columns")
+            .cloned()
+    };
+    let check = doctor(PII_MASK_SECTION).expect("a policy must produce the check");
+    assert_eq!(check["status"], "na", "{check}");
+    assert!(
+        check["message"].as_str().unwrap().contains("only thing"),
+        "{check}"
+    );
+    assert!(doctor("").is_none(), "no policy, no check");
 }
 
 /// Net A is shared by `query` and `explain`, so a plan for a refused query is

@@ -1,0 +1,240 @@
+# Golden corpus — the PII policy under mode = "mask" (PostgreSQL dialect).
+# The nine holes closed in step PII-1 are re-pinned HERE, in mask mode: relaxing
+# the projection must not reopen a single one of them.
+pii: users.email, users.phone, customers.ssn
+pii_mode: mask
+
+# --- what mask allows (net B redacts the values) ---
+- query: SELECT email FROM users
+  verdict: allow
+- query: SELECT users.email FROM users
+  verdict: allow
+- query: SELECT u.email FROM users u
+  verdict: allow
+- query: SELECT id, email, phone FROM users
+  verdict: allow
+- query: SELECT EMAIL FROM USERS
+  verdict: allow
+- query: SELECT ssn FROM app.customers
+  verdict: allow
+- query: SELECT email FROM users WHERE id = 1 LIMIT 5
+  verdict: allow
+# `FROM ONLY t` is a plain read of t in both spellings, so the projection is the
+# same shape — and the relation is still resolved (it is not a bypass)
+- query: SELECT email FROM ONLY users
+  verdict: allow
+
+# --- the nine closed holes, still closed under mask ---
+# 1-2. FROM ONLY, both forms, in every position that is not a plain projection
+- query: SELECT * FROM ONLY users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT * FROM ONLY (users)
+  verdict: deny
+  reason: PII_COLUMN
+# the paren form lands as a table FUNCTION whose argument is the bare relation
+# name, which is a whole-row value — so even a plain projection stays refused
+- query: SELECT email FROM ONLY (users)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email || '' FROM ONLY (users)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT count(*) FROM ONLY (users) WHERE email LIKE 'a%'
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT most_common_vals FROM ONLY (pg_stats)
+  verdict: deny
+  reason: PII_COLUMN
+# 3. UNION ALL TABLE (and TABLE on its own): a whole-relation read
+- query: SELECT NULL AS a UNION ALL TABLE users
+  verdict: deny
+  reason: PII_COLUMN
+# standalone `TABLE t` does not parse here -> fail closed on the parser
+- query: TABLE users
+  verdict: deny
+  reason: PARSE_FAILED
+- query: SELECT NULL AS a UNION ALL TABLE pg_stats
+  verdict: deny
+  reason: PII_COLUMN
+# 4. parenthesised JOIN USING / NATURAL
+- query: SELECT count(*) FROM (users JOIN dict USING (email))
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT count(*) FROM (users NATURAL JOIN (SELECT 'a@b.c' AS email) d)
+  verdict: deny
+  reason: PII_COLUMN
+# 5. f(t.*) in table-source position
+- query: SELECT 1 FROM users u, f(u.*)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT 1 FROM users u, LATERAL f(u.*)
+  verdict: deny
+  reason: PII_COLUMN
+# 6. alias column list
+- query: SELECT c FROM users AS u (a, b, c)
+  verdict: deny
+  reason: PII_COLUMN
+# 7. LATERAL (SELECT outer.*)
+- query: SELECT count(*) FROM users u, LATERAL (SELECT u.*) s WHERE s.email LIKE 'a%'
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT s.email FROM users u, LATERAL (SELECT u.*) s
+  verdict: deny
+  reason: PII_COLUMN
+# 8-9. whole row in every spelling: *, t.*, the composite, f(t.*) in projection
+- query: SELECT * FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT u.* FROM users u
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT u FROM users u
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT users FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT json_agg(u.*) FROM users u
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- the rest of net A, unchanged by the mode ---
+- query: SELECT email AS x FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email::int FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT md5(email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT count(DISTINCT email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT DISTINCT email FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email FROM users ORDER BY 1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT id, email FROM users ORDER BY 2
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT id, email FROM users GROUP BY 2
+  verdict: deny
+  reason: PII_COLUMN
+# sorting/grouping by an UNPROTECTED column cannot reach the masked value: by
+# name it is refused, and a masked item never carries an alias to reach it by
+- query: SELECT id, email FROM users ORDER BY id
+  verdict: allow
+- query: SELECT email FROM users GROUP BY 1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT count(*) FROM users WHERE email LIKE 'a%'
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT o.id FROM orders o JOIN users u ON u.email = o.contact
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT count(*) FROM users JOIN dict USING (email)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT count(*) FROM users NATURAL JOIN dict
+  verdict: deny
+  reason: PII_COLUMN
+- query: WITH x AS (SELECT email FROM users) SELECT count(*) FROM x
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT id FROM orders WHERE user_id IN (SELECT id FROM users WHERE email = 'a@b.c')
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT most_common_vals FROM pg_stats
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT query_to_xml('select email from users', true, false, '')
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# a wildcard expands into N columns, so nyet cannot say which RESULT column is
+# the protected one — mixing the two is refused rather than guessed
+- query: SELECT o.*, u.email FROM orders o, users u
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT u.email, o.* FROM orders o, users u
+  verdict: deny
+  reason: PII_COLUMN
+# every spelling the engines read as an ordinal, not just the bare number
+- query: SELECT email, id FROM users ORDER BY +1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY (1)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY ((+1))
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email FROM users GROUP BY +1
+  verdict: deny
+  reason: PII_COLUMN
+# ...but a wildcard with nothing protected beside it, and an ordinal pointing at
+# an unprotected column, are ordinary queries
+- query: SELECT o.* FROM orders o, users u
+  verdict: allow
+
+# ORDER BY / GROUP BY take plain column NAMES while a masked column is
+# projected: nyet does not model which spellings a planner folds into an
+# ordinal (measured ordinals include 0x1, -(-1), `1 COLLATE ...`, 0_1), so a key
+# that is not a name is refused whatever it is
+- query: SELECT id, email FROM users ORDER BY 1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY -(-1)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY abs(1)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY 1 + 0
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users GROUP BY -(-1)
+  verdict: deny
+  reason: PII_COLUMN
+# ...and a NAME still works, which is the case the guard was narrowed for
+- query: SELECT id, email FROM users ORDER BY created_at DESC
+  verdict: allow
+- query: SELECT id, email FROM users u ORDER BY u.id
+  verdict: allow
+
+- query: SELECT email, id FROM users ORDER BY 0x2
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY 0_2
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY -(-2)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY (2)
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY 2 COLLATE "C"
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY 2 + 0
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, id FROM users ORDER BY abs(2)
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- unchanged by the mode ---
+- query: SELECT count(*) FROM users
+  verdict: allow
+- query: SELECT id, created_at FROM users
+  verdict: allow
+- query: SELECT * FROM orders
+  verdict: allow
+- query: SELECT o.* FROM orders o JOIN users u ON u.id = o.uid
+  verdict: allow

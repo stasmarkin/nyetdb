@@ -8,14 +8,15 @@
 //! locking clauses, function denylist).
 
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, JoinConstraint, JoinOperator,
-    ObjectName, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
-    TableAlias, TableFactor, TableFunctionArgs, TableWithJoins, UtilityOption, Visit, Visitor,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    JoinOperator, ObjectName, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableAlias, TableFactor,
+    TableFunctionArgs, TableWithJoins, UtilityOption, Visit, Visitor,
 };
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
@@ -77,6 +78,11 @@ pub enum Verdict {
         /// The rest of the allowlist (EXPLAIN, SHOW, DESCRIBE) is metadata that
         /// no planner estimates, so the cli skips the guardrail for it.
         is_query: bool,
+        /// RESULT-column indexes that `mode = "mask"` let through on the
+        /// PROMISE that net B redacts them (empty in every other case). The cli
+        /// hands them to `check_origins`, which refuses when a promise was not
+        /// kept — net A's relaxation is only ever as good as net B's proof.
+        pii_exempt: Vec<usize>,
     },
     Deny {
         reason: DenyReason,
@@ -134,6 +140,49 @@ pub struct PiiRules {
     /// given table) is derived on the fly: a second, cached copy is exactly the
     /// kind of state a later edit desynchronizes into a fail-OPEN net A.
     pairs: BTreeSet<(String, String)>,
+    /// What happens when a rule matches. `Deny` is the default, so a config
+    /// written before this key keeps the same VERDICT and the same rows (UX-5);
+    /// the refusal `hint` texts were rewritten and `schema`/`doctor` gained the
+    /// PII marking and check, which are additive.
+    mode: PiiMode,
+}
+
+/// The sanction a matching rule carries (`[connections.X.pii] mode`). One mode
+/// per connection on purpose (Д5): per-column modes would multiply the rules an
+/// agent has to learn without protecting anything the connection-wide choice
+/// does not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PiiMode {
+    /// Refuse the whole query (the historical, and default, behavior).
+    #[default]
+    Deny,
+    /// Let a plain projection through and replace every value of the protected
+    /// column with `[REDACTED]`. Only the PROJECTION is relaxed — see
+    /// `maskable_projection`.
+    Mask,
+}
+
+impl PiiMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PiiMode::Deny => "deny",
+            PiiMode::Mask => "mask",
+        }
+    }
+
+    /// Config value -> mode. Fail loud (Д3): a typo must not silently pick the
+    /// weaker OR the stronger sanction.
+    pub fn parse(value: &str) -> Result<PiiMode, String> {
+        match value {
+            "deny" => Ok(PiiMode::Deny),
+            "mask" => Ok(PiiMode::Mask),
+            other => Err(format!(
+                "\"{other}\" is not a PII mode: write mode = \"deny\" (refuse the whole \
+                 query, the default) or mode = \"mask\" (return the protected column as \
+                 [REDACTED] when it is plainly projected)"
+            )),
+        }
+    }
 }
 
 impl PiiRules {
@@ -142,8 +191,11 @@ impl PiiRules {
     /// possibly match an identifier**: a rule nyet accepts but can never match
     /// is worse than a rejected one — the config owner believes the column is
     /// protected while every query returns it (finding 7).
-    pub fn parse(rules: &[String]) -> Result<PiiRules, String> {
-        let mut out = PiiRules::default();
+    pub fn parse(rules: &[String], mode: PiiMode) -> Result<PiiRules, String> {
+        let mut out = PiiRules {
+            mode,
+            ..PiiRules::default()
+        };
         for raw in rules {
             let parts: Vec<&str> = raw.split('.').map(str::trim).collect();
             let bad = |why: &str| {
@@ -191,6 +243,17 @@ impl PiiRules {
     /// No rules = no PII policy on this connection (the historical behavior).
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
+    }
+
+    /// The sanction this connection applies (deny / mask).
+    pub fn mode(&self) -> PiiMode {
+        self.mode
+    }
+
+    /// The protected `(table, column)` pairs, bare and lowercased — for the
+    /// `doctor` check that asks the SERVER whether the role can read them.
+    pub fn pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.pairs.iter().map(|(t, c)| (t.as_str(), c.as_str()))
     }
 
     /// Does this policy protect `column` of `table`? Both may be qualified
@@ -297,16 +360,45 @@ pub struct Refusal {
 /// A and are fixed there. The boundary that holds for renaming layers is:
 /// list the view's own columns in the policy, and use column-level GRANTs
 /// (README).
-pub fn check_origins(rules: &PiiRules, columns: &[String], origins: &[Origin]) -> Option<Refusal> {
+///
+/// **Under `mode = "mask"` this net is also the ENFORCER, and the masked set is
+/// EXACTLY the set net A sanctioned** (`pii_exempt`, the result-column indexes it
+/// let through on the promise of redaction). Both halves are load-bearing:
+///
+/// - a promised column that did NOT come back protected refuses
+///   (`PII_UNPROVABLE`) — otherwise `mask` returns what `deny` refused;
+/// - a protected column that was NOT promised refuses exactly as it does under
+///   `deny`, instead of being masked. Net B knows MORE than net A (SQLite
+///   resolves a view column to its base table), and a column net A never saw is
+///   one it could not judge the `ORDER BY`/`DISTINCT` over: `SELECT id, contact
+///   FROM v_users ORDER BY contact` came back fully redacted and perfectly
+///   sorted by the hidden value. Masking only what net A sanctioned makes the
+///   ordering guard complete by construction — and makes the three engines
+///   agree, since PostgreSQL and MySQL never reported through a view anyway.
+///
+/// `Unknown` still refuses in both modes — an unprovable column could be the
+/// protected one and must not be handed over unmasked.
+pub fn check_origins(
+    rules: &PiiRules,
+    columns: &[String],
+    origins: &[Origin],
+    pii_exempt: &[usize],
+) -> Result<Vec<usize>, Refusal> {
+    let mut mask = Vec::new();
     if rules.is_empty() {
-        return None;
+        return Ok(mask);
     }
     for (i, label) in columns.iter().enumerate() {
         match origins.get(i).unwrap_or(&Origin::Unknown) {
             Origin::Expression => {}
             Origin::Table { table, column } => {
                 if rules.protects(table, column) {
-                    return Some(Refusal {
+                    // Masked ONLY where net A sanctioned this very column.
+                    if rules.mode == PiiMode::Mask && pii_exempt.contains(&i) {
+                        mask.push(i);
+                        continue;
+                    }
+                    return Err(Refusal {
                         reason: DenyReason::PiiColumn,
                         message: format!(
                             "nyet: result column '{label}' resolves to '{}.{column}', which \
@@ -315,24 +407,56 @@ pub fn check_origins(rules: &PiiRules, columns: &[String], origins: &[Origin]) -
                              returned",
                             bare_name(table)
                         ),
-                        hint: pii_hint(),
+                        // NOT the generic hint: this refusal is about the layer,
+                        // not the query, and the mask text ("select it plainly")
+                        // would send an agent that DID select it plainly round in
+                        // circles. Only the config owner can fix this one.
+                        hint: pii_layer_hint(),
                     });
                 }
             }
             Origin::Unknown => {
-                return Some(Refusal {
+                return Err(Refusal {
                     reason: DenyReason::PiiUnprovable,
                     message: format!(
                         "nyet: the database would not say where result column '{label}' comes \
                          from, and this connection protects some columns as PII — nyet cannot \
                          prove the value is not protected data"
                     ),
-                    hint: pii_hint(),
+                    hint: pii_hint(rules.mode),
                 });
             }
         }
     }
-    None
+    // THE PROMISE, the other half. Net A let a column through only because net B
+    // was going to redact it; a column that was NOT redacted has to refuse, or
+    // the mode turns a refusal into a full disclosure. Two agent-reachable ways
+    // to get here, both found in review, both closed by this:
+    //   - a rule on a VIEW's column while the driver resolves the origin to the
+    //     BASE table (SQLite): net A protected `v_users.contact`, net B saw
+    //     `users.email`, and nothing matched — the README's own "list the view"
+    //     recipe used to hand the value over under `mask`;
+    //   - a CTE shadowing the protected table's name: the scope is active, so
+    //     the projection is exempted, but the value is an expression with no
+    //     provenance at all.
+    // The strict form ("an exempted column MUST come back masked") costs nothing
+    // against `deny`: net A only ever exempts an occurrence it would otherwise
+    // have refused. The index is trustworthy because net A refuses a WILDCARD
+    // beside a maskable column — with only scalar items in the SELECT list, the
+    // n-th item IS the n-th result column.
+    if let Some(i) = pii_exempt.iter().find(|i| !mask.contains(i)) {
+        return Err(Refusal {
+            reason: DenyReason::PiiUnprovable,
+            message: format!(
+                "nyet: result column '{}' was allowed only because this connection masks \
+                 protected columns, but the database did not report it as one of them — so \
+                 nyet cannot prove the value it returned is redacted, and nothing was returned",
+                columns.get(*i).map_or("?", String::as_str)
+            ),
+            hint: pii_hint(rules.mode),
+        });
+    }
+    Ok(mask)
 }
 
 /// Built-in SQLite denylist (rationale in docs/DEV.md). All defense in
@@ -747,15 +871,34 @@ pub fn validate(sql: &str, policy: &Policy) -> Verdict {
     // (`users AS u (a, b, c)`); nyet does not know the real column order, so
     // which alias hides the protected column is unprovable — refuse (finding 4).
     if pii.alias_columns {
-        return pii_alias_columns_deny();
+        return pii_alias_columns_deny(policy.pii.mode);
     }
     // A table source nyet could not classify at all: it may well be the
     // protected table under a spelling the parser renders differently — every
     // bypass found so far was exactly that.
     if pii.unresolved {
-        return pii_unresolved_source_deny();
+        return pii_unresolved_source_deny(policy.pii.mode);
     }
-    let mut checker = Checker { policy, pii };
+    let (maskable, wildcard_conflict) = maskable_projection(&policy.pii, &pii, &stmt);
+    // A wildcard beside a column the mask would redact: net A cannot say which
+    // result column is which, so the promise it hands net B would be checked
+    // against the wrong one (measured leak). Refused, with the way out.
+    if wildcard_conflict {
+        return pii_mask_wildcard_deny();
+    }
+    // Sorting/grouping/dedup on a column the mask would redact reads the value
+    // back out of the row order or the row count, so it is refused before the
+    // walk — and with its own message, because the fix is "remove the clause",
+    // not "do not name the column" (Д10).
+    if let Some(clause) = mask_ordering_conflict(&stmt, &maskable) {
+        return pii_mask_ordering_deny(clause);
+    }
+    let mut checker = Checker {
+        policy,
+        pii,
+        maskable,
+        pii_exempt: Vec::new(),
+    };
     if let ControlFlow::Break(v) = stmt.visit(&mut checker) {
         return *v;
     }
@@ -775,12 +918,175 @@ pub fn validate(sql: &str, policy: &Policy) -> Verdict {
         sql: sql.into_owned(),
         warnings,
         is_query: matches!(stmt, Statement::Query(_)),
+        pii_exempt: checker.pii_exempt,
     }
 }
 
 struct Checker<'a> {
     policy: &'a Policy,
     pii: PiiScope,
+    /// Projection expressions `mode = "mask"` relaxes: node address -> the
+    /// RESULT-column index it will produce (empty under `mode = "deny"`, and
+    /// empty for every statement shape that is not the exact one described on
+    /// `maskable_projection`).
+    maskable: BTreeMap<usize, usize>,
+    /// The result columns actually relaxed while walking THIS statement — the
+    /// promise handed to net B.
+    pii_exempt: Vec<usize>,
+}
+
+/// Which expression nodes `mode = "mask"` lets through — **by identity**, not by
+/// name: the same `email` is masked in the projection and refused in the WHERE
+/// of the same statement, so the rule cannot be a property of the name (and it
+/// cannot be a property of the value either: `WHERE email = 'x'` holds an
+/// `Expr::Identifier` structurally EQUAL to the projected one). The AST is
+/// borrowed for the whole walk, so a node's address identifies it exactly.
+///
+/// Masking is a promise net B has to keep, so net A relaxes only the shape whose
+/// result column the driver provably resolves to `table.column`:
+///
+/// - the **root** select's projection, never a nested one. A derived table, a
+///   CTE or a UNION arm hands its columns to another layer, and what a driver
+///   reports THROUGH that layer is precisely the documented view limitation —
+///   `SELECT x FROM (SELECT email AS x FROM users) t` must not become a way to
+///   launder the value past net B;
+/// - a **bare, unaliased** column reference. `upper(email)` carries no
+///   provenance at all (net B would see an `Expression` and pass it through
+///   unmasked), and an ALIAS is a second name for the same value that SQLite
+///   accepts in WHERE (`SELECT email AS e FROM users WHERE e LIKE 'a%'`) — an
+///   oracle net A can no longer see, because `e` is not a protected name.
+///
+/// Sorting, grouping and dedup are handled separately, by
+/// `mask_ordering_conflict` — they are a property of the STATEMENT, not of the
+/// projection node, and they get their own refusal so the agent is told what to
+/// remove (Д10). The exemption itself is a PROMISE: the index is recorded and
+/// `check_origins` refuses the result if the column did not come back masked.
+///
+/// Everything else — wildcards in every spelling, whole-row composites,
+/// `TABLE t`, USING/NATURAL, the statistics catalogs — keeps the `deny`-mode
+/// refusal, in both modes.
+fn maskable_projection(
+    rules: &PiiRules,
+    scope: &PiiScope,
+    stmt: &Statement,
+) -> (BTreeMap<usize, usize>, bool) {
+    let mut out = BTreeMap::new();
+    if rules.mode != PiiMode::Mask || rules.is_empty() {
+        return (out, false);
+    }
+    let Statement::Query(query) = stmt else {
+        return (out, false);
+    };
+    let SetExpr::Select(select) = &*query.body else {
+        return (out, false);
+    };
+    // A WILDCARD expands into N result columns, so everything to its right sits
+    // somewhere net A cannot compute.
+    // (`SelectItem` has FIVE variants in sqlparser 0.62: the two wildcards, the
+    // two scalar ones, and `ExprWithAliases` (`expr AS (a, b)`) — which is ALSO
+    // a multi-column expansion, but is parsed only by dialects whose
+    // `supports_select_item_multi_column_alias()` is true (Spark/Databricks/
+    // Generic). None of the three nyet ships is one, so it cannot reach here
+    // today; if a dialect is ever added, it belongs in the match below.) — and the promise net B checks by index
+    // would then be kept by the WRONG column while the exempted one goes out
+    // raw (measured: `SELECT v.*, d.protected FROM v, d` returned the value).
+    // A qualified `t.*` is NOT refused by the wildcard rule when `t` provably
+    // carries no rules, so this cannot be left to that check. Refusing here is
+    // what makes "the n-th item is the n-th result column" TRUE, which is the
+    // whole basis of the promise; `mask_conflict` turns it into a refusal that
+    // says so.
+    for (index, item) in select.projection.iter().enumerate() {
+        if let SelectItem::UnnamedExpr(expr) = item {
+            if scope.names_protected_column(expr) {
+                out.insert(std::ptr::from_ref(expr).addr(), index);
+            }
+        }
+    }
+    let wildcard = select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    });
+    // The map is DROPPED when a wildcard is present: keeping it would hand net B
+    // indexes that do not exist. The flag is what the caller turns into a
+    // refusal that explains itself.
+    match wildcard && !out.is_empty() {
+        true => (BTreeMap::new(), true),
+        false => (out, false),
+    }
+}
+
+/// Does this statement SORT, GROUP or DEDUPE on a column the mask would redact?
+/// Those read the real value back out through the row ORDER or the row COUNT
+/// even when every cell is `[REDACTED]`, so the statement is refused — with its
+/// own message, because "remove the ORDER BY" is a different instruction from
+/// "do not name this column" (Д10).
+///
+/// The check is a DENYLIST, not an allowlist, and that is the whole point.
+/// While anything is maskable, a sort/group key is accepted ONLY when it is a
+/// plain column NAME (`Expr::Identifier` / `Expr::CompoundIdentifier`) — those
+/// are judged by `check_pii_expr` like every other name, in both modes, so a
+/// protected one is refused there. Everything else is refused here.
+///
+/// The allowlist version was wrong three review rounds running, and it was wrong
+/// in PRINCIPLE: "which expressions is this planner willing to fold into an
+/// ordinal" is a per-engine, per-VERSION question nyet cannot answer from the
+/// AST. Measured across 47 spellings on three servers, the ordinal forms include
+/// `1`, `+1`, `(1)`, `-(-1)`, `0x1` (PostgreSQL 16 added non-decimal literals),
+/// `0_1` (digit separators), and `1 COLLATE NOCASE` — while `1+0`, `1.0`, `'1'`,
+/// `abs(1)` and `CAST(1 AS INT)` are NOT ordinals on any of them. Each of the
+/// misses sorted the result by the real value of a redacted column, or handed
+/// over its exact distinct count. A denylist needs none of that knowledge: a key
+/// that is not a name cannot be checked, so it is not allowed.
+///
+/// `DISTINCT` needs no key at all — it dedupes on the values themselves — so it
+/// conflicts whenever anything is maskable.
+///
+/// Cost, deliberate and documented: under `mode = "mask"`, and only in a
+/// statement that plainly projects a protected column, `ORDER BY`/`GROUP BY`
+/// takes column names only — no positions and no expressions. `ORDER BY id`,
+/// `ORDER BY u.created_at DESC` and `GROUP BY id` are unaffected, which is the
+/// case this guard was narrowed for in the first place.
+fn mask_ordering_conflict(
+    stmt: &Statement,
+    maskable: &BTreeMap<usize, usize>,
+) -> Option<&'static str> {
+    if maskable.is_empty() {
+        return None;
+    }
+    let Statement::Query(query) = stmt else {
+        return None;
+    };
+    let is_name = |expr: &Expr| matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+    if let Some(order_by) = &query.order_by {
+        match &order_by.kind {
+            // `ORDER BY ALL` sorts by every column, the masked one included.
+            // (No dialect nyet ships parses it — fail closed anyway.)
+            OrderByKind::All(_) => return Some("ORDER BY ALL"),
+            OrderByKind::Expressions(exprs) => {
+                if !exprs.iter().all(|e| is_name(&e.expr)) {
+                    return Some("ORDER BY <a position or an expression>");
+                }
+            }
+        }
+    }
+    if let SetExpr::Select(select) = &*query.body {
+        if select.distinct.is_some() {
+            return Some("DISTINCT");
+        }
+        match &select.group_by {
+            GroupByExpr::All(_) => return Some("GROUP BY ALL"),
+            // A modifier (WITH ROLLUP / CUBE) adds grouping sets over the same
+            // keys; refused with them for the same reason (fail closed).
+            GroupByExpr::Expressions(exprs, modifiers) => {
+                if !exprs.iter().all(is_name) || !modifiers.is_empty() {
+                    return Some("GROUP BY <a position or an expression>");
+                }
+            }
+        }
+    }
+    None
 }
 
 /// What the PII policy means for THIS statement (net A), computed from a
@@ -880,6 +1186,29 @@ impl PiiScope {
     /// relation is in scope.
     fn prefix_is_safe(&self, prefix: &str) -> bool {
         !self.handles.contains(prefix) && self.relations.contains(prefix)
+    }
+
+    /// Is this expression a plain reference to a column this scope protects —
+    /// i.e. exactly the case `check_pii_expr` refuses on the `columns` branch?
+    /// Shared so `maskable_projection` marks the nodes that WILL be exempted and
+    /// nothing else: a candidate list wider than the deny rule made
+    /// `ORDER BY 1` over an unprotected first column read as an oracle.
+    fn names_protected_column(&self, expr: &Expr) -> bool {
+        let name = match expr {
+            Expr::Identifier(ident) => &ident.value,
+            Expr::CompoundIdentifier(parts) => {
+                let qualifier = parts.len().checked_sub(2).and_then(|i| parts.get(i));
+                if qualifier.is_some_and(|q| self.prefix_is_safe(&q.value.to_lowercase())) {
+                    return false;
+                }
+                match parts.last() {
+                    Some(part) => &part.value,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        self.columns.contains(&name.to_lowercase())
     }
 }
 
@@ -1187,10 +1516,10 @@ impl Visitor for Checker<'_> {
         if !self.policy.pii.is_empty() {
             for name in set_expr_tables(&query.body) {
                 if self.policy.value_sampling_catalogs.contains(&name.as_str()) {
-                    return break_deny(pii_catalog_deny(&name));
+                    return break_deny(pii_catalog_deny(&name, self.policy.pii.mode));
                 }
                 if self.policy.pii.protects_table(&name) {
-                    return break_deny(pii_wildcard_deny());
+                    return break_deny(pii_wildcard_deny(self.policy.pii.mode));
                 }
             }
         }
@@ -1250,7 +1579,7 @@ impl Visitor for Checker<'_> {
                     _ => false,
                 };
                 if refused {
-                    return break_deny(pii_wildcard_deny());
+                    return break_deny(pii_wildcard_deny(self.policy.pii.mode));
                 }
             }
             self.check_joins(&select.from, &local)?;
@@ -1308,7 +1637,7 @@ impl Visitor for Checker<'_> {
                         .value_sampling_catalogs
                         .contains(&table.as_str())
                     {
-                        return break_deny(pii_catalog_deny(&table));
+                        return break_deny(pii_catalog_deny(&table, self.policy.pii.mode));
                     }
                 }
             }
@@ -1384,7 +1713,10 @@ impl Checker<'_> {
                             if let Some(ident) = terminal_ident(name) {
                                 let lower = ident.value.to_lowercase();
                                 if self.pii.columns.contains(&lower) {
-                                    return break_deny(pii_column_deny(&lower));
+                                    return break_deny(pii_column_deny(
+                                        &lower,
+                                        self.policy.pii.mode,
+                                    ));
                                 }
                             }
                         }
@@ -1392,7 +1724,7 @@ impl Checker<'_> {
                     // NATURAL joins on every same-named column pair, which nyet
                     // cannot enumerate without the schema.
                     Some(JoinConstraint::Natural) if local.active() => {
-                        return break_deny(pii_natural_join_deny())
+                        return break_deny(pii_natural_join_deny(self.policy.pii.mode))
                     }
                     _ => {}
                 }
@@ -1417,18 +1749,20 @@ impl Checker<'_> {
             };
             if let FunctionArgExpr::QualifiedWildcard(name) = arg_expr {
                 if !self.qualified_wildcard_is_safe(name, &self.pii) {
-                    return break_deny(pii_wildcard_deny());
+                    return break_deny(pii_wildcard_deny(self.policy.pii.mode));
                 }
             }
         }
         ControlFlow::Continue(())
     }
 
-    fn check_pii_expr(&self, expr: &Expr) -> Option<Verdict> {
+    fn check_pii_expr(&mut self, expr: &Expr) -> Option<Verdict> {
         let name = match expr {
             // `SELECT *` inside an expression position (rare, but it exists);
             // `count(*)` is a FunctionArgExpr, not an Expr, so it never lands here.
-            Expr::Wildcard(_) | Expr::QualifiedWildcard(..) => return Some(pii_wildcard_deny()),
+            Expr::Wildcard(_) | Expr::QualifiedWildcard(..) => {
+                return Some(pii_wildcard_deny(self.policy.pii.mode))
+            }
             Expr::Identifier(ident) => &ident.value,
             Expr::CompoundIdentifier(parts) => {
                 // A qualifier that provably names an unruled source settles
@@ -1445,12 +1779,21 @@ impl Checker<'_> {
         };
         let lower = name.to_lowercase();
         if self.pii.columns.contains(&lower) {
-            return Some(pii_column_deny(&lower));
+            // mode = "mask": a plain projection of the column is allowed here
+            // and REDACTED by net B, which is the only layer that can prove the
+            // result column is the protected one (see `maskable_projection`).
+            // The index is REMEMBERED: net B must refuse the result if it did
+            // not in fact mask this column (an exemption is a promise).
+            if let Some(index) = self.maskable.get(&std::ptr::from_ref(expr).addr()) {
+                self.pii_exempt.push(*index);
+                return None;
+            }
+            return Some(pii_column_deny(&lower, self.policy.pii.mode));
         }
         // A bare table name or alias used as a VALUE is a whole-row composite
         // (`SELECT u FROM users u` in PostgreSQL) — every column at once.
         if self.pii.handles.contains(&lower) {
-            return Some(pii_whole_row_deny(&lower));
+            return Some(pii_whole_row_deny(&lower, self.policy.pii.mode));
         }
         None
     }
@@ -1568,86 +1911,163 @@ fn pragma_deny() -> Verdict {
 /// also close the door on the obvious next move — there is no flag, and asking
 /// nyet again in another shape will not help; the policy belongs to whoever owns
 /// the config file, exactly like the guardrail's ceiling.
-fn pii_hint() -> String {
-    "this connection's config marks some columns as personal data in \
-     [connections.<alias>.pii]; nyet refuses the whole query rather than \
-     returning or filtering on them, and there is no CLI flag to override it — \
-     the policy belongs to whoever owns the config file. Name the columns you \
-     actually need instead of `*`, and keep the protected ones out of every \
-     clause (SELECT, WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY and subqueries \
-     all count — filtering on a protected column leaks it one character at a \
-     time). Use `nyet schema <alias>` to see which columns exist, and ask the \
-     config owner if you genuinely need the protected data."
+fn pii_hint(mode: PiiMode) -> String {
+    // The two modes need DIFFERENT instructions, and mixing them is a real
+    // defect: under `deny`, "name the columns you need" IS what was refused, so
+    // the deny text must keep saying that the protected column is off limits in
+    // every clause INCLUDING SELECT (it said so before mask mode existed).
+    let sanction = match mode {
+        PiiMode::Deny => {
+            "nyet refuses the whole query rather than returning or filtering on them, and \
+             there is no CLI flag to override it — the policy belongs to whoever owns the \
+             config file. Select the OTHER columns of that table instead: a protected \
+             column is off limits in every clause, SELECT included (SELECT, WHERE, JOIN \
+             ON, JOIN USING, GROUP BY, HAVING, ORDER BY, DISTINCT, subqueries and `*` all \
+             count — filtering on a protected column leaks it one character at a time)"
+        }
+        // Under mask the agent CAN get the row back — it just has to ask for the
+        // column plainly, which is the one shape nyet can prove and redact.
+        PiiMode::Mask => {
+            "this connection masks them (mode = \"mask\"), and there is no CLI flag to \
+             override that — the policy belongs to whoever owns the config file. A \
+             protected column may be SELECTed PLAINLY, on its own: `SELECT id, email FROM \
+             users` returns [REDACTED] in every row of `email`, with a PII_MASKED warning. \
+             Any other use is refused — an alias (`AS e`), an expression around it \
+             (`substr(email,1,3)`), `*`/`t.*`, WHERE, JOIN ON, JOIN USING, GROUP BY, \
+             HAVING, ORDER BY, DISTINCT, and projecting it inside a subquery or CTE — \
+             because comparing, sorting or grouping by the real value reads it back out \
+             of the row count or the row order"
+        }
+    };
+    format!(
+        "this connection's config marks some columns as personal data in \
+         [connections.<alias>.pii]; {sanction}. Use `nyet schema <alias>` to see which \
+         columns exist (protected ones are marked), and ask the config owner if you \
+         genuinely need the protected data."
+    )
+}
+
+/// `mode = "mask"`, and the SELECT list mixes a wildcard with a column the mask
+/// would redact. Its own refusal (Д10): the fix is "list the columns", which is
+/// not what any other PII message says.
+/// A result column that turns out to come from a protected column through a
+/// layer the policy does not name (a view, a renaming select). No rewrite of the
+/// QUERY helps — the fix is in the config, so say that instead of repeating the
+/// generic advice (Д10).
+fn pii_layer_hint() -> String {
+    "the column reached the result through a layer this connection's PII policy does not \
+     name — a view or another renaming layer over a protected table — and nyet refuses \
+     what it cannot check against a rule rather than guessing. Rewriting the query \
+     will not change that, and there is no CLI flag: the config owner has to list that \
+     layer's own columns as well (`columns = [\"users.email\", \"v_users.contact\"]`), or \
+     hide the column from the database role. Read the other columns of that view in the \
+     meantime, and see `nyet schema <alias>` for what exists."
         .to_string()
 }
 
-fn pii_column_deny(column: &str) -> Verdict {
+fn pii_mask_wildcard_deny() -> Verdict {
+    deny(
+        DenyReason::PiiColumn,
+        "the SELECT list mixes a wildcard ('*' or 'alias.*') with a column this connection's \
+         PII policy masks — a wildcard expands into as many columns as the source has, so \
+         nyet cannot tell which column of the RESULT is the protected one, and it will not \
+         guess"
+            .to_string(),
+        "list the columns you need explicitly instead of the wildcard — the protected ones \
+         then come back as [REDACTED] with a PII_MASKED warning (`SELECT id, name, email \
+         FROM users`). `nyet schema <alias>` shows the column list, protected columns \
+         marked.",
+    )
+}
+
+/// `mode = "mask"`, and the statement SORTS, GROUPS or DEDUPES on a column the
+/// mask would redact. Its own refusal on purpose (Д10): the agent removed
+/// nothing useful by dropping the column — what it has to drop is the clause,
+/// and the ordinary "do not name this column" message would send it in circles.
+fn pii_mask_ordering_deny(clause: &str) -> Verdict {
+    deny(
+        DenyReason::PiiColumn,
+        format!(
+            "this query uses {clause} while projecting a column this connection's PII policy \
+             masks — the values would come back as [REDACTED], but the row ORDER and the row \
+             COUNT would still be the real ones, which reads the hidden value back out"
+        ),
+        "while a masked column is in the SELECT list, ORDER BY and GROUP BY take plain column \
+         NAMES only — no positions (`ORDER BY 1`) and no expressions, because nyet cannot \
+         tell which of those the server folds into a reference to the hidden column. \
+         `SELECT id, email FROM users ORDER BY id` works and returns `email` as [REDACTED]; \
+         DISTINCT over a masked column is refused outright. Sort the rows yourself if you \
+         need another order — and there is no CLI flag to override this.",
+    )
+}
+
+fn pii_column_deny(column: &str, mode: PiiMode) -> Verdict {
     deny(
         DenyReason::PiiColumn,
         format!(
             "the query references '{column}', which this connection's PII policy protects \
              on one of the tables it reads"
         ),
-        &pii_hint(),
+        &pii_hint(mode),
     )
 }
 
-fn pii_wildcard_deny() -> Verdict {
+fn pii_wildcard_deny(mode: PiiMode) -> Verdict {
     deny(
         DenyReason::PiiColumn,
         "the query projects a whole row ('*', 'alias.*' or 'f(alias.*)') from a source that \
          either has columns this connection's PII policy protects, or that nyet cannot \
          resolve to a source without them — so it could return the protected columns"
             .to_string(),
-        &pii_hint(),
+        &pii_hint(mode),
     )
 }
 
-fn pii_whole_row_deny(handle: &str) -> Verdict {
+fn pii_whole_row_deny(handle: &str, mode: PiiMode) -> Verdict {
     deny(
         DenyReason::PiiColumn,
         format!(
             "'{handle}' is used as a whole-row value, which expands to every column of a \
              table this connection's PII policy protects"
         ),
-        &pii_hint(),
+        &pii_hint(mode),
     )
 }
 
-fn pii_natural_join_deny() -> Verdict {
+fn pii_natural_join_deny(mode: PiiMode) -> Verdict {
     deny(
         DenyReason::PiiColumn,
         "a NATURAL JOIN silently joins on every column the two relations share, and one of \
          them has columns this connection's PII policy protects — whether a protected column \
          is part of the join condition cannot be told without the schema"
             .to_string(),
-        &pii_hint(),
+        &pii_hint(mode),
     )
 }
 
-fn pii_alias_columns_deny() -> Verdict {
+fn pii_alias_columns_deny(mode: PiiMode) -> Verdict {
     deny(
         DenyReason::PiiColumn,
         "the query renames the columns of a table this connection's PII policy protects with \
          an alias column list (`table AS t (a, b, c)`), which maps names by POSITION — nyet \
          cannot tell which alias now stands for the protected column"
             .to_string(),
-        &pii_hint(),
+        &pii_hint(mode),
     )
 }
 
-fn pii_unresolved_source_deny() -> Verdict {
+fn pii_unresolved_source_deny(mode: PiiMode) -> Verdict {
     deny(
         DenyReason::PiiUnprovable,
         "nyet could not work out what one of the query's table sources is, and this \
          connection protects some columns as PII — an unidentified source may well be the \
          protected table under a spelling nyet reads differently"
             .to_string(),
-        &pii_hint(),
+        &pii_hint(mode),
     )
 }
 
-fn pii_catalog_deny(catalog: &str) -> Verdict {
+fn pii_catalog_deny(catalog: &str, mode: PiiMode) -> Verdict {
     deny(
         DenyReason::PiiColumn,
         format!(
@@ -1655,7 +2075,7 @@ fn pii_catalog_deny(catalog: &str) -> Verdict {
              bounds), so reading it would expose the data this connection's PII policy \
              protects — without naming a protected column"
         ),
-        &pii_hint(),
+        &pii_hint(mode),
     )
 }
 
@@ -1699,6 +2119,11 @@ mod tests {
         /// (so a file can pin both sides of the same query). Absent everywhere =
         /// no PII policy, as before.
         pii: String,
+        /// `[connections.X.pii] mode` for this case — `deny` (default) or
+        /// `mask`. Same two levels as `pii:`: a file-wide line before the first
+        /// case, overridable per case, so the mask twins of a deny case can sit
+        /// next to it.
+        pii_mode: String,
     }
 
     fn parse_corpus(file: &Path) -> Vec<Case> {
@@ -1716,6 +2141,7 @@ mod tests {
         let text = std::fs::read_to_string(file).unwrap();
         let mut cases: Vec<Case> = Vec::new();
         let mut default_pii = String::new();
+        let mut default_pii_mode = String::new();
         for (idx, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -1731,10 +2157,15 @@ mod tests {
                     reason: None,
                     warnings: None,
                     pii: default_pii.clone(),
+                    pii_mode: default_pii_mode.clone(),
                 });
                 continue;
             }
             if cases.is_empty() {
+                if let Some(m) = line.strip_prefix("pii_mode: ") {
+                    default_pii_mode = m.to_string();
+                    continue;
+                }
                 let p = line
                     .strip_prefix("pii: ")
                     .unwrap_or_else(|| panic!("{name}:{}: key before first '- query:'", idx + 1));
@@ -1754,6 +2185,8 @@ mod tests {
                 case.warnings = Some(w.to_string());
             } else if let Some(p) = line.strip_prefix("pii: ") {
                 case.pii = p.to_string();
+            } else if let Some(m) = line.strip_prefix("pii_mode: ") {
+                case.pii_mode = m.to_string();
             } else {
                 panic!("{name}:{}: unrecognized corpus line: {raw}", idx + 1);
             }
@@ -1783,7 +2216,11 @@ mod tests {
                     .filter(|r| !r.is_empty() && *r != "none")
                     .map(str::to_string)
                     .collect();
-                let pii = PiiRules::parse(&rules).unwrap_or_else(|e| panic!("{at}: {e}"));
+                let mode = match case.pii_mode.as_str() {
+                    "" => PiiMode::Deny,
+                    other => PiiMode::parse(other).unwrap_or_else(|e| panic!("{at}: {e}")),
+                };
+                let pii = PiiRules::parse(&rules, mode).unwrap_or_else(|e| panic!("{at}: {e}"));
                 let policy = match case.dialect.as_str() {
                     "sqlite" => Policy::sqlite(&[], &[]),
                     "postgres" => Policy::postgres(&[], &[]),
@@ -1828,7 +2265,7 @@ mod tests {
         }
         // Tripwire against accidental corpus loss (a whole file or a large
         // chunk vanishing must fail loudly). Raise as the corpus grows.
-        assert!(total >= 350, "corpus suspiciously small: {total} cases");
+        assert!(total >= 550, "corpus suspiciously small: {total} cases");
     }
 
     #[test]
@@ -2121,11 +2558,14 @@ mod tests {
     #[test]
     fn pii_rules_parse_normalizes_and_rejects_garbage() {
         // table.column and schema.table.column; case and schema are ignored.
-        let rules = PiiRules::parse(&[
-            "Users.Email".to_string(),
-            "app.customers.SSN".to_string(),
-            " users . phone ".to_string(),
-        ])
+        let rules = PiiRules::parse(
+            &[
+                "Users.Email".to_string(),
+                "app.customers.SSN".to_string(),
+                " users . phone ".to_string(),
+            ],
+            PiiMode::Deny,
+        )
         .unwrap();
         assert!(rules.protects("users", "email"));
         assert!(rules.protects("USERS", "EMAIL"));
@@ -2138,7 +2578,7 @@ mod tests {
         assert!(!rules.protects("users", "id"));
         assert!(!rules.protects("orders", "email"));
         // no rules at all = the historical behavior
-        assert!(PiiRules::parse(&[]).unwrap().is_empty());
+        assert!(PiiRules::parse(&[], PiiMode::Deny).unwrap().is_empty());
         // garbage fails loud, naming the offender (Д3/Д10)
         for bad in [
             "",
@@ -2149,7 +2589,7 @@ mod tests {
             "users..email",
             "   ",
         ] {
-            let err = PiiRules::parse(&[bad.to_string()]).unwrap_err();
+            let err = PiiRules::parse(&[bad.to_string()], PiiMode::Deny).unwrap_err();
             assert!(err.contains("table.column"), "{bad:?}: {err}");
         }
     }
@@ -2160,8 +2600,8 @@ mod tests {
     /// and each one, left unresolved, emptied the scope and switched net A off.
     #[test]
     fn only_resolves_to_the_real_relation_in_both_spellings() {
-        let policy =
-            Policy::postgres(&[], &[]).with_pii(PiiRules::parse(&["users.email".into()]).unwrap());
+        let policy = Policy::postgres(&[], &[])
+            .with_pii(PiiRules::parse(&["users.email".into()], PiiMode::Deny).unwrap());
         for sql in [
             "SELECT email FROM ONLY users",
             "SELECT email FROM ONLY (users)",
@@ -2190,7 +2630,7 @@ mod tests {
 
     #[test]
     fn net_b_judges_the_reported_provenance() {
-        let rules = PiiRules::parse(&["users.email".to_string()]).unwrap();
+        let rules = PiiRules::parse(&["users.email".to_string()], PiiMode::Deny).unwrap();
         let cols = vec!["x".to_string()];
         let table = |t: &str, c: &str| {
             vec![Origin::Table {
@@ -2200,22 +2640,25 @@ mod tests {
         };
         // A protected column reached through a rename/view -> PII_COLUMN.
         for (t, c) in [("users", "email"), ("public.users", "EMAIL")] {
-            match check_origins(&rules, &cols, &table(t, c)) {
-                Some(Refusal { reason, hint, .. }) => {
+            match check_origins(&rules, &cols, &table(t, c), &[]) {
+                Err(Refusal { reason, hint, .. }) => {
                     assert_eq!(reason, DenyReason::PiiColumn);
                     assert!(hint.contains("config"), "{hint}");
                 }
                 _ => panic!("{t}.{c} must be denied"),
             }
         }
-        // An unmarked column and a computed value pass.
-        assert!(check_origins(&rules, &cols, &table("users", "id")).is_none());
-        assert!(check_origins(&rules, &cols, &[Origin::Expression]).is_none());
+        // An unmarked column and a computed value pass, and mask NOTHING.
+        for origins in [table("users", "id"), vec![Origin::Expression]] {
+            assert!(check_origins(&rules, &cols, &origins, &[])
+                .unwrap()
+                .is_empty());
+        }
         // An origin the driver would not state, and a MISSING origin, both fail
         // closed with PII_UNPROVABLE.
         for origins in [vec![Origin::Unknown], Vec::new()] {
-            match check_origins(&rules, &cols, &origins) {
-                Some(Refusal { reason, hint, .. }) => {
+            match check_origins(&rules, &cols, &origins, &[]) {
+                Err(Refusal { reason, hint, .. }) => {
                     assert_eq!(reason, DenyReason::PiiUnprovable);
                     assert!(!hint.is_empty());
                 }
@@ -2224,8 +2667,119 @@ mod tests {
         }
         // No PII policy -> net B is a no-op, whatever the driver says.
         let none = PiiRules::default();
-        assert!(check_origins(&none, &cols, &table("users", "email")).is_none());
-        assert!(check_origins(&none, &cols, &[Origin::Unknown]).is_none());
+        assert!(check_origins(&none, &cols, &table("users", "email"), &[]).is_ok());
+        assert!(check_origins(&none, &cols, &[Origin::Unknown], &[]).is_ok());
+    }
+
+    /// mode = "mask": the same provenance that REFUSES under deny now names the
+    /// columns to redact — and the unprovable case still refuses, in both modes.
+    #[test]
+    fn net_b_masks_instead_of_refusing_under_mask_mode() {
+        let rules = PiiRules::parse(&["users.email".to_string()], PiiMode::Mask).unwrap();
+        let cols = vec!["id".to_string(), "e".to_string()];
+        let origins = vec![
+            Origin::Table {
+                table: "users".to_string(),
+                column: "id".to_string(),
+            },
+            Origin::Table {
+                table: "public.users".to_string(),
+                column: "EMAIL".to_string(),
+            },
+        ];
+        assert_eq!(
+            check_origins(&rules, &cols, &origins, &[1]).unwrap(),
+            vec![1]
+        );
+        // ...and ONLY where net A sanctioned it: unsanctioned, the protected
+        // column refuses exactly as `deny` does. Net B knows MORE than net A
+        // (a view resolved to its base table), and a column net A never saw is
+        // one it could not judge the ORDER BY / DISTINCT over.
+        match check_origins(&rules, &cols, &origins, &[]) {
+            Err(Refusal { reason, .. }) => assert_eq!(reason, DenyReason::PiiColumn),
+            Ok(masked) => panic!("an unsanctioned protected column must refuse, got {masked:?}"),
+        }
+        // Unprovable is unprovable whatever the mode: an Unknown column could BE
+        // the protected one, and nyet cannot mask what it cannot identify.
+        let unknown = vec![Origin::Unknown, Origin::Expression];
+        match check_origins(&rules, &cols, &unknown, &[]) {
+            Err(Refusal { reason, .. }) => assert_eq!(reason, DenyReason::PiiUnprovable),
+            Ok(masked) => panic!("an Unknown origin must refuse, masked {masked:?}"),
+        }
+    }
+
+    /// Net A's exemption is a PROMISE, and an unkept promise refuses: the two
+    /// live cases (a rule on a view's column while the driver reports the base
+    /// table's, and a CTE shadowing the protected table) both arrive here as
+    /// "column 1 was exempted but nothing masked it".
+    #[test]
+    fn net_b_refuses_an_exempted_column_it_did_not_mask() {
+        let rules = PiiRules::parse(&["v_users.contact".to_string()], PiiMode::Mask).unwrap();
+        let cols = vec!["id".to_string(), "contact".to_string()];
+        for origins in [
+            // SQLite resolves the view column to its BASE table, which no rule
+            // names — so nothing was masked, and the value must not be returned.
+            vec![
+                Origin::Table {
+                    table: "users".to_string(),
+                    column: "id".to_string(),
+                },
+                Origin::Table {
+                    table: "users".to_string(),
+                    column: "email".to_string(),
+                },
+            ],
+            // A computed value carries no provenance at all.
+            vec![Origin::Expression, Origin::Expression],
+        ] {
+            match check_origins(&rules, &cols, &origins, &[1]) {
+                Err(Refusal {
+                    reason, message, ..
+                }) => {
+                    assert_eq!(reason, DenyReason::PiiUnprovable);
+                    assert!(message.contains("'contact'"), "{message}");
+                }
+                Ok(masked) => panic!("an unkept promise must refuse, masked {masked:?}"),
+            }
+        }
+        // The promise KEPT (the policy names what the driver reports) passes.
+        let rules = PiiRules::parse(&["users.email".to_string()], PiiMode::Mask).unwrap();
+        let kept = vec![
+            Origin::Expression,
+            Origin::Table {
+                table: "users".to_string(),
+                column: "email".to_string(),
+            },
+        ];
+        assert_eq!(check_origins(&rules, &cols, &kept, &[1]).unwrap(), vec![1]);
+    }
+
+    /// The mask relaxation is per OCCURRENCE, not per name: the very same
+    /// `email` is allowed in the projection and refused in the WHERE of one
+    /// statement — and the refusal has to teach the mask (Д10).
+    #[test]
+    fn mask_mode_relaxes_the_projection_and_nothing_else() {
+        let policy = Policy::sqlite(&[], &[])
+            .with_pii(PiiRules::parse(&["users.email".to_string()], PiiMode::Mask).unwrap());
+        assert!(matches!(
+            validate("SELECT id, email FROM users LIMIT 5", &policy),
+            Verdict::Allow { .. }
+        ));
+        let Verdict::Deny { reason, hint, .. } =
+            validate("SELECT email FROM users WHERE email LIKE 'a%'", &policy)
+        else {
+            panic!("a filter on the protected column must stay refused")
+        };
+        assert_eq!(reason, DenyReason::PiiColumn);
+        assert!(hint.contains("REDACTED"), "{hint}");
+        assert!(hint.contains("no CLI flag"), "{hint}");
+        // Deny mode is untouched by the new code path.
+        let deny_policy = Policy::sqlite(&[], &[])
+            .with_pii(PiiRules::parse(&["users.email".to_string()], PiiMode::Deny).unwrap());
+        assert!(matches!(
+            validate("SELECT id, email FROM users LIMIT 5", &deny_policy),
+            Verdict::Deny { .. }
+        ));
     }
 
     #[test]
@@ -2233,7 +2787,7 @@ mod tests {
         // Д10 + the guardrail's rule: an agent that can lift its own limit does
         // not have one, so every PII hint must close that door explicitly.
         let policy = Policy::postgres(&[], &[])
-            .with_pii(PiiRules::parse(&["users.email".to_string()]).unwrap());
+            .with_pii(PiiRules::parse(&["users.email".to_string()], PiiMode::Deny).unwrap());
         for sql in [
             "SELECT email FROM users",
             "SELECT * FROM users",
