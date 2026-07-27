@@ -53,13 +53,45 @@ The SQLite and validator/config/resolver tests need no Docker.
 The engine treats MySQL and MariaDB as one driver + one SQL dialect; the only
 runtime difference is the **server-side query-timeout variable**, mutually
 exclusive between the two (each server rejects the other's name with
-ER_UNKNOWN_SYSTEM_VARIABLE, 1193): MySQL uses `max_execution_time` (ms), MariaDB
-`max_statement_time` (seconds). The engine picks by the config `engine` value
-(`mariadb` → the seconds form) and **swallows a 1193** if the label is wrong —
-the cli's outer tokio timeout is the backstop, so a mislabelled server degrades
-to timeout-only rather than a broken query. Both timeout SQLSTATEs (3024 / 1969)
-map to `EngineError::Timeout` so the exit code is deterministic (like Postgres
-57014).
+ER_UNKNOWN_SYSTEM_VARIABLE, 1193; re-verified live on mysql:8.4 and mariadb:11.4
+in July 2026): MySQL uses `max_execution_time` (ms), MariaDB `max_statement_time`
+(seconds). Both timeout SQLSTATEs (3024 / 1969) map to `EngineError::Timeout` so
+the exit code is deterministic (like Postgres 57014).
+
+**The flavor is a hint-ordered SEARCH, learned once per connection
+(`TimeoutVar`).** The engine used to send BOTH spellings on every call and
+swallow the 1193 of whichever was wrong — three calls per guarded query × two
+statements = **six round trips, half of them known-doomed**. Now the config
+`engine` label only picks which name is tried FIRST; the other stays in the
+search as the fallback, and the accepted one is remembered for the rest of the
+connection. Consequences, in order of importance:
+
+- a mislabelled server is **still capped** — the label cannot switch the server
+  cap off, it can only cost one extra round trip, once per connection;
+- a correctly labelled server never sees a 1193 at all;
+- `TimeoutVar::Neither` (a proxy that knows neither name) is remembered too, so
+  the discovery is not re-paid on every SET; there is no server cap then and the
+  cli's own deadline is the backstop — exactly the behavior of the old
+  swallow-both code.
+
+**`Neither` warns nobody and refuses nothing — on purpose.** "Fail closed" is the
+rule for SECURITY doubt, and a missing server cap is not that: the read-only
+transaction, the validator and the read-only role are untouched by it, and the
+query is still bounded by nyet's own deadline plus a dropped socket. SQLite ships
+with no server-side timeout at all for the same reason. Refusing here would also
+be a behavior change for a setup that works today (the old code swallowed both
+SETs and ran on), and the agent cannot summon the condition on an arbitrary query
+— which is the project's standing test for fail-open (see the guardrail section).
+The branch itself is covered by `the_timeout_variable_is_searched_by_hint_and_learned_once`
+(no candidates left, no statement produced); the "send the transaction on its own"
+fallback next to it is unreachable today (every phase starts from a fresh
+`Unknown`) and exists so that a future reuse of the flavor across statements
+cannot silently drop layer 2.
+
+Reading `@@version_comment` at connect was the obvious alternative and was
+rejected: it costs a round trip of its own on EVERY connection to learn what the
+first SET tells us for free, and it answers about the server's marketing name
+rather than about the variable we are about to set.
 
 Two flavors are tested on purpose to cover both timeout variables and both
 `JSON` behaviors (MySQL has a real `JSON` type → structured; MariaDB stores
@@ -710,9 +742,12 @@ which is what makes fail-open the right default there:
 client-side is not enough — the backend keeps planning, and on MySQL the late
 error of a dropped EXPLAIN surfaced as the failure of the NEXT statement. So:
 
-- **PostgreSQL** (`pg_guarded_plan`): `SAVEPOINT nyet_guardrail` +
-  `SET LOCAL statement_timeout = <budget>` before the EXPLAIN, and
-  `ROLLBACK TO SAVEPOINT` after it — on every path that keeps the connection.
+- **PostgreSQL** (`Postgres::begin_read_only` + `pg_guarded_plan`):
+  `SAVEPOINT nyet_guardrail` + `SET LOCAL statement_timeout = <budget>` before the
+  EXPLAIN, and `ROLLBACK TO SAVEPOINT` after it — on every path that keeps the
+  connection. Each of those two groups travels as ONE message (see "Round trips"
+  below): the arming rides in the `BEGIN READ ONLY`, the repair carries its own
+  restore.
   `TooSlow` and `Broken` skip it (there the socket is dropped, and the savepoint
   dies with it; awaiting a rollback on a busy or broken session is the very hang
   this design avoids). The savepoint is what makes the
@@ -722,11 +757,26 @@ error of a dropped EXPLAIN surfaced as the failure of the NEXT statement. So:
   instead of naming the missing relation (verified live, now pinned in the e2e).
   Rolling back to the savepoint also restores `statement_timeout` (SET LOCAL is
   savepoint-scoped), and an explicit restore follows as belt and suspenders.
+  **That second half is provably redundant, and deliberately kept**: measured on
+  postgres:16 (`SET LOCAL statement_timeout = 5000` inside the savepoint reads
+  `5s`, and after `ROLLBACK TO SAVEPOINT` alone it reads `30s` again), and an
+  ablation that deletes ONLY the explicit restore leaves the whole suite green —
+  not a coverage hole, an unobservable duplicate. It costs zero round trips (it
+  shares the repair message) and covers a rollback that ever stops restoring
+  GUCs. The invariant underneath it IS pinned: deleting the whole repair, or
+  restoring the wrong value, turns
+  `pg_collapsed_guardrail_arming_keeps_its_invariants` red (`5s` / `300ms`
+  instead of `30s`).
 - **MySQL/MariaDB** (`Mysql::guarded_plan`): `set_statement_timeout(budget)`
-  before, `set_statement_timeout(query timeout)` after — the same pair of
-  variables `begin_read_only` uses. Pinned by an e2e that reads
+  before, `set_statement_timeout(query timeout)` after — the same (now single)
+  variable `begin_read_only` uses. Here the restore is NOT redundant (there is no
+  savepoint to undo it), and it is pinned twice: an e2e reads
   `@@max_statement_time` back inside the query (10 s with `--timeout 10`, not the
-  5 s budget) — proof that the cap was lent and returned.
+  5 s budget), and `mysql_layer2_types_and_timeout` asserts it as the agent would
+  feel it — with `query_timeout_ms = 1000` the EXPLAIN's cap is 300 ms while the
+  query's own stays 30 s, so `SELECT sleep(0.5)` must come back `0`; a leaked
+  budget makes MySQL interrupt the sleep and return `1`. Both go red under an
+  ablation that drops the restore.
 
 **Plumbing errors are their own verdict (`Plan::Broken`).** A failure of the
 guardrail's own scaffolding — the savepoint, the timeout it lends the EXPLAIN,
@@ -741,10 +791,17 @@ with the socket — and awaiting a rollback there is exactly the hang this desig
 avoids.
 
 **Three deadlines, strictly nested: server cap < guardrail deadline < query
-deadline.** `explain_deadline_ms` = `min(cap + grace, timeout_secs - 200ms)`, and
-`explain_budget_ms` is that minus the 500 ms grace, so the ordering holds for
-EVERY timeout the CLI accepts (at the 1 s minimum: 300 / 800 / 1000 ms; from 10 s
-up the flat 5 s cap applies). Both earlier shapes were wrong in the same way:
+deadline.** `explain_budget_ms` = `min(cap + grace, timeout_secs - 200ms)` minus
+the 500 ms grace, and `explain_deadline_ms` is **derived from that budget**
+(`budget + grace`), so the ordering holds for EVERY timeout the CLI accepts (at
+the 1 s minimum: 300 / 800 / 1000 ms; from 10 s up the flat 5 s cap applies).
+The derivation direction matters now that the cap is armed at one call site (it
+rides in the `BEGIN`) and the deadline is awaited at another: computing both from
+`query_timeout_ms` would leave "the server cuts a grace period first" true only
+as long as two places agree on the arithmetic, and a silent divergence brings
+back exactly the flake below. Passing the budget through
+(`pg_guarded_plan(.., budget_ms, ..)`) makes it one physical value.
+Both earlier shapes were wrong in the same way:
 equal deadlines let the race be decided by luck (the e2e flaked one run in
 three), and `budget + grace` alone exceeded the query's own deadline below 3.5 s,
 so the outer timer answered `TIMEOUT` before the guardrail could refuse. Pinned
@@ -793,8 +850,11 @@ Two more things worth knowing:
   backend notices when it tries to answer. That is the accepted cost of refusing
   on time.
 
-Cost: three extra round trips on a guarded Postgres query, two on MySQL. That is
-the price of a guardrail that cannot be disabled by making planning slow.
+Cost over an unguarded query: three extra round trips on Postgres (the EXPLAIN's
+two, plus the repair message) and four on MySQL (the EXPLAIN's two, plus lending
+and returning the cap). The ARMING is free on both — it rides in a message that
+was being sent anyway (see "Round trips" below). That is the price of a guardrail
+that cannot be disabled by making planning slow.
 *Residual, documented:* MariaDB's `max_statement_time` has SECOND granularity,
 rounded UP (rounding down turned a 1600 ms budget into a 1 s cap and refused
 queries that were inside it). So on short timeouts the server cap lands LATER
@@ -816,6 +876,113 @@ the envelope shape live in the pure module.
 depends on statistics, parameters and server settings, and a stale cached
 estimate would be a guardrail that lies. Reconsider only if a connection daemon
 (ROADMAP v0.5) ever gives it a natural home.
+
+## Round trips (the control statements, per engine)
+
+On a LAN the control statements around a query are invisible; over a WAN they are
+the bill. Measured against a Yandex-MDB-shaped setup (RTT ≈ 27.5 ms), one
+`nyet query` cost 542 ms of which 278 ms was the query phase — and the query
+phase was **ten** round trips on Postgres and **twelve** on MySQL/MariaDB, i.e.
+more than the connect handshake itself (4–6). Through an SSH bastion each round
+trip roughly doubles in price (measured: 431 ms warm through the tunnel vs 229 ms
+direct at the same RTT), so the count is what to cut, not the per-hop cost.
+
+**What was collapsed.** Both wire protocols run a `;`-separated string of
+statements in ONE round trip, in order, stopping at the first error (Postgres:
+the simple-query `Query` message, which sqlx uses for any `execute(&str)` with no
+bind parameters; MySQL: COM_QUERY with the CLIENT_MULTI_STATEMENTS capability
+sqlx already negotiates). Groups that are always sent together are therefore sent
+as one message:
+
+| Group | Before | After |
+|---|---|---|
+| pg: `BEGIN READ ONLY` + `SAVEPOINT` + `SET LOCAL statement_timeout = <budget>` | 3 | 1 |
+| pg: `ROLLBACK TO SAVEPOINT` + `SET LOCAL statement_timeout = <restore>` | 2 | 1 |
+| mysql: `START TRANSACTION READ ONLY` + the timeout SET | 3 | 1 |
+| mysql: the two SETs the guardrail lends and returns | 4 | 2 |
+
+Per guarded `SELECT`, query phase only (connect excluded), counted on the wire:
+
+| Path | Before | After |
+|---|---|---|
+| `query`, PostgreSQL | 10 | **7** |
+| `query`, MySQL / MariaDB (label correct) | 12 | **8** |
+| `query`, MySQL / MariaDB (label wrong) | 12 | **9** |
+| `explain`, PostgreSQL | 8 | **5** |
+| `explain`, MySQL / MariaDB | 10 | **6** |
+| `schema`, MySQL / MariaDB | 12 | **10** |
+| `query` with `guardrail.mode = "off"`, PostgreSQL | 4 | 4 (unchanged — nothing is armed) |
+| `query` with `guardrail.mode = "off"`, MySQL / MariaDB | 6 | **4** |
+| `schema`, PostgreSQL | 10 | 10 (unchanged) |
+
+At RTT 27.5 ms that is ≈ 82 ms saved per Postgres query and ≈ 110 ms per
+MySQL/MariaDB query; through an SSH tunnel (where the per-hop price doubles),
+≈ 165 / 220 ms.
+
+**How it was measured (reproducible).** A counting TCP proxy in front of the
+container: it forwards every client→server flush after a fixed delay and logs it
+(one flush = one round trip, because both drivers flush and then read). The log
+is the statement-by-statement trace, and the wall clock is the second, independent
+witness — `meta.duration_ms` moves by exactly `Δround-trips × delay`:
+
+| delay per round trip | pg before → after | mysql before → after |
+|---|---|---|
+| 27 ms | 446 → 359 ms | 422 → 293 ms |
+| 55 ms (tunnel-shaped) | 853 → 676 ms | 810 → 585 ms |
+
+(medians of 3–5 runs, `postgres:16-alpine` / `mysql:8.4` / `mariadb:11.4` on
+colima; the numbers include the connect handshake, which did not change.)
+
+**Why none of the guardrail's invariants moved.** Collapsing is only safe where
+every statement in a group fails the SAME WAY to the caller, and where nothing
+can slip between them:
+
+- **The server-side timeout is never absent.** On Postgres the query's
+  `statement_timeout` is a CONNECT option (libpq `-c`), so it is in force before
+  the first byte of SQL; the `SET LOCAL` only NARROWS it for the EXPLAIN and is
+  restored in the same message as the savepoint rollback. On MySQL the cap now
+  shares its round trip with `START TRANSACTION READ ONLY`, which comes first —
+  and still lands before any agent statement.
+- **Read-only cannot be bypassed.** `BEGIN READ ONLY` /
+  `START TRANSACTION READ ONLY` is the FIRST statement of its group and the
+  server stops the group at the first error, so nothing can execute ahead of it
+  (Postgres also carries `default_transaction_read_only=on` from connect).
+  Verified live: after the collapsed batch, `transaction_read_only` reads `on`
+  and an `INSERT` is refused.
+- **The guardrail still cannot be switched off by slow planning.** The
+  `Plan::Failed` / `Plan::TooSlow` / `Plan::Broken` classification, the three
+  nested deadlines and `Plan::discard()` are untouched; the collapse only changes
+  how many messages carry the same statements. `TooSlow` still returns before any
+  repair is attempted.
+- **The restore still happens on every path that keeps the connection**,
+  including the fail-open one: it is the second half of the repair message that
+  the `Failed` path sends too. A failure of that message is still `Plan::Broken`
+  (the session is unusable either way — which is exactly why the two halves may
+  share a message).
+- **Arming failure is treated like `Plan::Broken`.** Since the savepoint and the
+  budget now travel with the `BEGIN`, a half-applied arming is indistinguishable
+  from a failed `BEGIN` — so the armed paths (`query`, `explain`) DROP the socket
+  instead of closing it politely, which is what `Plan::Broken` already did for
+  the same failure. The unarmed `schema` path still closes politely: nothing was
+  armed, so its state is known.
+
+**Diagnostics: what is lost.** When a collapsed group fails, the server names the
+error but not which statement of the group tripped on it. That is acceptable
+precisely because the groups were chosen so any member's failure means the same
+thing to the agent and to the human: arming → "the session could not be set up"
+(DB_ERROR, exit 7, the server's own message); repair → `Plan::Broken` → the same
+DB_ERROR the un-collapsed code produced. No `error.code`, `reason`, hint or exit
+code changed, and none of the statements in a collapsed group contains agent
+text — the agent's SQL still travels ALONE, as a prepared statement, which is
+also why the collapse adds no injection surface (multi-statement text queries
+carry nyet's own constants plus integers).
+
+Not collapsed on purpose: the EXPLAIN and the query itself (prepared statements —
+Parse/Describe then Bind/Execute on Postgres, COM_STMT_PREPARE then
+COM_STMT_EXECUTE on MySQL: 2 round trips each, and the protocol has no way to
+batch them through sqlx), and the final `ROLLBACK`/close (it already runs outside
+the query deadline). Connection reuse, a daemon and query batching stay out of
+scope (ROADMAP v0.5).
 
 ## `nyet agent-setup` (`src/skill.rs` generator)
 

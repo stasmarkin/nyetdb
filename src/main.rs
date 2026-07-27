@@ -1552,10 +1552,10 @@ fn build_engine(
                 validator::Policy::postgres(v_allow, v_deny),
             ))
         }
-        // MariaDB is dialect- and protocol-identical to MySQL here; the
-        // engine sets both server-timeout variables (MySQL's and
-        // MariaDB's) and swallows the wrong-flavor error, so the label
-        // needs no special handling.
+        // MariaDB is dialect- and protocol-identical to MySQL here; the label
+        // only tells the engine which of the two mutually exclusive
+        // server-timeout variables to try FIRST. A wrong label costs one round
+        // trip per connection, never the cap itself (see `TimeoutVar`).
         "mysql" | "mariadb" => {
             let Some(url) = &conn.url else {
                 return Err(Failure::new(
@@ -1584,6 +1584,9 @@ fn build_engine(
                     host_override: None,
                     // Production: the generous connect_deadline floor.
                     connect_timeout_ms: None,
+                    // A hint for the first SET, not a promise: a mislabelled
+                    // server is still capped, one round trip later.
+                    mariadb: conn.engine == "mariadb",
                 }),
                 validator::Policy::mysql(v_allow, v_deny),
             ))

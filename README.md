@@ -179,7 +179,9 @@ not signed by a public one.
 MySQL/MariaDB specifics: use `engine = "mysql"` or `engine = "mariadb"` (they
 share the driver and SQL dialect; the only difference is the server-side query
 timeout variable — MySQL's `max_execution_time` in milliseconds vs MariaDB's
-`max_statement_time` in seconds — which nyet sets for you). `url` is required
+`max_statement_time` in seconds — which nyet sets for you; the label only tells
+nyet which one to try first, so a mislabelled server is still capped, it just
+costs one extra round trip per connection). `url` is required
 (`mysql://user@host:port/dbname`); the password goes in `password_env`, never in
 the file or url. Every query runs inside an explicit `START TRANSACTION READ
 ONLY`, so a write that slipped past the validator is refused by the server, and

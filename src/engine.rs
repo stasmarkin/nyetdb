@@ -198,32 +198,38 @@ impl Plan {
 /// expensive — so exceeding it REFUSES the query (`Plan::TooSlow`).
 const EXPLAIN_BUDGET_MS: u64 = 5_000;
 
-/// The guardrail's OWN client deadline, always strictly inside the query's:
-/// `min(cap + grace, timeout - reserve)`. If planning alone ate the query's
-/// budget the query could not have finished either, and the guardrail's
-/// "planning is itself that expensive" beats a bare TIMEOUT — but only if it
-/// gets to answer first, which is what the reserve buys. At the smallest legal
-/// timeout (1 s) this is 800 ms; from 10 s up it is the flat cap + grace.
+/// The SERVER-side cap lent to the guardrail's EXPLAIN: `min(cap + grace,
+/// timeout - reserve) - grace`. If planning alone ate the query's budget the
+/// query could not have finished either, and the guardrail's "planning is itself
+/// that expensive" beats a bare TIMEOUT — but only if it gets to answer first,
+/// which is what the reserve buys. At the smallest legal timeout (1 s) this is
+/// 300 ms; from 10 s up it is the flat cap.
 ///
 /// **Applicability: `query_timeout_ms >= 1000`** — the minimum both the CLI and
 /// the config enforce (`--timeout` / `timeout_secs` are >= 1 second). Below
-/// ~200 ms the reserve eats everything and deadline/budget collapse to 1 ms, so
-/// the "strictly nested" property would stop holding; nothing can reach that
-/// today, and a future sub-second input must revisit these three constants.
-fn explain_deadline_ms(query_timeout_ms: u64) -> u64 {
+/// ~200 ms the reserve eats everything and the budget collapses to 1 ms, so the
+/// "strictly nested" property would stop holding; nothing can reach that today,
+/// and a future sub-second input must revisit these three constants.
+fn explain_budget_ms(query_timeout_ms: u64) -> u64 {
     EXPLAIN_BUDGET_MS
         .saturating_add(EXPLAIN_GRACE_MS)
         .min(query_timeout_ms.saturating_sub(EXPLAIN_RESERVE_MS))
         .max(1)
-}
-
-/// The SERVER-side cap that goes with that deadline, a grace period earlier, so
-/// the normal way out is the server cancelling its own EXPLAIN rather than nyet
-/// abandoning it.
-fn explain_budget_ms(query_timeout_ms: u64) -> u64 {
-    explain_deadline_ms(query_timeout_ms)
         .saturating_sub(EXPLAIN_GRACE_MS)
         .max(1)
+}
+
+/// The guardrail's OWN client deadline, DERIVED from the cap the server was
+/// actually given rather than recomputed from the timeout. That is the point:
+/// the cap is armed at one call site (it rides in the `BEGIN`) and the deadline
+/// is awaited at another, and "the server cuts a grace period earlier than the
+/// client" must not depend on both places doing the same arithmetic on the same
+/// input. Here it holds by construction — the deadline cannot exist without the
+/// budget it is derived from. (The two were once equal, and the race was then
+/// decided by luck: the e2e flaked one run in three, and the losing branch fell
+/// OPEN.)
+fn explain_deadline_ms(budget_ms: u64) -> u64 {
+    budget_ms.saturating_add(EXPLAIN_GRACE_MS)
 }
 
 /// How much later than the SERVER's cap the client deadline fires. The two used
@@ -1096,23 +1102,27 @@ impl Engine for Postgres {
         // Complements the server statement_timeout (57014); whichever fires, 8.
         let deadline = Duration::from_millis(self.query_timeout_ms);
         let phase = tokio::time::timeout(deadline, async move {
-            if let Err(e) = Postgres::begin_read_only(&mut conn).await {
-                return (Err(e), Some(conn));
+            // The guardrail's EXPLAIN runs HERE: same read-only session (no
+            // second connect), before a single row of the real query is read —
+            // so when it is going to run, its savepoint and its server-side
+            // budget are armed in the same message as the BEGIN.
+            let budget_ms = explain_budget_ms(self.query_timeout_ms);
+            let arm = guardrail.plans().then_some(budget_ms);
+            if let Err(e) = Postgres::begin_read_only(&mut conn, arm).await {
+                // Arming shares the fate of `Plan::Broken`: after a partially
+                // applied BEGIN+SAVEPOINT+SET the session state is unknown, so
+                // the socket is dropped rather than chatted with.
+                drop(conn);
+                return (Err(e), None);
             }
 
-            // The guardrail's EXPLAIN runs HERE: same read-only session (no
-            // second connect), before a single row of the real query is read.
-            let budget_ms = explain_budget_ms(self.query_timeout_ms);
             let estimate = match guardrail.plans() {
                 false => None,
                 true => {
-                    let plan = pg_guarded_plan(
-                        &mut conn,
-                        sql,
-                        self.query_timeout_ms,
-                        self.statement_timeout_ms,
-                    )
-                    .await;
+                    // The SAME `budget_ms` the server was armed with above, so
+                    // the client deadline is derived from it, never recomputed.
+                    let plan =
+                        pg_guarded_plan(&mut conn, sql, budget_ms, self.statement_timeout_ms).await;
                     // THE decision about this connection, here as everywhere
                     // (`Plan::discard`): anything the guardrail could not leave
                     // clean is DROPPED, never closed politely — a graceful
@@ -1217,18 +1227,16 @@ impl Engine for Postgres {
         let mut conn = self.connect().await?;
         let deadline = Duration::from_millis(self.query_timeout_ms);
         let phase = tokio::time::timeout(deadline, async move {
-            if let Err(e) = Postgres::begin_read_only(&mut conn).await {
-                return (Err(e), Some(conn));
+            // `explain` always plans, so the savepoint and the budget are always
+            // armed with the BEGIN (see the `execute` twin for the drop rule).
+            let budget_ms = explain_budget_ms(self.query_timeout_ms);
+            if let Err(e) = Postgres::begin_read_only(&mut conn, Some(budget_ms)).await {
+                drop(conn);
+                return (Err(e), None);
             }
             // The guarded path, exactly as `query` runs it — so a statement
             // whose planning `query` refuses is not blessed with an "ok" here.
-            let plan = pg_guarded_plan(
-                &mut conn,
-                sql,
-                self.query_timeout_ms,
-                self.statement_timeout_ms,
-            )
-            .await;
+            let plan = pg_guarded_plan(&mut conn, sql, budget_ms, self.statement_timeout_ms).await;
             // A connection the guardrail could not leave clean is dropped, never
             // chatted with (`Plan::discard` — see DEV.md).
             let keep = match plan.discard() {
@@ -1248,7 +1256,10 @@ impl Engine for Postgres {
         let mut conn = self.connect().await?;
         let deadline = Duration::from_millis(self.query_timeout_ms);
         let phase = tokio::time::timeout(deadline, async move {
-            if let Err(e) = Postgres::begin_read_only(&mut conn).await {
+            // `schema` never plans: no savepoint, no borrowed budget, so a failed
+            // BEGIN leaves a session whose state IS known and can be closed
+            // politely.
+            if let Err(e) = Postgres::begin_read_only(&mut conn, None).await {
                 return (Err(e), Some(conn));
             }
             let schema = pg_schema(&mut conn, table).await;
@@ -1443,12 +1454,37 @@ impl Postgres {
     /// suspenders over the connection's `default_transaction_read_only`) — the
     /// read runs inside it, a smuggled write fails. Shared by execute/schema,
     /// mirroring `Mysql::begin_read_only`.
-    async fn begin_read_only(conn: &mut sqlx::PgConnection) -> Result<(), EngineError> {
+    ///
+    /// `arm` is the guardrail's server-side budget: when the caller is about to
+    /// plan, the savepoint and that budget travel in the SAME message as the
+    /// BEGIN (one round trip instead of three — `pg_guarded_plan` then only
+    /// EXPLAINs and repairs). The simple-query protocol runs a `;`-separated
+    /// string in one round trip, in order, stopping at the first error — so
+    /// `BEGIN READ ONLY` still takes effect before anything else can, and the
+    /// only statement that ever carries agent text (the query itself) still
+    /// travels alone, as a prepared statement.
+    async fn begin_read_only(
+        conn: &mut sqlx::PgConnection,
+        arm: Option<u64>,
+    ) -> Result<(), EngineError> {
         use sqlx::Executor;
-        conn.execute("BEGIN READ ONLY").await.map_err(pg_error)?;
+        let sql = match arm {
+            None => "BEGIN READ ONLY".to_string(),
+            Some(budget_ms) => format!(
+                "BEGIN READ ONLY; SAVEPOINT {PG_GUARDRAIL_SAVEPOINT}; \
+                 SET LOCAL statement_timeout = {budget_ms}"
+            ),
+        };
+        conn.execute(sqlx::AssertSqlSafe(sql))
+            .await
+            .map_err(pg_error)?;
         Ok(())
     }
 }
+
+/// The savepoint the guardrail plans inside. Named once: it is set by
+/// `begin_read_only` and rolled back by `pg_guarded_plan`.
+const PG_GUARDRAIL_SAVEPOINT: &str = "nyet_guardrail";
 
 /// PostgreSQL plan: `EXPLAIN (FORMAT JSON)` — the JSON tree carries the
 /// planner's `Total Cost` and `Plan Rows` on the top node, which is what the
@@ -1483,61 +1519,52 @@ async fn pg_plan(conn: &mut sqlx::PgConnection, sql: &str) -> Result<CostEstimat
 ///   transaction is aborted" — so the fail-open path did not actually work on
 ///   Postgres: `SELECT * FROM nope_x` reported that instead of "relation does
 ///   not exist". Rolling back to the savepoint restores the transaction AND
-///   (savepoints being transactional) the `statement_timeout` set below, so one
-///   mechanism undoes everything.
+///   (savepoints being transactional) the `statement_timeout` the arming set, so
+///   one mechanism undoes everything.
 /// - **`SET LOCAL statement_timeout = <budget>`.** The SERVER stops planning at
 ///   the budget instead of us abandoning a future that keeps burning the backend.
 ///   The error comes back as 57014 -> `EngineError::Timeout` -> `Plan::TooSlow`.
 ///
-/// Three extra round trips on a guarded query; the price of a guardrail that
-/// cannot be disabled by making planning slow.
+/// The ARMING half (savepoint + budget) rode in the caller's `BEGIN READ ONLY`
+/// message, and the repair half is one message too, so the scaffolding around
+/// the EXPLAIN costs ONE round trip instead of four. Both groups are collapsible for the same
+/// reason: within a group every statement fails the same way to the caller
+/// (arming -> the session was never set up; repair -> `Plan::Broken`, the
+/// session is unusable either way), so nothing is lost by not knowing which one
+/// the server tripped on.
 async fn pg_guarded_plan(
     conn: &mut sqlx::PgConnection,
     sql: &str,
-    query_timeout_ms: u64,
+    budget_ms: u64,
     restore_ms: u64,
 ) -> Plan {
     use sqlx::Executor;
-    let budget_ms = explain_budget_ms(query_timeout_ms);
-    if let Err(e) = conn.execute("SAVEPOINT nyet_guardrail").await {
-        return Plan::Broken(pg_error(e));
-    }
-    if let Err(e) = conn
-        .execute(sqlx::AssertSqlSafe(format!(
-            "SET LOCAL statement_timeout = {budget_ms}"
-        )))
-        .await
-    {
-        // No tidying: `Broken` means the caller drops the connection, so the
-        // savepoint dies with it — and awaiting a rollback here could hang long
-        // enough for the outer timer to answer TIMEOUT instead of this error.
-        return Plan::Broken(pg_error(e));
-    }
     // The client deadline sits a grace period BEHIND the server cap (and inside
     // the query's own deadline), so the normal way out is the server's 57014.
-    let plan = budgeted_plan(explain_deadline_ms(query_timeout_ms), pg_plan(conn, sql)).await;
+    // `budget_ms` is the very value the caller armed the server with, not a
+    // second computation of it — see `explain_deadline_ms`.
+    let plan = budgeted_plan(explain_deadline_ms(budget_ms), pg_plan(conn, sql)).await;
     if matches!(plan, Plan::TooSlow) {
         // TERMINAL — and nothing is attempted on the connection afterwards, so
         // no plumbing error can rewrite the verdict. When OUR deadline is what
         // fired, the backend is still planning and the connection is busy: the
-        // rollback below would queue behind the very work we gave up on and burn
+        // repair below would queue behind the very work we gave up on and burn
         // the query's remaining time, which is how this case answered TIMEOUT
         // instead of a refusal. The caller drops the socket.
         return Plan::TooSlow;
     }
-    // Clears an aborted transaction and restores statement_timeout.
-    if let Err(e) = conn.execute("ROLLBACK TO SAVEPOINT nyet_guardrail").await {
-        // Never a silent run: an unrecoverable session is surfaced, not fallen
-        // open on. (TooSlow cannot reach here — it returned above.)
-        return Plan::Broken(pg_error(e));
-    }
-    // Belt and suspenders: if the rollback somehow left the budget in place, the
-    // query would be cut short at the EXPLAIN's budget. Failing to restore is a
-    // broken session too — running the query under an unknown timeout would
-    // report a TIMEOUT that is nobody's actual setting.
+    // One round trip, and the two halves are inseparable anyway: the rollback
+    // clears an aborted transaction and (savepoints being transactional) already
+    // restores statement_timeout, while the explicit SET is the belt-and-
+    // suspenders half — if the rollback somehow left the budget in place, the
+    // query would be cut short at the EXPLAIN's budget. Failing either is a
+    // broken session: running the query under an unknown timeout would report a
+    // TIMEOUT that is nobody's actual setting, so it is surfaced, never fallen
+    // open on. (TooSlow cannot reach here — it returned above.)
     if let Err(e) = conn
         .execute(sqlx::AssertSqlSafe(format!(
-            "SET LOCAL statement_timeout = {restore_ms}"
+            "ROLLBACK TO SAVEPOINT {PG_GUARDRAIL_SAVEPOINT}; \
+             SET LOCAL statement_timeout = {restore_ms}"
         )))
         .await
     {
@@ -2077,6 +2104,73 @@ pub struct Mysql {
     /// Test-only override for the connect handshake deadline (ms); see the same
     /// field on `Postgres`. Production passes `None`.
     pub connect_timeout_ms: Option<u64>,
+    /// The config's `engine = "mariadb"` label — a HINT only: it decides which
+    /// of the two mutually exclusive timeout variables is tried FIRST, never
+    /// which one is honored. A mislabelled server is still capped, it just pays
+    /// one extra round trip once per connection (see `TimeoutVar`).
+    pub mariadb: bool,
+}
+
+/// Which server-side statement-timeout variable THIS server accepts. The two
+/// spellings are mutually exclusive — MySQL has `max_execution_time`
+/// (milliseconds), MariaDB `max_statement_time` (seconds), and each answers
+/// ER_UNKNOWN_SYSTEM_VARIABLE (1193) for the other's name (verified live on
+/// mysql:8.4 and mariadb:11.4).
+///
+/// The engine used to send BOTH on every call, so half of the six timeout round
+/// trips a guarded query paid were known-doomed. Now the flavor is learned ONCE
+/// per connection, from the very 1193 that used to be paid over and over: the
+/// config label picks which name to try first, so a correctly labelled server
+/// never sees a 1193 at all, and a mislabelled one is still capped by the
+/// fallback — the label cannot silently disable the server cap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TimeoutVar {
+    /// Not asked yet: try the label's name first, then the other.
+    Unknown,
+    /// MySQL: milliseconds.
+    MaxExecutionTime,
+    /// MariaDB: seconds.
+    MaxStatementTime,
+    /// Neither name exists here (an exotic proxy). No server cap is possible, so
+    /// nothing more is tried on this connection — the cli's own deadline is the
+    /// backstop, exactly as it was when both SETs were swallowed.
+    Neither,
+}
+
+impl TimeoutVar {
+    /// The names still worth trying, in order.
+    fn candidates(self, mariadb: bool) -> &'static [TimeoutVar] {
+        const MYSQL_FIRST: &[TimeoutVar] =
+            &[TimeoutVar::MaxExecutionTime, TimeoutVar::MaxStatementTime];
+        const MARIA_FIRST: &[TimeoutVar] =
+            &[TimeoutVar::MaxStatementTime, TimeoutVar::MaxExecutionTime];
+        match self {
+            TimeoutVar::Unknown if mariadb => MARIA_FIRST,
+            TimeoutVar::Unknown => MYSQL_FIRST,
+            TimeoutVar::MaxExecutionTime => &MYSQL_FIRST[..1],
+            TimeoutVar::MaxStatementTime => &MARIA_FIRST[..1],
+            TimeoutVar::Neither => &[],
+        }
+    }
+
+    /// The SET statement for this name, or `None` for the two non-names.
+    fn set(self, timeout_ms: u64) -> Option<String> {
+        match self {
+            // (>= 1; 0 = "no limit".)
+            TimeoutVar::MaxExecutionTime => Some(format!(
+                "SET SESSION max_execution_time = {}",
+                timeout_ms.max(1)
+            )),
+            // MariaDB counts SECONDS, so round UP: rounding down turned a 1600ms
+            // guardrail budget into a 1s server cap and refused queries whose
+            // planning was inside the budget.
+            TimeoutVar::MaxStatementTime => Some(format!(
+                "SET SESSION max_statement_time = {}",
+                timeout_ms.div_ceil(1000).max(1)
+            )),
+            TimeoutVar::Unknown | TimeoutVar::Neither => None,
+        }
+    }
 }
 
 /// Redirect host+port to the tunnel's local end while keeping user/db/params
@@ -2172,48 +2266,80 @@ impl Mysql {
         }
     }
 
-    /// Layer 2 for MySQL/MariaDB: the server-side statement timeout plus an
-    /// explicit read-only transaction. Shared by `execute` and `schema`.
+    /// Layer 2 for MySQL/MariaDB: an explicit read-only transaction plus the
+    /// server-side statement timeout, in ONE round trip (sqlx negotiates
+    /// CLIENT_MULTI_STATEMENTS, and a `;`-separated COM_QUERY runs in order,
+    /// stopping at the first error). Shared by `execute` and `schema`.
     ///
-    /// MySQL and MariaDB use different, mutually exclusive timeout variables
-    /// (ms vs seconds), so set BOTH and swallow the wrong-flavor
-    /// ER_UNKNOWN_SYSTEM_VARIABLE (1193) on each independently — the real server
-    /// always ends up capped regardless of the config label.
-    async fn begin_read_only(&self, conn: &mut sqlx::MySqlConnection) -> Result<(), EngineError> {
-        use sqlx::Executor;
-        Self::set_statement_timeout(conn, self.statement_timeout_ms).await?;
-        conn.execute("START TRANSACTION READ ONLY")
-            .await
-            .map_err(mysql_error)?;
-        Ok(())
+    /// The transaction comes FIRST on purpose: it is the layer that must exist
+    /// before anything else can run, and the cap that follows it still lands
+    /// before the first agent statement. If the flavor guess is wrong the SET
+    /// costs one extra round trip (see `set_statement_timeout`) — the read-only
+    /// transaction is already open by then and is never re-sent.
+    async fn begin_read_only(
+        &self,
+        conn: &mut sqlx::MySqlConnection,
+        var: &mut TimeoutVar,
+    ) -> Result<(), EngineError> {
+        self.set_statement_timeout(
+            conn,
+            Some("START TRANSACTION READ ONLY"),
+            self.statement_timeout_ms,
+            var,
+        )
+        .await
     }
 
-    /// The server-side statement cap, in both flavors' spellings. MySQL takes
-    /// milliseconds (`max_execution_time`), MariaDB seconds
-    /// (`max_statement_time`), and each rejects the other's name with
-    /// ER_UNKNOWN_SYSTEM_VARIABLE (1193) — set both, swallow the 1193, and the
-    /// real server always ends up capped. Also used to lend the guardrail's
-    /// EXPLAIN a shorter cap of its own.
+    /// The server-side statement cap, in the ONE spelling this server accepts.
+    /// Also used to lend the guardrail's EXPLAIN a shorter cap of its own and to
+    /// give it back afterwards.
+    ///
+    /// `lead` is an optional constant statement sent in the same round trip,
+    /// ahead of the SET (`begin_read_only`'s transaction). It runs at most once:
+    /// a retry with the other flavor's name must not repeat it.
+    ///
+    /// Only the flavor mismatch (1193) is swallowed; any other error is the
+    /// caller's, which owns and closes the connection.
     async fn set_statement_timeout(
+        &self,
         conn: &mut sqlx::MySqlConnection,
+        lead: Option<&str>,
         timeout_ms: u64,
+        var: &mut TimeoutVar,
     ) -> Result<(), EngineError> {
         use sqlx::Executor;
-        // MariaDB counts SECONDS, so round UP: rounding down turned a 1600ms
-        // guardrail budget into a 1s server cap and refused queries whose
-        // planning was inside the budget.
-        let secs = timeout_ms.div_ceil(1000).max(1);
-        for stmt in [
-            // (>= 1; 0 = "no limit".)
-            format!("SET SESSION max_execution_time = {}", timeout_ms.max(1)),
-            format!("SET SESSION max_statement_time = {secs}"),
-        ] {
-            if let Err(e) = conn.execute(sqlx::AssertSqlSafe(stmt)).await {
-                if !is_unknown_var(&e) {
-                    // The caller closes the connection on this path (it owns it).
-                    return Err(mysql_error(e));
+        let mut lead = lead;
+        for candidate in var.candidates(self.mariadb) {
+            let Some(set) = candidate.set(timeout_ms) else {
+                continue;
+            };
+            let stmt = match lead {
+                Some(first) => format!("{first}; {set}"),
+                None => set,
+            };
+            match conn.execute(sqlx::AssertSqlSafe(stmt)).await {
+                Ok(_) => {
+                    *var = *candidate;
+                    return Ok(());
                 }
+                // Wrong flavor: this name does not exist here. The lead ran
+                // before it (the server stops AT the failing statement, not
+                // before it), so the retry must not send it again.
+                Err(e) if is_unknown_var(&e) => lead = None,
+                Err(e) => return Err(mysql_error(e)),
             }
+        }
+        *var = TimeoutVar::Neither;
+        // Neither name exists (or was already known not to): no server cap is
+        // possible here, but the lead still MUST run — it is layer 2, not part
+        // of the cap. Unreachable today (every phase starts from a fresh
+        // `Unknown`, so the loop always sends the lead with its first attempt);
+        // it is here so that reusing a learned flavor across phases can never
+        // silently drop the read-only transaction.
+        if let Some(first) = lead {
+            conn.execute(sqlx::AssertSqlSafe(first.to_string()))
+                .await
+                .map_err(mysql_error)?;
         }
         Ok(())
     }
@@ -2230,13 +2356,15 @@ impl Mysql {
         conn: &mut sqlx::MySqlConnection,
         sql: &str,
         query_timeout_ms: u64,
+        var: &mut TimeoutVar,
     ) -> Plan {
-        if let Err(e) = Self::set_statement_timeout(conn, explain_budget_ms(query_timeout_ms)).await
-        {
+        // One budget, computed once: the deadline below is derived from the
+        // value the SERVER was actually given (see `explain_deadline_ms`).
+        let budget_ms = explain_budget_ms(query_timeout_ms);
+        if let Err(e) = self.set_statement_timeout(conn, None, budget_ms, var).await {
             return Plan::Broken(e);
         }
-        let plan =
-            budgeted_plan(explain_deadline_ms(query_timeout_ms), mysql_plan(conn, sql)).await;
+        let plan = budgeted_plan(explain_deadline_ms(budget_ms), mysql_plan(conn, sql)).await;
         if matches!(plan, Plan::TooSlow) {
             // TERMINAL, and the connection may still be busy with the planning
             // we abandoned: no restore, no politeness (see the Postgres twin).
@@ -2244,7 +2372,10 @@ impl Mysql {
         }
         // Restoring the query's own cap is part of the plumbing: if it fails the
         // query would run under the EXPLAIN's short budget, so fail closed.
-        match Self::set_statement_timeout(conn, self.statement_timeout_ms).await {
+        match self
+            .set_statement_timeout(conn, None, self.statement_timeout_ms, var)
+            .await
+        {
             Ok(()) => plan,
             Err(e) => Plan::Broken(e),
         }
@@ -2302,7 +2433,10 @@ impl Engine for Mysql {
         // max_execution_time/max_statement_time; whichever fires, exit 8.
         let deadline = Duration::from_millis(self.query_timeout_ms);
         let phase = tokio::time::timeout(deadline, async move {
-            if let Err(e) = self.begin_read_only(&mut conn).await {
+            // Which timeout variable this server accepts, learned once and
+            // reused by every SET of this connection (see `TimeoutVar`).
+            let mut var = TimeoutVar::Unknown;
+            if let Err(e) = self.begin_read_only(&mut conn, &mut var).await {
                 return (Err(e), Some(conn));
             }
 
@@ -2313,7 +2447,7 @@ impl Engine for Mysql {
                 false => None,
                 true => {
                     let plan = self
-                        .guarded_plan(&mut conn, sql, self.query_timeout_ms)
+                        .guarded_plan(&mut conn, sql, self.query_timeout_ms, &mut var)
                         .await;
                     // The same single decision as the Postgres twin.
                     if plan.discard() {
@@ -2404,12 +2538,13 @@ impl Engine for Mysql {
         let mut conn = self.connect().await?;
         let deadline = Duration::from_millis(self.query_timeout_ms);
         let phase = tokio::time::timeout(deadline, async move {
-            if let Err(e) = self.begin_read_only(&mut conn).await {
+            let mut var = TimeoutVar::Unknown;
+            if let Err(e) = self.begin_read_only(&mut conn, &mut var).await {
                 return (Err(e), Some(conn));
             }
             // The guarded path, exactly as `query` runs it (see the pg twin).
             let plan = self
-                .guarded_plan(&mut conn, sql, self.query_timeout_ms)
+                .guarded_plan(&mut conn, sql, self.query_timeout_ms, &mut var)
                 .await;
             // A connection the guardrail could not leave clean is dropped.
             let keep = match plan.discard() {
@@ -2429,7 +2564,8 @@ impl Engine for Mysql {
         let mut conn = self.connect().await?;
         let deadline = Duration::from_millis(self.query_timeout_ms);
         let phase = tokio::time::timeout(deadline, async move {
-            if let Err(e) = self.begin_read_only(&mut conn).await {
+            let mut var = TimeoutVar::Unknown;
+            if let Err(e) = self.begin_read_only(&mut conn, &mut var).await {
                 return (Err(e), Some(conn));
             }
             let schema = mysql_schema(&mut conn, table).await;
@@ -3332,6 +3468,58 @@ mod tests {
         assert_eq!(classify_mysql_create_failure(None), MaybeOrphan);
     }
 
+    /// The flavor of the server-side timeout variable is a HINT-ordered SEARCH,
+    /// never a decision: the config label only picks which of the two mutually
+    /// exclusive names is tried first, and the other one always remains as the
+    /// fallback — a mislabelled server must still end up capped (it just pays one
+    /// extra round trip, once per connection). Once the answer is known the
+    /// search is a single candidate, which is the whole saving: three SETs per
+    /// guarded query instead of six.
+    #[test]
+    fn the_timeout_variable_is_searched_by_hint_and_learned_once() {
+        use TimeoutVar::{MaxExecutionTime, MaxStatementTime, Neither, Unknown};
+        // The label orders the search; BOTH names stay in it either way.
+        assert_eq!(
+            Unknown.candidates(false),
+            [MaxExecutionTime, MaxStatementTime]
+        );
+        assert_eq!(
+            Unknown.candidates(true),
+            [MaxStatementTime, MaxExecutionTime]
+        );
+        // Learned: one candidate, and the label no longer matters.
+        for mariadb in [false, true] {
+            assert_eq!(MaxExecutionTime.candidates(mariadb), [MaxExecutionTime]);
+            assert_eq!(MaxStatementTime.candidates(mariadb), [MaxStatementTime]);
+            // A server with neither name: nothing left to try, so no round trip
+            // is spent on it again (the cli's deadline is the backstop, exactly
+            // as when both SETs were sent and both swallowed).
+            assert!(Neither.candidates(mariadb).is_empty());
+        }
+        // MySQL counts milliseconds, MariaDB seconds — rounded UP, because
+        // rounding down turned a 1600ms budget into a 1s cap and refused queries
+        // that were inside it.
+        assert_eq!(
+            MaxExecutionTime.set(1600).as_deref(),
+            Some("SET SESSION max_execution_time = 1600")
+        );
+        assert_eq!(
+            MaxStatementTime.set(1600).as_deref(),
+            Some("SET SESSION max_statement_time = 2")
+        );
+        // Neither variable takes 0 ("no limit"): the floor is 1.
+        assert_eq!(
+            MaxExecutionTime.set(0).as_deref(),
+            Some("SET SESSION max_execution_time = 1")
+        );
+        assert_eq!(
+            MaxStatementTime.set(0).as_deref(),
+            Some("SET SESSION max_statement_time = 1")
+        );
+        // The two non-names never produce a statement.
+        assert!(Unknown.set(1000).is_none() && Neither.set(1000).is_none());
+    }
+
     /// The probe is time-bounded if EITHER `lock_wait_timeout` (both flavors) or
     /// MariaDB's `max_statement_time` was set. Critically it must NOT require both
     /// (`&&`) — MySQL never has `max_statement_time`, so `&&` would always skip the
@@ -3500,10 +3688,13 @@ mod tests {
         // a bare TIMEOUT — with the server cap a grace period earlier still.
         // Checked over a representative sample of CLI timeouts (1s..3600s),
         // not exhaustively.
+        // The deadline is DERIVED from the budget (one value, not two
+        // computations), which is what makes "the server cuts first" structural
+        // rather than a coincidence between two call sites.
         for timeout_secs in [1u64, 2, 3, 5, 10, 30, 3600] {
             let query_ms = timeout_secs * 1000;
-            let deadline = explain_deadline_ms(query_ms);
             let budget = explain_budget_ms(query_ms);
+            let deadline = explain_deadline_ms(budget);
             assert!(
                 deadline < query_ms,
                 "{timeout_secs}s: {deadline} !< {query_ms}"
@@ -3511,13 +3702,16 @@ mod tests {
             assert!(budget < deadline, "{timeout_secs}s: {budget} !< {deadline}");
             assert!(budget >= 1);
         }
-        // The flat cap applies once there is room for it.
+        // The flat cap applies once there is room for it, and the smallest legal
+        // timeout is the tight case the container test exercises for real.
         assert_eq!(explain_budget_ms(30_000), EXPLAIN_BUDGET_MS);
+        assert_eq!(explain_budget_ms(1_000), 300);
         // OUTSIDE the documented range (sub-second, unreachable through the CLI
         // and the config) the only claim is that nothing wraps or reaches zero —
         // NOT that the deadlines still nest.
         assert!(explain_budget_ms(1) >= 1);
-        assert!(explain_deadline_ms(u64::MAX) >= 1 && explain_budget_ms(u64::MAX) >= 1);
+        assert!(explain_budget_ms(u64::MAX) >= 1);
+        assert!(explain_deadline_ms(explain_budget_ms(u64::MAX)) >= 1);
     }
 
     /// Layer 2: a write that bypasses the validator entirely (direct Engine
@@ -4024,6 +4218,129 @@ mod tests {
         });
     }
 
+    /// The guardrail's arming rides in the BEGIN message and its repair is one
+    /// message too (7 round trips per guarded Postgres query instead of 10).
+    /// Collapsing must not lose any of the four things those messages carry, so
+    /// all four are asserted on the GUARDED path — the only path where the
+    /// collapse happens. Directly, against a real server; no outer timeout is
+    /// involved in any of them.
+    #[test]
+    fn pg_collapsed_guardrail_arming_keeps_its_invariants() {
+        use sqlx::Executor;
+        use testcontainers_modules::postgres::Postgres as PgImage;
+        use testcontainers_modules::testcontainers::runners::AsyncRunner;
+        use testcontainers_modules::testcontainers::ImageExt;
+
+        pg_block_on(async {
+            let container = PgImage::default()
+                .with_tag("16-alpine")
+                .start()
+                .await
+                .expect("start postgres:16-alpine (is docker/colima running?)");
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres@127.0.0.1:{port}/postgres");
+            let mut w = writable(&url).await;
+            w.execute("CREATE TABLE t (id int primary key)")
+                .await
+                .unwrap();
+            w.close().await.unwrap();
+
+            let engine = Postgres {
+                url: url.clone(),
+                password: Some("postgres".to_string()),
+                statement_timeout_ms: 30_000,
+                query_timeout_ms: 30_000,
+                host_override: None,
+                connect_timeout_ms: None,
+                resolve_column_origins: false,
+            };
+            // The default mode (cost, 1e6) plans every statement below and
+            // refuses none of them.
+            let guard = crate::guardrail::Guardrail::resolve("postgres", None, None, None).unwrap();
+            let ran = |outcome| match outcome {
+                QueryOutcome::Ran { result, .. } => result,
+                other => panic!("expected the query to run, got {other:?}"),
+            };
+
+            // 1) The budget is LENT and GIVEN BACK, in the same message as the
+            // savepoint rollback: the query must see its own 30s, never the 5s
+            // the EXPLAIN borrowed. (`statement_timeout` itself is set at
+            // connect, so it is never absent — the SET LOCAL only narrows it.)
+            let rs = ran(engine
+                .execute(
+                    "SELECT current_setting('statement_timeout') AS t",
+                    10,
+                    &guard,
+                )
+                .await
+                .unwrap());
+            assert_eq!(rs.rows[0][0], Value::from("30s"), "budget not restored");
+
+            // 2) ...including on the ERROR branch: a statement the server cannot
+            // plan aborts the transaction, and only the savepoint rollback makes
+            // the fail-open path work. Without it this reports "current
+            // transaction is aborted" instead of the missing relation.
+            match engine.execute("SELECT * FROM nope_x", 10, &guard).await {
+                Err(EngineError::Db { message, .. }) => {
+                    assert!(message.contains("nope_x"), "{message}");
+                    assert!(!message.contains("transaction is aborted"), "{message}");
+                }
+                other => panic!("a missing relation is a DB error, got {other:?}"),
+            }
+
+            // 3) The read-only transaction is still the FIRST thing the message
+            // does: a write that bypassed the validator is refused even though
+            // BEGIN now shares its round trip with the guardrail's scaffolding.
+            match engine
+                .execute("INSERT INTO t (id) VALUES (1)", 10, &guard)
+                .await
+            {
+                Err(EngineError::Db { message, .. }) => {
+                    assert!(message.to_lowercase().contains("read-only"), "{message}")
+                }
+                other => {
+                    panic!("a write must fail inside the read-only transaction, got {other:?}")
+                }
+            }
+
+            // 4) An unguarded call arms nothing (no savepoint, no borrowed
+            // budget) and still runs inside the read-only transaction.
+            let rs = engine
+                .execute_rows("SELECT current_setting('statement_timeout') AS t", 10)
+                .await
+                .unwrap();
+            assert_eq!(rs.rows[0][0], Value::from("30s"));
+
+            // 5) The BEHAVIORAL half of (1), because reading the setting back is
+            // not enough: a leaked budget must be caught as what the agent would
+            // actually feel — a query cut short. `query_timeout_ms = 1000` makes
+            // the EXPLAIN's budget 300 ms while the query's own server cap stays
+            // 30 s, so a 500 ms sleep is comfortably inside the query's limits
+            // and comfortably OUTSIDE the borrowed one. If the guardrail's cap
+            // survived the repair, the SERVER cancels this at 300 ms -> Timeout;
+            // no outer timer is involved in that verdict (the client deadline is
+            // 1 s, twice the sleep). The margins are 200 ms below and 500 ms
+            // above, over a loopback connection whose round trips are ~1 ms.
+            let short = Postgres {
+                url: url.clone(),
+                password: Some("postgres".to_string()),
+                statement_timeout_ms: 30_000,
+                query_timeout_ms: 1_000,
+                host_override: None,
+                connect_timeout_ms: None,
+                resolve_column_origins: false,
+            };
+            assert_eq!(explain_budget_ms(1_000), 300, "the budget this case needs");
+            let rs = ran(short
+                .execute("SELECT pg_sleep(0.5) IS NULL AS slept", 10, &guard)
+                .await
+                .unwrap());
+            assert_eq!(rs.rows[0][0], Value::Bool(false));
+
+            container.rm().await.unwrap();
+        });
+    }
+
     // --- MySQL/MariaDB: needs Docker (colima). mysql:8.4 is used (real JSON
     // type + max_execution_time, the variable DESIGN §3 names). ---
 
@@ -4090,6 +4407,7 @@ mod tests {
             query_timeout_ms: 100,
             host_override: None,
             connect_timeout_ms: Some(500), // short so the hang test finishes fast
+            mariadb: false,
         };
         match pg_block_on(engine.execute_rows("SELECT 1", 10)) {
             Err(EngineError::Connect { hint, .. }) => {
@@ -4151,6 +4469,7 @@ mod tests {
                 query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
+                mariadb: false,
             };
 
             // Layer 2: a write bypassing the validator fails at the database
@@ -4264,6 +4583,33 @@ mod tests {
                 other => panic!("the guardrail must refuse this one: {other:?}"),
             }
 
+            // ...and the cap the EXPLAIN borrowed is GIVEN BACK — asserted as
+            // the agent would feel it, not by reading the variable (the e2e in
+            // tests/mysql.rs does that on the MariaDB flavor). With
+            // `query_timeout_ms = 1000` the EXPLAIN's cap is 300 ms while the
+            // query's own stays 30 s, so a 500 ms sleep is inside the query's
+            // limits and outside the borrowed one: if the budget survived the
+            // restore, the SERVER kills this at 300 ms (3024 -> Timeout) — no
+            // outer timer involved (the client deadline is 1 s, twice the
+            // sleep). MySQL, not MariaDB, on purpose: `max_execution_time` has
+            // millisecond granularity, while `max_statement_time` would round
+            // the 300 ms budget UP to a full second and blunt the test.
+            let short = Mysql {
+                url: url.clone(),
+                password: None,
+                statement_timeout_ms: 30_000,
+                query_timeout_ms: 1_000,
+                host_override: None,
+                connect_timeout_ms: None,
+                mariadb: false,
+            };
+            match short.execute("SELECT sleep(0.5) AS s", 10, &guard).await {
+                Ok(QueryOutcome::Ran { result, .. }) => {
+                    assert_eq!(result.rows[0][0], Value::from(0), "sleep was interrupted")
+                }
+                other => panic!("the query's own cap must be restored, got {other:?}"),
+            }
+
             // Server max_execution_time -> Timeout (exit 8), not Db. A big
             // cross join is a read-only SELECT (so max_execution_time applies)
             // and cannot finish inside 1s. sleep()/benchmark() are denylisted,
@@ -4278,6 +4624,7 @@ mod tests {
                 query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
+                mariadb: false,
             };
             match slow
                 .execute_rows(
@@ -4346,6 +4693,7 @@ mod tests {
                 query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
+                mariadb: false,
             };
             let rs = engine
                 .execute_rows("SELECT id, name FROM tls_t", 10)
@@ -4379,7 +4727,7 @@ mod tests {
 
             // The SET landed: a fresh connection reports the max_statement_time
             // the engine set (5s here). Proves the MariaDB variable was accepted
-            // (its MySQL sibling got 1193 and was swallowed).
+            // — with the right label it is the FIRST and only one tried.
             let e5 = Mysql {
                 url: url.clone(),
                 password: None,
@@ -4387,6 +4735,7 @@ mod tests {
                 query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
+                mariadb: true,
             };
             let rs = e5
                 .execute_rows("SELECT @@max_statement_time AS t", 10)
@@ -4397,6 +4746,59 @@ mod tests {
                 "max_statement_time not set: {:?}",
                 rs.rows[0]
             );
+
+            // A MISLABELLED server (`engine = "mysql"` in front of MariaDB) is
+            // the case the label must not be able to break. The first SET now
+            // travels in the same message as `START TRANSACTION READ ONLY` and
+            // is the WRONG name here, so the server stops that message at the
+            // SET with a 1193 — after the transaction has already started. All
+            // three halves of layer 2 must survive that: the fallback name is
+            // set, the SERVER really enforces it, and the transaction is still
+            // READ ONLY.
+            let mislabelled = Mysql {
+                url: url.clone(),
+                password: None,
+                statement_timeout_ms: 1000,
+                // Generous client timer, so anything cancelled below was
+                // cancelled by the SERVER's fallback cap, not by nyet.
+                query_timeout_ms: 30_000,
+                host_override: None,
+                connect_timeout_ms: None,
+                mariadb: false,
+            };
+            let rs = mislabelled
+                .execute_rows(
+                    "SELECT @@max_statement_time AS t, @@in_transaction AS x",
+                    10,
+                )
+                .await
+                .unwrap();
+            assert!(
+                serde_json::to_string(&rs.rows[0][0]).unwrap().contains('1'),
+                "a mislabelled server must still be capped: {:?}",
+                rs.rows[0]
+            );
+            assert_eq!(rs.rows[0][1], Value::from(1), "the transaction is gone");
+            match mislabelled
+                .execute_rows("CREATE TABLE mislabelled_probe (id int)", 10)
+                .await
+            {
+                Err(EngineError::Db { message, .. }) => {
+                    assert!(message.to_lowercase().contains("read only"), "{message}")
+                }
+                other => panic!("the read-only transaction must survive the 1193, got {other:?}"),
+            }
+            match mislabelled
+                .execute_rows(
+                    "SELECT count(*) FROM information_schema.columns a, \
+                     information_schema.columns b, information_schema.columns c",
+                    10,
+                )
+                .await
+            {
+                Err(EngineError::Timeout { .. }) => {}
+                other => panic!("the fallback cap must be enforced by the server, got {other:?}"),
+            }
 
             // Client query timer generous (30s) vs server cap 1s: this heavy
             // read is cancelled by the SERVER (max_statement_time -> 1969), not
@@ -4411,6 +4813,7 @@ mod tests {
                 query_timeout_ms: 30_000,
                 host_override: None,
                 connect_timeout_ms: None,
+                mariadb: true,
             };
             match slow
                 .execute_rows(
