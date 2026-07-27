@@ -166,6 +166,9 @@ flag. Common reasons:
 - `DENIED_FUNCTION`, `LOCKING_CLAUSE` (`FOR UPDATE`/`FOR SHARE`),
   `EXPLAIN_ANALYZE`, `TXN_CONTROL`, `EXECUTABLE_COMMENT`, `PARSE_FAILED` — read
   the message and rewrite accordingly.
+- `INTERNAL_ERROR` — a bug in nyet itself, not in your query; nothing was
+  returned. This is the one reason NOT to rewrite and retry: stop and tell the
+  human, quoting the statement and the message.
 
 ## Protected columns (personal data)
 

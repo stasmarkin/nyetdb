@@ -1478,11 +1478,11 @@ a `Grants` variant for it; the pg/mysql probe is untouched.
 
 ### Error codes (Д7: append-only)
 
-`PARSE_FAILED`, `WRITE_OPERATION` and `DENIED_FUNCTION` are REUSED with exactly
-their existing meaning (a unit test pins that the strings stay identical to the
-SQL validator's — an agent that learned them on Postgres must recognize them
-here). Two are new: **`DENIED_COMMAND`** (the collection method / database-level
-command is not on the read allowlist) and **`DENIED_OPERATOR`** (a `$`-key —
+`PARSE_FAILED`, `WRITE_OPERATION`, `DENIED_FUNCTION` and `INTERNAL_ERROR` are
+REUSED with exactly their existing meaning (a unit test pins that the strings
+stay identical to the SQL validator's — an agent that learned them on Postgres
+must recognize them here). Two are new: **`DENIED_COMMAND`** (the collection
+method / database-level command is not on the read allowlist) and **`DENIED_OPERATOR`** (a `$`-key —
 stage, query operator, expression, accumulator — is not, including the options
 nyet owns). They are new rather than folded into `DENIED_FUNCTION` because the
 agent's fix differs: one means "use a different method", the other "use a
@@ -3111,7 +3111,7 @@ config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
 |---|---|---|
 | `CONFIG_INVALID` | 3 | config not found / unreadable / bad TOML / unknown key / missing `${VAR}` / unknown alias / sqlite without `path` / unsupported `[defaults].format` / zero `row_limit`/`timeout_secs`. One code for the whole class — deliberate; details live in `message`. |
 | `DIR_NOT_ALLOWED` | 4 | alias exists but cwd is outside its `allowed_dirs` |
-| `NYET` | 5 | query refused by the validator; `error.reason` from the closed list `PARSE_FAILED` / `MULTI_STATEMENT` / `WRITE_OPERATION` / `TXN_CONTROL` / `LOCKING_CLAUSE` / `DENIED_FUNCTION` / `EXECUTABLE_COMMENT` / `EXPLAIN_ANALYZE` / `PII_COLUMN` / `PII_UNPROVABLE` (owner: `src/validator.rs`; the two PII reasons are produced by both the pre-execution AST walk and the post-execution provenance check `validator::check_origins`, which the cli calls — see the PII section) — **plus `EXPENSIVE_QUERY`, whose owner is NOT the validator** but the guardrail (`src/guardrail.rs` decides, `src/main.rs` builds the failure): the plan estimate was over the connection's threshold — or planning itself outran the guardrail's budget — so nothing ran. The threshold case is the only envelope with a top-level `estimate` object (append-only field); the budget case has no plan to attach |
+| `NYET` | 5 | query refused by the validator; `error.reason` from the closed list `PARSE_FAILED` / `MULTI_STATEMENT` / `WRITE_OPERATION` / `TXN_CONTROL` / `LOCKING_CLAUSE` / `DENIED_FUNCTION` / `EXECUTABLE_COMMENT` / `EXPLAIN_ANALYZE` / `PII_COLUMN` / `PII_UNPROVABLE` / `INTERNAL_ERROR` (owner: `src/validator.rs`; `INTERNAL_ERROR` is a panic inside layer 1, caught at each boundary — `validate`, `check_origins` and `mongo::check`, all three through `validator::catching_panics` — and reported as an ordinary refusal: a bug in nyet must still fail closed, with an exit code and an audit record, instead of aborting the process. One path is deliberately NOT this code: the engine's re-validation of already-classified MongoDB text (`src/engine.rs`) maps any refusal — this one included — to `EngineError::Db`, so a panic there surfaces as `DB_ERROR` / exit 7 with an `"error"` audit record. Unreachable in practice (the cli classified the same text a moment earlier), but the mapping is the engine's, not layer 1's; the two PII reasons are produced by both the pre-execution AST walk and the post-execution provenance check `validator::check_origins`, which the cli calls — see the PII section) — **plus `EXPENSIVE_QUERY`, whose owner is NOT the validator** but the guardrail (`src/guardrail.rs` decides, `src/main.rs` builds the failure): the plan estimate was over the connection's threshold — or planning itself outran the guardrail's budget — so nothing ran. The threshold case is the only envelope with a top-level `estimate` object (append-only field); the budget case has no plan to attach |
 | `CONNECTION_FAILED` | 6 | database unreachable (sqlite: file missing / unreadable / a directory; postgres/mysql: refused, auth failure, or a hung TCP handshake that exceeds the connect deadline — bounded separately inside each engine so a blackholed connect is 6, not 8) |
 | `DB_ERROR` | 7 | the database accepted the connection but rejected the query |
 | `TIMEOUT` | 8 | query did not finish within the per-query timeout (the future is dropped; a stuck sqlite worker may run until process exit). Postgres: the server `statement_timeout` (SQLSTATE 57014) maps here too, so the exit code is deterministic whichever timer fires; 57014 is `query_canceled` generally, so a manual `pg_cancel_backend` from another session also lands as TIMEOUT (rare, acceptable). MySQL/MariaDB: the server `max_execution_time`/`max_statement_time` (error 3024 / 1969) maps here too |

@@ -1662,6 +1662,7 @@ to do:
 | `DENIED_COMMAND` | (MongoDB) the collection method is not on the read allowlist — a write (`insertOne`, `drop`, ...), a database-level command (`db.runCommand`, `db.adminCommand`), a cursor method nyet does not run (`.forEach`, `.count`), or an internal `system.*` catalog. The message names it |
 | `DENIED_OPERATOR` | (MongoDB) a `$`-prefixed key — pipeline stage, query operator, aggregation expression or accumulator — that is not on the read allowlist, at any nesting depth. Everything nyet has not reviewed is refused by default, including operators a newer MongoDB adds, undocumented `$_internal*` stages, Atlas-only `$search`/`$vectorSearch`, cluster introspection (`$currentOp`, `$collStats`, `$planCacheStats`) and the options nyet sets itself |
 | `PII_UNPROVABLE` | the database would not state where a result column came from, on a connection with a PII policy — an undetermined origin is refused rather than guessed |
+| `INTERNAL_ERROR` | nyet's own validator crashed while checking the query (or the result it came back with) — a bug in nyet, not in your SQL. The crash is caught and turned into this refusal, so a bug cannot become an unchecked query or an unchecked result: no result is returned either way. Please report it with the statement that triggered it |
 
 PRAGMA is refused with a pointer instead of a dead end: schema questions
 have a SELECT answer (`SELECT name, sql FROM sqlite_master WHERE type = 'table'`).

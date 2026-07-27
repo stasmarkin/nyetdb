@@ -2363,6 +2363,21 @@ mod tests {
         }
     }
 
+    /// The cli half of the same policy: a caught validator panic must travel the
+    /// ordinary refusal road — NYET, exit 5 — because that is exactly what makes
+    /// `audit_finish` write it as a "refused" record instead of an error (or, if
+    /// the panic had escaped, nothing at all).
+    #[test]
+    fn a_validator_panic_refuses_with_the_ordinary_nyet_exit_code() {
+        let policy = validator::Policy::sqlite(&[], &[]);
+        let Err(f) = validate("SELECT '__nyet_test_panic__'", &policy) else {
+            panic!("a panic must never pass as an allow");
+        };
+        assert_eq!(f.code.as_str(), "NYET");
+        assert_eq!(f.code.reason(), Some("INTERNAL_ERROR"));
+        assert_eq!(f.code.exit(), 5);
+    }
+
     #[test]
     fn broken_pipe_is_the_only_graceful_write_error() {
         // A gone consumer (closed pipe) is graceful; a full disk (or any

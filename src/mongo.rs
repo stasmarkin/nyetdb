@@ -41,6 +41,9 @@ pub const DENIED_COMMAND: &str = "DENIED_COMMAND";
 /// A `$`-prefixed key (stage, query operator, aggregation expression,
 /// accumulator) is not on the read allowlist, or is a service field nyet owns.
 pub const DENIED_OPERATOR: &str = "DENIED_OPERATOR";
+/// This module panicked while classifying — a bug in nyet, reported as an
+/// ordinary refusal. Same spelling and same meaning as the SQL validator's.
+pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 
 /// One refusal, ready for the cli's NYET envelope (exit 5).
 #[derive(Debug)]
@@ -393,10 +396,28 @@ fn is_listed(list: &[&str], name: &str) -> bool {
 /// calls it to refuse before connecting, and the engine calls it again on the
 /// same text to get the request it executes, so what runs is always what was
 /// classified (no validate/exec drift).
+/// A panic in the parser or the allowlist walk is a bug, and it must not escape
+/// this boundary either — same policy, same one mechanism as the SQL validator
+/// (`validator::catching_panics`, which also keeps the trace off stderr).
 pub fn check(text: &str) -> Result<Request, Refusal> {
-    let request = parse(text)?;
-    classify(&request)?;
-    Ok(request)
+    crate::validator::catching_panics(|| {
+        // Panic injection for the boundary test; compiled out of the shipped
+        // binary.
+        #[cfg(test)]
+        if text.contains("__nyet_test_panic__") {
+            panic!("injected mongo panic");
+        }
+        let request = parse(text)?;
+        classify(&request)?;
+        Ok(request)
+    })
+    .unwrap_or_else(|detail| {
+        refuse(
+            INTERNAL_ERROR,
+            format!("nyet: internal error while classifying the query: {detail}"),
+            crate::validator::INTERNAL_ERROR_HINT,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +567,7 @@ impl Parser {
 
 /// Parse the mongosh subset. Every failure is a refusal with an actionable
 /// hint; no input can panic (Д3).
-pub fn parse(text: &str) -> Result<Request, Refusal> {
+fn parse(text: &str) -> Result<Request, Refusal> {
     if text.len() > MAX_INPUT_BYTES {
         return refuse(
             PARSE_FAILED,
@@ -1622,7 +1643,9 @@ fn parse_ctor(p: &mut Parser, name: &str, depth: usize) -> Result<Bson, Refusal>
 /// allowlist. This is the layer that has to be complete, so it is deliberately
 /// dumb: ONE recursive walk, no shape-specific shortcuts, no "this branch
 /// cannot contain an operator" assumptions.
-pub fn classify(request: &Request) -> Result<(), Refusal> {
+/// Private, like `parse`: `check` is the only way in, so "every layer-1 entry
+/// goes through `catching_panics`" is enforced by the compiler, not by habit.
+fn classify(request: &Request) -> Result<(), Refusal> {
     match &request.op {
         Op::Find {
             filter,
@@ -2240,6 +2263,26 @@ mod tests {
         assert_eq!(PARSE_FAILED, DenyReason::ParseFailed.as_str());
         assert_eq!(WRITE_OPERATION, DenyReason::WriteOperation.as_str());
         assert_eq!(DENIED_FUNCTION, DenyReason::DeniedFunction.as_str());
+        assert_eq!(INTERNAL_ERROR, DenyReason::InternalError.as_str());
+    }
+
+    /// MongoDB layer 1 is a boundary like the SQL one, so a panic in it is a bug
+    /// that still has to come out as a refusal (exit 5, one audit line) instead
+    /// of taking the process with it.
+    #[test]
+    fn a_panic_inside_mongo_layer_1_becomes_an_ordinary_refusal() {
+        match check("db.c.find({a: '__nyet_test_panic__'})") {
+            Err(Refusal {
+                reason,
+                message,
+                hint,
+            }) => {
+                assert_eq!(reason, INTERNAL_ERROR);
+                assert!(message.contains("injected mongo panic"), "{message}");
+                assert!(hint.contains("bug in nyet"), "{hint}");
+            }
+            Ok(_) => panic!("a panic must never pass as an allow"),
+        }
     }
 
     /// Golden corpus (Д6) — the public specification of what MongoDB layer 1
@@ -2342,7 +2385,12 @@ mod tests {
             // covered rather than only at the end.
             for cut in 0..=seed.chars().count() {
                 let prefix: String = seed.chars().take(cut).collect();
-                let _ = check(&prefix);
+                // A bare `let _ =` would be blind now: `check` turns a panic
+                // into a refusal, and INTERNAL_ERROR is exactly that panic
+                // showing through — the very thing this test hunts.
+                if let Err(r) = check(&prefix) {
+                    assert_ne!(r.reason, INTERNAL_ERROR, "{prefix:?}: {}", r.message);
+                }
             }
         }
         // Deep nesting, both shapes, well past the limit: a refusal, not a

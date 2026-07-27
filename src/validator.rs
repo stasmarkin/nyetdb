@@ -15,9 +15,13 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
+use std::any::Any;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Once;
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 /// Closed list; the strings are part of the agent-facing contract
@@ -36,6 +40,9 @@ pub enum DenyReason {
     /// proven either by NAME before execution (net A) or by the driver's column
     /// PROVENANCE after execution (net B).
     PiiColumn,
+    /// The validator itself panicked: a BUG in nyet, reported to the caller as
+    /// an ordinary refusal so the query still does not reach the database.
+    InternalError,
     /// The result carries a column whose origin the database would not state,
     /// on a connection that protects columns as PII: nyet cannot prove the
     /// value is not protected data, so it refuses (fail closed).
@@ -53,6 +60,7 @@ impl DenyReason {
             DenyReason::DeniedFunction => "DENIED_FUNCTION",
             DenyReason::ExecutableComment => "EXECUTABLE_COMMENT",
             DenyReason::ExplainAnalyze => "EXPLAIN_ANALYZE",
+            DenyReason::InternalError => "INTERNAL_ERROR",
             DenyReason::PiiColumn => "PII_COLUMN",
             DenyReason::PiiUnprovable => "PII_UNPROVABLE",
         }
@@ -384,6 +392,21 @@ pub fn check_origins(
     origins: &[Origin],
     pii_exempt: &[usize],
 ) -> Result<Vec<usize>, Refusal> {
+    catching_panics(|| judge_origins(rules, columns, origins, pii_exempt))
+        .unwrap_or_else(|detail| Err(internal_error_refusal(&detail)))
+}
+
+fn judge_origins(
+    rules: &PiiRules,
+    columns: &[String],
+    origins: &[Origin],
+    pii_exempt: &[usize],
+) -> Result<Vec<usize>, Refusal> {
+    // Panic injection for the boundary test; compiled out of the shipped binary.
+    #[cfg(test)]
+    if columns.iter().any(|c| c.contains("__nyet_test_panic__")) {
+        panic!("injected net B panic");
+    }
     let mut mask = Vec::new();
     if rules.is_empty() {
         return Ok(mask);
@@ -808,8 +831,96 @@ fn scan_executable_comment(sql: &str, backslash_escapes: bool) -> bool {
     false
 }
 
+thread_local! {
+    /// Set only while THIS thread sits inside the `catch_unwind` below.
+    static CATCHING_PANIC: Cell<bool> = const { Cell::new(false) };
+    /// Where the caught panic fired. The hook is the only place that can see it
+    /// — `catch_unwind` hands back the payload alone — and "please report it"
+    /// with no file:line is a bug report nobody can act on.
+    static PANIC_LOCATION: Cell<Option<String>> = const { Cell::new(None) };
+}
+
+/// Keep a panic we are about to catch off stderr, without ever losing anybody
+/// else's. Installed once and chained to the previous hook, so panics outside
+/// this boundary (tests, the rest of the cli) still print exactly as before;
+/// the flag is per-thread because take_hook/set_hook around each call is
+/// process-global — two threads validating at once can interleave and leave the
+/// silent hook installed for good.
+fn hush_caught_panics() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if CATCHING_PANIC.with(Cell::get) {
+                PANIC_LOCATION.with(|at| at.set(info.location().map(ToString::to_string)));
+            } else {
+                previous(info);
+            }
+        }));
+    });
+}
+
+/// Run one validation boundary with a panic turned into a value: `Err` carries
+/// the panic's message.
+///
+/// A panic anywhere in a check is a BUG, and it is treated as one — but not by
+/// letting it out: an unwind escaping a boundary would kill the process past
+/// every seam that makes nyet trustworthy (no NYET envelope, no exit code, no
+/// audit line for what the agent tried). Caught, it stays a refusal like any
+/// other, so the guarantee "nothing nyet did not understand reaches the database
+/// — and nothing it could not judge reaches the agent" survives nyet's own bugs.
+/// Every layer-1 boundary of the crate goes through here (SQL, MongoDB, net B),
+/// so the policy cannot be forgotten at one of them.
+///
+/// `AssertUnwindSafe` is the caller's obligation: each `f` below only READS
+/// shared borrows and owns everything it builds, so an unwind can leave no
+/// half-written state behind for a later call to observe.
+pub(crate) fn catching_panics<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    hush_caught_panics();
+    // Saved and restored rather than set/cleared: should a boundary ever end up
+    // inside another, the inner one must not un-hush the outer's panic.
+    let outer = CATCHING_PANIC.with(|c| c.replace(true));
+    let caught = panic::catch_unwind(AssertUnwindSafe(f));
+    CATCHING_PANIC.with(|c| c.set(outer));
+    // `&*`, not `&`: a `&Box<dyn Any>` unsizes to a `dyn Any` holding the BOX,
+    // and both downcasts would miss the message inside it.
+    caught.map_err(|payload| match PANIC_LOCATION.with(Cell::take) {
+        Some(at) => format!("{} at {at}", panic_detail(&*payload)),
+        None => panic_detail(&*payload),
+    })
+}
+
+/// The panic's own message: quoted back because it is the only thing that makes
+/// the bug report useful, and it is no more revealing than the parser errors
+/// already echoed back — it comes from nyet's own code working on the caller's
+/// own query.
+fn panic_detail(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_string())
+}
+
+/// The hint a caught panic carries at every boundary. "No result" is the one
+/// promise all of them keep: net A refuses before anything runs, net B withholds
+/// what already ran.
+pub(crate) const INTERNAL_ERROR_HINT: &str =
+    "this is a bug in nyet, not a problem with your query; no result was returned (fail \
+     closed) — please report it with the statement that triggered it";
+
 /// Classify one query under the engine's policy (which carries the dialect).
 pub fn validate(sql: &str, policy: &Policy) -> Verdict {
+    catching_panics(|| classify(sql, policy)).unwrap_or_else(|detail| internal_error_deny(&detail))
+}
+
+fn classify(sql: &str, policy: &Policy) -> Verdict {
+    // The only way to exercise the boundary above without a real bug; compiled
+    // out of the shipped binary.
+    #[cfg(test)]
+    if sql.contains("__nyet_test_panic__") {
+        panic!("injected validator panic");
+    }
     let (sql, removed) = strip_control(sql);
     // SQLite only: sqlparser cannot parse several PRAGMA forms (the call form
     // `PRAGMA table_info(users)`, keyword values `PRAGMA journal_mode =
@@ -2103,6 +2214,25 @@ fn pii_catalog_deny(catalog: &str, mode: PiiMode) -> Verdict {
     )
 }
 
+/// The refusal a panic caught in net A becomes.
+fn internal_error_deny(detail: &str) -> Verdict {
+    deny(
+        DenyReason::InternalError,
+        format!("internal error while classifying the query: {detail}"),
+        INTERNAL_ERROR_HINT,
+    )
+}
+
+/// The same, for net B — where the query already ran, so the refusal is about
+/// the RESULT being withheld rather than the statement being rejected.
+fn internal_error_refusal(detail: &str) -> Refusal {
+    Refusal {
+        reason: DenyReason::InternalError,
+        message: format!("nyet: internal error while checking the result's columns: {detail}"),
+        hint: INTERNAL_ERROR_HINT.to_string(),
+    }
+}
+
 fn deny(reason: DenyReason, message: String, hint: &str) -> Verdict {
     Verdict::Deny {
         reason,
@@ -2122,6 +2252,54 @@ mod tests {
 
     fn validate_default(sql: &str) -> Verdict {
         validate(sql, &default_policy())
+    }
+
+    /// A panic in the validator is a bug, and the bug is worth fixing — but at
+    /// this boundary it must first become an ordinary refusal: an escaping
+    /// unwind would take the process down instead of producing the NYET the
+    /// audit trail and the exit code are built on.
+    #[test]
+    fn a_panic_inside_the_validator_becomes_an_ordinary_refusal() {
+        let Verdict::Deny {
+            reason,
+            message,
+            hint,
+        } = validate_default("SELECT '__nyet_test_panic__'")
+        else {
+            panic!("a panic must never pass as an allow");
+        };
+        assert_eq!(reason.as_str(), "INTERNAL_ERROR");
+        assert!(message.contains("injected validator panic"), "{message}");
+        // Without the file:line there is nothing to report.
+        assert!(message.contains("validator.rs:"), "{message}");
+        assert!(hint.contains("bug in nyet"), "{hint}");
+        // The silencing must not outlive the call it was meant for.
+        assert!(!CATCHING_PANIC.with(Cell::get));
+        assert!(matches!(
+            validate_default("SELECT 1"),
+            Verdict::Allow { .. }
+        ));
+    }
+
+    /// The same policy on the other side of execution: net B judges rows that
+    /// already exist, so a panic here must withhold them through the ordinary
+    /// refusal — never abort with the result half-written to stdout.
+    #[test]
+    fn a_panic_inside_net_b_becomes_an_ordinary_refusal() {
+        let rules = PiiRules::parse(&["users.email".to_string()], PiiMode::Deny).unwrap();
+        let cols = vec!["__nyet_test_panic__".to_string()];
+        match check_origins(&rules, &cols, &[Origin::Expression], &[]) {
+            Err(Refusal {
+                reason,
+                message,
+                hint,
+            }) => {
+                assert_eq!(reason.as_str(), "INTERNAL_ERROR");
+                assert!(message.contains("injected net B panic"), "{message}");
+                assert!(hint.contains("bug in nyet"), "{hint}");
+            }
+            Ok(_) => panic!("a panic must never pass as a clean result"),
+        }
     }
 
     /// Golden corpus (Д6): every yaml file in tests/corpus is the public
