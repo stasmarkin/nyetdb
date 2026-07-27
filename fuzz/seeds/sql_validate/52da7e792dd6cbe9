@@ -1,0 +1,1 @@
+SELECT count(*), avg(total) FROM orders GROUP BY user_id HAVING count(*) > 2

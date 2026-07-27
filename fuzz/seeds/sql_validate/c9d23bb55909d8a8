@@ -1,0 +1,1 @@
+UPDATE users SET email = 'x@y.z' WHERE id = 1

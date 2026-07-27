@@ -1,0 +1,1 @@
+db.users.aggregate([{$graphLookup: {from: "system.js", startWith: "$a", connectFromField: "a", connectToField: "b", as: "c"}}])

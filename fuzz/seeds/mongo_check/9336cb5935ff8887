@@ -1,0 +1,1 @@
+db.users.find({a: 1, /* note */ b: 2,})

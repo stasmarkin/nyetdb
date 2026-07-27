@@ -1,0 +1,1 @@
+db.users.find({$where: "this.a == 1"})

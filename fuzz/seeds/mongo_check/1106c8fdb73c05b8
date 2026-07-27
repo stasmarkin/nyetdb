@@ -1,0 +1,1 @@
+db.users.aggregate([{$search: {text: {query: "a", path: "b"}}}])

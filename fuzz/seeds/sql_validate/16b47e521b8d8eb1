@@ -1,0 +1,1 @@
+SELECT id /*! INTO OUTFILE '/tmp/x' */ FROM users

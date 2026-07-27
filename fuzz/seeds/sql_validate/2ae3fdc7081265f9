@@ -1,0 +1,1 @@
+SELECT length(email), abs(id) FROM users

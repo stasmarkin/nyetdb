@@ -1,0 +1,1 @@
+SELECT count(*) FROM ONLY (users) NATURAL JOIN dict

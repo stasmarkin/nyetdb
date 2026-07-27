@@ -1,0 +1,1 @@
+SELECT (SELECT count(*) FROM orders o WHERE o.user_id = u.id) AS n FROM users u

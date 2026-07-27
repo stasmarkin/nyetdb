@@ -1,0 +1,1 @@
+db.users.aggregate([{$lookup: {from: "orders", as: "o", let: {u: "$_id"}, pipeline: [{$match: {$expr: {$eq: ["$user_id", "$$u"]}}}, {$project: {total: 1}}]}}])

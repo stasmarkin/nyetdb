@@ -1,0 +1,1 @@
+db.users.aggregate([{$match: {active: true}}, {$group: {_id: "$dept", n: {$sum: 1}}}, {$sort: {n: -1}}, {$limit: 10}])

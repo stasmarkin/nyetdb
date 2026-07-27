@@ -1,0 +1,1 @@
+SELECT substr(email, 1, 3) FROM users

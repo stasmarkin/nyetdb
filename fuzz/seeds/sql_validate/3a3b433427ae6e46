@@ -1,0 +1,1 @@
+SELECT wait_until_sql_thread_after_gtids('uuid:1-5')

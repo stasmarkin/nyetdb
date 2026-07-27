@@ -1,0 +1,1 @@
+db.users.aggregate([{$lookup: {from: "o", as: "o", pipeline: [{$changeStream: {}}]}}])

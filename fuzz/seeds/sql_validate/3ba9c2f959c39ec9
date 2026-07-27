@@ -1,0 +1,1 @@
+SELECT email, id FROM users ORDER BY CAST(2 AS INT)

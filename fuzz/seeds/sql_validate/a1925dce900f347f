@@ -1,0 +1,1 @@
+SELECT 1 FROM t WHERE pg_sleep(1) IS NOT NULL

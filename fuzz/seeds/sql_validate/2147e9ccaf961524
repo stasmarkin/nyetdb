@@ -1,0 +1,1 @@
+SELECT 1 FROM users u, unnest(ARRAY[1]) AS g

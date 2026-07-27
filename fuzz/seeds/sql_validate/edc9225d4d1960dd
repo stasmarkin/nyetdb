@@ -1,0 +1,1 @@
+SELECT count(*) FROM dict NATURAL LEFT JOIN users

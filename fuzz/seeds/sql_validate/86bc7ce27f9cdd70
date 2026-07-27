@@ -1,0 +1,1 @@
+SELECT cast(schema_to_xml('public', true, false, '') as text)

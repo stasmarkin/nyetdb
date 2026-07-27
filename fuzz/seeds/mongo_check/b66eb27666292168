@@ -1,0 +1,1 @@
+db.users.aggregate([{$project: {name: 1, shout: {$toUpper: "$name"}}}])

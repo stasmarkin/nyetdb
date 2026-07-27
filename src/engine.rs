@@ -275,6 +275,10 @@ async fn budgeted_plan(
 
 /// The one planned abstraction of the project (Д5). Fetches at most
 /// `fetch_limit` rows; the caller passes limit+1 to detect truncation.
+// The lint fires only because src/lib.rs makes this trait technically public;
+// it is implemented and used inside this crate alone (the lib target exists for
+// the fuzz targets), so no downstream ever needs a `Send` bound on the futures.
+#[allow(async_fn_in_trait)]
 pub trait Engine {
     /// Run the query, unless the guardrail's plan estimate says it is a monster
     /// (then nothing is executed). The EXPLAIN runs in the SAME read-only

@@ -1,0 +1,1 @@
+SELECT id FROM (SELECT id, email FROM users) t

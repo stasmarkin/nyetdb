@@ -1,0 +1,1 @@
+db.users.updateMany({}, {$set: {b: 2}})

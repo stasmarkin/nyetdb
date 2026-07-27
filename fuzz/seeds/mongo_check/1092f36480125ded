@@ -1,0 +1,1 @@
+db.users.find({tags: {$all: ["a", "b"]}, "profile.city": "Berlin"})

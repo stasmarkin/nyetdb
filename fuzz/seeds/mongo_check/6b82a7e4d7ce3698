@@ -1,0 +1,1 @@
+db.users.find({$where: function() { return true }})

@@ -1,0 +1,1 @@
+SELECT JSON_EXTRACT(doc, '$.k') AS k FROM events

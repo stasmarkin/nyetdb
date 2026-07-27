@@ -1,0 +1,1 @@
+db.users.aggregate([{$graphLookup: {from: "users", startWith: "$manager", connectFromField: "manager", connectToField: "_id", as: "chain"}}])

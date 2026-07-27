@@ -1,0 +1,1 @@
+SELECT count(*) FROM users u CROSS JOIN LATERAL (SELECT u.*) AS s(a, b, c, d) WHERE s.b LIKE 'a%'

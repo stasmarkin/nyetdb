@@ -1,0 +1,1 @@
+SELECT data->>'name' AS name, data #> '{a,b}' AS nested FROM events

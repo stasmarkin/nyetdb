@@ -1,0 +1,1 @@
+db.users.findOneAndReplace({a: 1}, {a: 2})

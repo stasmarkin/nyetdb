@@ -1,0 +1,1 @@
+SELECT setval('users_id_seq', 1)

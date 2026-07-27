@@ -1,0 +1,1 @@
+SELECT x.email FROM (VALUES ('a')) AS x (email), users u

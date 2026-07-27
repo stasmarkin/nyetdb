@@ -1,0 +1,1 @@
+SELECT dblink_exec('conn', 'DELETE FROM t')

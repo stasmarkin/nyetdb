@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM users JOIN dict USING (email)

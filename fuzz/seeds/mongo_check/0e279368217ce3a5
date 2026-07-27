@@ -1,0 +1,1 @@
+db.users.find({items: {$elemMatch: {qty: {$gt: 5}, sku: /^ab/i}}})

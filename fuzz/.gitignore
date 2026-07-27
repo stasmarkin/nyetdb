@@ -1,0 +1,6 @@
+target
+# The working corpus the fuzzer grows; the committed starting points are in
+# fuzz/seeds/, which is passed as a second, read-only corpus directory.
+corpus
+artifacts
+coverage

@@ -1,0 +1,1 @@
+SELECT * FROM orders o JOIN dict d ON d.id = (SELECT id FROM users LIMIT 1)

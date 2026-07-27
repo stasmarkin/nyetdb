@@ -1,0 +1,1 @@
+SELECT CAST(email AS TEXT) FROM users

@@ -1,0 +1,1 @@
+SELECT GROUP_CONCAT(email SEPARATOR ',') AS emails FROM users

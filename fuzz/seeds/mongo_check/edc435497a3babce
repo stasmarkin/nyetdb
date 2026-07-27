@@ -1,0 +1,1 @@
+db.users.find({created_at: {$gt: ISODate("2026-01-31T00:00:00Z")}})

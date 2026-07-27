@@ -1,0 +1,127 @@
+name: Fuzz
+
+# Nightly, not per-push: fuzzing is a soak, not a gate. The stable pipeline in
+# ci.yml stays the thing that blocks a merge, and it never needs nightly Rust.
+on:
+  schedule:
+    # 03:20 UTC — off the hour, where GitHub's scheduler is least congested.
+    - cron: "20 3 * * *"
+  workflow_dispatch:
+
+# Security tool: least privilege for the workflow token (Д8). The one job that
+# needs more (issues: write, to file the crash) asks for it itself.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# All actions are pinned to full commit SHAs (supply chain, Д8).
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # 15 min of fuzzing per target, plus a cold build of the sanitizer-
+    # instrumented tree and cargo-fuzz itself — 40 leaves real headroom.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      # Only to open the crash issue in the step below; nothing else here writes.
+      issues: write
+    strategy:
+      # A panic in one target must not cancel the other one's soak.
+      fail-fast: false
+      matrix:
+        include:
+          - target: sql_validate
+            # Tokens the validator decides on, so mutation reaches a verdict
+            # boundary instead of spelling `INSERT` one byte at a time.
+            args: "-dict=fuzz/sql.dict"
+          - target: mongo_check
+            args: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Nightly is a hard requirement of cargo-fuzz (-Z sanitizer). It lives in
+      # THIS workflow only: nothing in ci.yml may come to depend on it.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master 2026-07
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # The fuzz crate is its own workspace (fuzz/Cargo.toml is not a member
+          # of the root package), so its target dir needs naming separately.
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
+        with:
+          tool: cargo-fuzz
+
+      - name: Fuzz
+        id: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          ARGS: ${{ matrix.args }}
+        run: |
+          # fuzz/seeds/ is the committed starting corpus (extracted from the
+          # golden corpus in tests/corpus); it is passed SECOND, which makes it
+          # read-only to libFuzzer — everything the fuzzer discovers lands in
+          # the first directory, which is gitignored and thrown away with the
+          # runner. No corpus is carried between nightly runs: each one starts
+          # from the seeds with a fresh RNG.
+          mkdir -p "fuzz/corpus/$TARGET"
+          # $ARGS is deliberately unquoted: it is empty for the targets with no
+          # dictionary, and quoting it would pass libFuzzer an empty argument.
+          cargo fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
+            $ARGS \
+            -max_total_time=900 \
+            -max_len=4096 \
+            -timeout=25
+
+      # Everything needed to reproduce: `cargo fuzz run <target> <file>`.
+      #
+      # `steps.fuzz.outcome` as well as `failure()`, on this step and the next:
+      # a bare `failure()` also fires when the job died BEFORE the fuzzer ever
+      # ran (toolchain install, a build broken by bit-rot in fuzz/), which would
+      # file a "found a panic" issue about a crash that never happened — and the
+      # dedupe below would then swallow the real one. A failure before this
+      # point leaves the outcome `skipped`, not `failure`.
+      - name: Upload the crashing input
+        if: failure() && steps.fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+
+      - name: File an issue
+        if: failure() && steps.fuzz.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Through env rather than inline `${{ }}` in the script: no expansion
+          # ever becomes shell source here.
+          TARGET: ${{ matrix.target }}
+          TITLE: "fuzz: ${{ matrix.target }} found a panic"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # One open issue per target — a nightly that keeps failing must not
+          # file a new issue every night. Exact title match rather than a
+          # `--search` query: the title contains a colon, which the search
+          # syntax would eat.
+          if gh issue list --state open --limit 100 --json title --jq '.[].title' | grep -qxF "$TITLE"; then
+            echo "an open issue already tracks this target; not filing another"
+            exit 0
+          fi
+          gh issue create --title "$TITLE" --body "The nightly fuzz run failed.
+
+          A panic in layer 1 is a bug (project policy). This target also fails
+          on a panic that \`catch_unwind\` turned into an \`INTERNAL_ERROR\`
+          refusal, so the crash may be either — read the run log to tell them
+          apart.
+
+          The crashing input is attached to the run as
+          \`fuzz-artifacts-$TARGET\`. To reproduce:
+
+              cargo +nightly fuzz run $TARGET path/to/the/downloaded/input
+
+          Run: $RUN_URL"

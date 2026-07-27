@@ -1,0 +1,1 @@
+SELECT DISTINCT id, email FROM users

@@ -1,0 +1,1 @@
+SELECT main.load_extension('/tmp/evil.so')

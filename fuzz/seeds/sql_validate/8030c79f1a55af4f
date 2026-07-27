@@ -1,0 +1,1 @@
+SELECT dict.email FROM dict JOIN users u ON u.id = dict.id

@@ -1,0 +1,1 @@
+EXPLAIN ANALYZE UPDATE users SET email = 'x'

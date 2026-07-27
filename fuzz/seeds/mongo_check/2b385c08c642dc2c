@@ -1,0 +1,1 @@
+db.users.find({a: "\ud83d"})

@@ -1,0 +1,1 @@
+db.users.find({n: NumberDecimal("not a number")})

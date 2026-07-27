@@ -1,0 +1,1 @@
+db.users.aggregate([{$group: {_id: null, x: {$accumulator: {init: "f", accumulate: "f", accumulateArgs: [], merge: "f", lang: "js"}}}}])

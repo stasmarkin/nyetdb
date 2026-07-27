@@ -1,0 +1,1 @@
+SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id

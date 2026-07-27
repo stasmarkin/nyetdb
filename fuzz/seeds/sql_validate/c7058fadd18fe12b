@@ -1,0 +1,1 @@
+SELECT NULL AS a UNION ALL TABLE pg_stats

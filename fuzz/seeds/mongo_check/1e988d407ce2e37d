@@ -1,0 +1,1 @@
+db.users.findOneAndUpdate({a: 1}, {$set: {b: 2}})

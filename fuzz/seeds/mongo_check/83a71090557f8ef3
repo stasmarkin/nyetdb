@@ -1,0 +1,1 @@
+db.users.find({a: {$gt: {"$minKey": 1}, $lt: {"$maxKey": 1}}})

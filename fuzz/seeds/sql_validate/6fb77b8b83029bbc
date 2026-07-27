@@ -1,0 +1,1 @@
+SELECT c FROM users AS u (a, b, c)

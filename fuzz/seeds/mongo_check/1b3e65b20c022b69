@@ -1,0 +1,1 @@
+db.oplog.find({ts: {$gt: {"$timestamp": {"t": 1767139200, "i": 1}}}})

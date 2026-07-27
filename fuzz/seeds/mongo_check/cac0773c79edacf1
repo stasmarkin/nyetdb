@@ -1,0 +1,1 @@
+db.users.find({blob: {"$binary": {"base64": "AQID", "subType": "00"}}})

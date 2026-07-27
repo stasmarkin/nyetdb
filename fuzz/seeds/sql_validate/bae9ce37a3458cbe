@@ -1,0 +1,1 @@
+SELECT query_to_xmlschema('select 1', true, false, '')

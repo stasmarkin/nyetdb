@@ -1,0 +1,1 @@
+SELECT pg_typeof(id) FROM users LIMIT 1

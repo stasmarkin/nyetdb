@@ -1,0 +1,1 @@
+db.users.find({name: "Ann", active: false, deleted: null})

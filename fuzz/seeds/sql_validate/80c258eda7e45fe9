@@ -1,0 +1,1 @@
+SELECT id, name COLLATE utf8mb4_bin AS n FROM users

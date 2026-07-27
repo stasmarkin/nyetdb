@@ -1,0 +1,1 @@
+SELECT email, id FROM users ORDER BY 2 COLLATE "C"

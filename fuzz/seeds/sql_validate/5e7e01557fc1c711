@@ -1,0 +1,1 @@
+SELECT * FROM LATERAL load_extension('x')

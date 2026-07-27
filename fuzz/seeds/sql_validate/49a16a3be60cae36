@@ -1,0 +1,1 @@
+SELECT o.* FROM orders o, users u

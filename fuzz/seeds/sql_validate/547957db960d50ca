@@ -1,0 +1,1 @@
+SELECT id, email FROM users ORDER BY id DESC LIMIT 10

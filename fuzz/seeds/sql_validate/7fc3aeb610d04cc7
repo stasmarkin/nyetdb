@@ -1,0 +1,1 @@
+SELECT email, count(*) FROM users GROUP BY email

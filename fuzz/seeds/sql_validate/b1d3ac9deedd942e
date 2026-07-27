@@ -1,0 +1,1 @@
+SELECT f.email FROM users u, generate_series(1, 3) AS f (email)

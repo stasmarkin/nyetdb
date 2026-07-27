@@ -1,0 +1,1 @@
+SELECT master_pos_wait FROM t

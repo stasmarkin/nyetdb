@@ -3,16 +3,9 @@
 
 #![forbid(unsafe_code)]
 
-mod audit;
-mod config;
-mod engine;
-mod guardrail;
-mod mongo;
-mod output;
-mod resolver;
-mod skill;
-mod tunnel;
-mod validator;
+// The modules live in the lib target (src/lib.rs) so the fuzz targets can link
+// against them; this binary is just their cli layer.
+use nyetdb::{audit, config, engine, guardrail, mongo, output, resolver, skill, tunnel, validator};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use engine::Engine;
@@ -2367,12 +2360,26 @@ mod tests {
     /// ordinary refusal road — NYET, exit 5 — because that is exactly what makes
     /// `audit_finish` write it as a "refused" record instead of an error (or, if
     /// the panic had escaped, nothing at all).
+    ///
+    /// The refusal is built here rather than provoked with the validator's
+    /// `__nyet_test_panic__` hook: that hook is `#[cfg(test)]` inside the lib
+    /// target, which is compiled WITHOUT `cfg(test)` for this binary's tests.
+    /// The other half of the chain — a real panic producing exactly this
+    /// `InternalError` refusal — is pinned in `validator.rs` and `mongo.rs`,
+    /// where the hook does compile in. Splitting the chain is safe only because
+    /// both links between the halves are reason-AGNOSTIC — `validate`'s `Deny`
+    /// arm hands the reason straight to `refusal_failure`, and `audit_finish`
+    /// matches `ErrorCode::Nyet(r)` without looking at `r` — so no reason can
+    /// take a different road; a refactor that starts matching on the reason in
+    /// either place breaks that assumption and owes this test an end-to-end
+    /// replacement.
     #[test]
     fn a_validator_panic_refuses_with_the_ordinary_nyet_exit_code() {
-        let policy = validator::Policy::sqlite(&[], &[]);
-        let Err(f) = validate("SELECT '__nyet_test_panic__'", &policy) else {
-            panic!("a panic must never pass as an allow");
-        };
+        let f = refusal_failure(validator::Refusal {
+            reason: validator::DenyReason::InternalError,
+            message: "internal error".to_string(),
+            hint: "report it".to_string(),
+        });
         assert_eq!(f.code.as_str(), "NYET");
         assert_eq!(f.code.reason(), Some("INTERNAL_ERROR"));
         assert_eq!(f.code.exit(), 5);

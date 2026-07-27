@@ -1,0 +1,1 @@
+db.users.find({age: {$gte: 18, $lt: 65}})

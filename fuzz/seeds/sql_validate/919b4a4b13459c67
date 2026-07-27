@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE uid IN (SELECT id FROM users)

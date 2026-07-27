@@ -1,0 +1,1 @@
+db.users.find({a: {"$g​t": 1}})

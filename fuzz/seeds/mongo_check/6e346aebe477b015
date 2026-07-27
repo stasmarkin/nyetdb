@@ -1,0 +1,1 @@
+db.users.aggregate([{$lookup: {from: "orders", as: "o", pipeline: [{$match: {coll: "system.js"}}]}}])

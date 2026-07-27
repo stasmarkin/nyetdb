@@ -1,0 +1,1 @@
+LOAD DATA INFILE '/etc/passwd' INTO TABLE t

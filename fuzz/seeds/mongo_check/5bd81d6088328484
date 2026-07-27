@@ -1,0 +1,1 @@
+db.users.deleteOne({a: 1})

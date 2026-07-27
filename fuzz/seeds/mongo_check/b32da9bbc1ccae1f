@@ -1,0 +1,1 @@
+db.users.aggregate([{$facet: {a: [{$unionWith: {coll: "system.views"}}]}}])

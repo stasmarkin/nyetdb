@@ -1,0 +1,1 @@
+SELECT data @> '{"k":1}' AS has FROM events

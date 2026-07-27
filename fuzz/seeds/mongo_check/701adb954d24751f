@@ -1,0 +1,1 @@
+db.users.find({n: NumberLong("not a number")})

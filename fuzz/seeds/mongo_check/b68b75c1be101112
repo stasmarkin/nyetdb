@@ -1,0 +1,1 @@
+db.users.aggregate([{$addFields: {total: {$multiply: ["$price", "$qty"]}}}, {$unset: "tmp"}])

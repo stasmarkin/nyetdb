@@ -1,0 +1,1 @@
+SELECT doc->'$.a' AS a, doc->>'$.b' AS b FROM events

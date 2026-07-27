@@ -1,0 +1,1 @@
+SELECT * FROM users PIVOT (count(id) FOR dept IN ('a'))

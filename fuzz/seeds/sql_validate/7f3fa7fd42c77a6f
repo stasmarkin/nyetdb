@@ -1,0 +1,1 @@
+SELECT histogram FROM column_statistics

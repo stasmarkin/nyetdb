@@ -1,0 +1,1 @@
+db.users.aggregate([{$group: {_id: null, avg: {$avg: "$n"}, top: {$topN: {n: 3, sortBy: {n: -1}, output: "$name"}}}}])

@@ -1,0 +1,1 @@
+SELECT s.email FROM users u, LATERAL (SELECT u.*) s

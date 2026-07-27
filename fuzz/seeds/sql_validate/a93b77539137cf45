@@ -1,0 +1,1 @@
+SELECT min_value FROM mysql.column_stats

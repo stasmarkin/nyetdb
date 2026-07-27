@@ -1,0 +1,1 @@
+SELECT query_to_xml('select pg_sleep(3)', true, false, '')

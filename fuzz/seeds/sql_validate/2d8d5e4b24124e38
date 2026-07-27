@@ -1,0 +1,1 @@
+SELECT xpath('//email/text()', query_to_xml('select email from users', true, false, ''))

@@ -1,0 +1,1 @@
+SELECT DISTINCT ON (user_id) user_id, total FROM orders ORDER BY user_id, created_at DESC

@@ -1,0 +1,1 @@
+SELECT * FROM information_schema.column_statistics

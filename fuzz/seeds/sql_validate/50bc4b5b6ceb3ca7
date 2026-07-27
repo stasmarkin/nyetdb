@@ -1,0 +1,1 @@
+SELECT count(*) FROM orders o JOIN (users JOIN dict USING (email)) x ON true

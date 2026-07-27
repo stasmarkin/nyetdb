@@ -1,0 +1,1 @@
+db.users.aggregate([{$vectorSearch: {index: "i", path: "p", queryVector: [1], numCandidates: 1, limit: 1}}])

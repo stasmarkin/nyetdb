@@ -1,0 +1,1 @@
+SELECT email FROM users UNION ALL SELECT contact FROM signups

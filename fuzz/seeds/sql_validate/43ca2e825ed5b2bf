@@ -1,0 +1,1 @@
+SELECT most_common_vals FROM ONLY (pg_stats)

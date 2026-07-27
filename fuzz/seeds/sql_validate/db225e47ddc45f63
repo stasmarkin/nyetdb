@@ -1,0 +1,1 @@
+SELECT email::int FROM users

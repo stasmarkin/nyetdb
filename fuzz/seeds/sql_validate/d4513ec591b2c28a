@@ -1,0 +1,1 @@
+SELECT count(*) FROM users u, LATERAL (SELECT * FROM (SELECT u.*) q) s WHERE s.email LIKE 'a%'

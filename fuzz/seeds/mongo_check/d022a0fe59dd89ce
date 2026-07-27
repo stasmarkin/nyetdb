@@ -1,0 +1,1 @@
+db.users.aggregate([{$lookup: {from: {db: "other", coll: "orders"}, as: "o", pipeline: []}}])

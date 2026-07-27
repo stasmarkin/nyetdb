@@ -1,0 +1,1 @@
+SELECT SUBSTRING(email, 1, 3) FROM users

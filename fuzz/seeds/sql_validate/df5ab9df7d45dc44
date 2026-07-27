@@ -1,0 +1,1 @@
+SELECT load_file FROM t

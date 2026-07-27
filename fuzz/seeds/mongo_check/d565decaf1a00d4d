@@ -1,0 +1,1 @@
+db.users.find({uid: UUID("3b241101-e2bb-4255-8caf-4136c566a962")})

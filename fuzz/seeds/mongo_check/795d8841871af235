@@ -1,0 +1,1 @@
+db.users.find({$maxTimeMS: 999999})

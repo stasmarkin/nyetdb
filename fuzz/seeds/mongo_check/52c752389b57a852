@@ -1,0 +1,1 @@
+db.users.find({$hint: {a: 1}})

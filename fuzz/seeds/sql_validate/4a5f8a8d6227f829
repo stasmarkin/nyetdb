@@ -1,0 +1,1 @@
+SELECT json_object('e', email) FROM users

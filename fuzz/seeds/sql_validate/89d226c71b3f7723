@@ -1,0 +1,1 @@
+SELECT '1'::int AS n, id::text AS s FROM users

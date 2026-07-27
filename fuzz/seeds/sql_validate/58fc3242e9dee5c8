@@ -1,0 +1,1 @@
+SELECT tags[1] AS first_tag FROM posts

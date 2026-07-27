@@ -1,0 +1,1 @@
+db.users.aggregate([{$lookup: {from: "system.profile", localField: "a", foreignField: "b", as: "p"}}])

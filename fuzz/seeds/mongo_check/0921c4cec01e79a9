@@ -1,0 +1,1 @@
+db.users.find({created_at: {"$date": {"$numberLong": "1767139200000"}}})

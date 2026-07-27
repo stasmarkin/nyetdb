@@ -1,0 +1,1 @@
+SELECT lo_export(12345, '/tmp/leak')

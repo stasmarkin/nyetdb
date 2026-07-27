@@ -1,0 +1,1 @@
+db.users.find({}).sort({$out: 1})

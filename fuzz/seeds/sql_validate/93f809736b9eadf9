@@ -1,0 +1,1 @@
+WITH x AS (SELECT email FROM users) SELECT count(*) FROM x

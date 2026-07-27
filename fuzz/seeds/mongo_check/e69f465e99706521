@@ -1,0 +1,1 @@
+db.users.find({}).sort({created_at: -1}).skip(10).limit(5)

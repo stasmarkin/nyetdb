@@ -1,0 +1,1 @@
+db.users.mapReduce("function(){}", "function(){}", {out: "res"})

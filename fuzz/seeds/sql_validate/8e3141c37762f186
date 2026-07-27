@@ -1,0 +1,1 @@
+WITH top AS (SELECT user_id, sum(total) s FROM orders GROUP BY 1) SELECT * FROM top WHERE s > 100

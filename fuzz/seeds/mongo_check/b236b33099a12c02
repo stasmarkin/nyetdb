@@ -1,0 +1,1 @@
+db.users.aggregate([{$facet: {byStatus: [{$group: {_id: "$status", n: {$sum: 1}}}], total: [{$count: "n"}]}}])

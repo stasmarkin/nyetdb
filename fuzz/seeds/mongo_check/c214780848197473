@@ -1,0 +1,1 @@
+db.users.aggregate([{$setWindowFields: {partitionBy: "$dept", sortBy: {salary: -1}, output: {place: {$rank: {}}}}}])

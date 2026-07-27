@@ -18,7 +18,7 @@ the recipes:
 | recipe | what it runs |
 |---|---|
 | `just build` / `just install` | `cargo build` / `cargo install --path . --locked` |
-| `just test-fast` | `--bins` + `--test cli`, minus the five container unit tests — **no Docker**, ~2 s |
+| `just test-fast` | `--lib` + `--bins` + `--test cli`, minus the five container unit tests — **no Docker**, ~2 s |
 | `just test` | the whole `cargo test`, containers included, ~40 s |
 | `just check` | the pre-commit gate: fmt, clippy, full test, deny, audit |
 
@@ -30,6 +30,8 @@ and if no daemon answers there, they say so (with the `colima start` /
 added to `container_units` in the justfile.
 
 Stable Rust; no nightly features. `#![forbid(unsafe_code)]` on the whole crate.
+(The one nightly consumer is `fuzz/`, a separate crate outside this package's
+workspace — see "Fuzzing" below. Nothing in the stable pipeline touches it.)
 
 ### Integration tests need Docker
 
@@ -73,7 +75,7 @@ just test                                  # containers come up and are reaped p
 docker CLI contexts). With a plain `cargo test`, export it yourself.
 
 The SQLite and validator/config/resolver tests need no Docker; `just test-fast`
-is exactly that subset (`cargo test --bins --test cli` minus
+is exactly that subset (`cargo test --lib --bins --test cli` minus
 `postgres_layer2_types_and_timeout`,
 `pg_collapsed_guardrail_arming_keeps_its_invariants`,
 `mysql_layer2_types_and_timeout`, `mysql8_caching_sha2_password_over_tls` and
@@ -214,6 +216,12 @@ command-building, host/remote validation, and the url→localhost override are
 covered by unit tests in `src/tunnel.rs` / `src/engine.rs` (no network).
 
 ## Module map (PRINCIPLES Д2)
+
+Every module below `cli` lives in a **library target** (`src/lib.rs`), which
+`src/main.rs` then imports; the binary is the cli layer and nothing else. The
+lib exists for one reason — libFuzzer links against a library, not a binary
+(see "Fuzzing") — and is `#[doc(hidden)]` with no API promise. The module
+boundaries, and who may depend on whom, are exactly as they were.
 
 ```
 cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
@@ -3024,6 +3032,49 @@ read-only builtins with no side effects worth denying. If a future denylist
 entry needs a keyword-parsed function, add a dedicated visitor arm for its
 AST node.
 
+## Fuzzing (`fuzz/`, `.github/workflows/fuzz.yml`)
+
+`cargo-fuzz` on the one property layer 1 owes for **any** input: it returns a
+verdict, it does not unwind. Two targets, both taking the raw bytes as text:
+
+| target | boundary |
+|---|---|
+| `sql_validate` | `validator::validate`, against all three policies (`sqlite`/`postgres`/`mysql`) on every input |
+| `mongo_check` | `mongo::check` |
+
+**The oracle is indirect, and that is the whole trick.** Those boundaries wrap
+themselves in `catch_unwind` (see `INTERNAL_ERROR` in the error-code table), so
+libFuzzer would never see a panic they catch — it comes back as an ordinary
+refusal. Each target therefore panics *itself* when the verdict's reason is
+`INTERNAL_ERROR`. Panics from outside the guarded region (a refusal builder, a
+`Display` impl) still reach libFuzzer the usual way, unchanged.
+
+`check_origins`, the third `catching_panics` boundary, has no target: its input
+is `&[Origin]` + column names, structure a byte stream cannot reach without an
+`Arbitrary` impl written for the purpose, and behind it is name matching rather
+than a parser. The proptest in `src/validator/property.rs` and the corpus cover
+it better than random bytes would.
+
+The seed corpus in `fuzz/seeds/<target>/` is one file per query, extracted from
+the golden corpus (`tests/corpus/*.yaml` and `tests/corpus/mongo/*.yaml`) — it
+is committed, and passed to libFuzzer as a **second, read-only** directory, so
+what the fuzzer discovers lands in the gitignored `fuzz/corpus/<target>/`
+instead of growing the repo. `fuzz/sql.dict` is not a grammar, just the tokens
+the validator decides on (write verbs, txn control, locking clauses, denied
+function names, comment openers), so mutation can reach a verdict boundary.
+
+Running it needs a nightly toolchain and `cargo install cargo-fuzz`:
+
+```
+mkdir -p fuzz/corpus/sql_validate
+cargo +nightly fuzz run sql_validate fuzz/corpus/sql_validate fuzz/seeds/sql_validate \
+  -- -dict=fuzz/sql.dict -max_total_time=120
+```
+
+`fuzz/` is a **separate crate outside this package's workspace**, so the stable
+pipeline never builds it: `cargo build`, `cargo clippy --all-targets` and
+`cargo test` from the repo root do not see it, and none of them needs nightly.
+
 ## CI (.github/workflows/ci.yml)
 
 Three jobs on push/PR, stable toolchain:
@@ -3038,6 +3089,12 @@ Three jobs on push/PR, stable toolchain:
   (advisories, license allowlist, bans, sources).
 - **audit** — `cargo audit` against the RustSec advisory DB
   (installed via `taiki-e/install-action`).
+
+A fourth workflow, `fuzz.yml`, is deliberately NOT part of this gate: it runs on
+a nightly `schedule` (and `workflow_dispatch`), 15 minutes per target on the
+nightly toolchain, uploads the crashing input and opens one issue per target on
+failure (`issues: write`, scoped to that job alone). Fuzzing is a soak, not a
+merge gate — see "Fuzzing" above.
 
 ## Release process (`dist` + `.github/workflows/release.yml`)
 

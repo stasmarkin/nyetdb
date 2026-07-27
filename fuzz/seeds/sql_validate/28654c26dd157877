@@ -1,0 +1,1 @@
+SELECT email || 'x' FROM users

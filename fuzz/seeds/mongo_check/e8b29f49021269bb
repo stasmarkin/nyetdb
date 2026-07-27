@@ -1,0 +1,1 @@
+db.users.aggregate([{$unionWith: {coll: "system.profile", pipeline: []}}])

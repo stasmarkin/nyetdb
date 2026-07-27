@@ -1,0 +1,1 @@
+SELECT u.id, c.cnt FROM users u, LATERAL (SELECT count(*) cnt FROM orders o WHERE o.user_id = u.id) c

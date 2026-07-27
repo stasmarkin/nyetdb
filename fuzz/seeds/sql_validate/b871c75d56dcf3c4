@@ -1,0 +1,1 @@
+SELECT o.* FROM orders o JOIN users u ON u.id = o.uid

@@ -1,0 +1,1 @@
+db.users.aggregate([]).sort({a: 1})

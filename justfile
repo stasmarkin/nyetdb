@@ -22,7 +22,9 @@ build:
 
 # Unit + cli tests, no containers, no Docker needed (seconds).
 test-fast:
-    cargo test --bins --test cli -- {{ container_units }}
+    # --lib as well as --bins: the modules, and their unit tests, live in the
+    # lib target since src/lib.rs; only the cli layer is left in the binary.
+    cargo test --lib --bins --test cli -- {{ container_units }}
 
 # Everything, containers included (~40s): needs a Docker daemon.
 test: _docker
@@ -35,6 +37,15 @@ check: _docker
     cargo test
     cargo deny check
     cargo audit
+
+# Fuzz one target for TIME seconds (needs nightly + `cargo install cargo-fuzz`).
+fuzz target time="120":
+    # fuzz/seeds/ goes SECOND, so libFuzzer treats it as read-only and writes
+    # what it discovers into the gitignored fuzz/corpus/. Same flags as fuzz.yml.
+    @mkdir -p fuzz/corpus/{{ target }}
+    cargo +nightly fuzz run {{ target }} fuzz/corpus/{{ target }} fuzz/seeds/{{ target }} -- \
+        {{ if target == "sql_validate" { "-dict=fuzz/sql.dict" } else { "" } }} \
+        -max_total_time={{ time }} -max_len=4096 -timeout=25
 
 # Installs the `nyet` binary into ~/.cargo/bin.
 install:

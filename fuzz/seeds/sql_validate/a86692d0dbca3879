@@ -1,0 +1,1 @@
+SELECT o.id FROM orders o JOIN payments p USING (order_id)

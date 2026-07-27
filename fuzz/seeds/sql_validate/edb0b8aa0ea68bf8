@@ -1,0 +1,1 @@
+SELECT locktype, granted FROM pg_locks

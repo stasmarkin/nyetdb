@@ -1,0 +1,1 @@
+db.users.update({}, {$set: {b: 2}})

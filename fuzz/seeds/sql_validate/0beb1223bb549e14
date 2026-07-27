@@ -1,0 +1,1 @@
+SELECT '/*! not a comment */' AS s

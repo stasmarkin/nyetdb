@@ -1,0 +1,1 @@
+SELECT * FROM pg_statistic_ext_data

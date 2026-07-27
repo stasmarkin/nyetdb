@@ -1,0 +1,1 @@
+SELECT * FROM users JOIN (UPDATE t SET a = 1 RETURNING *) u ON u.id = users.id

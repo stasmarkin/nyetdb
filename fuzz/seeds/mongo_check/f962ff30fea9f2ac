@@ -1,0 +1,1 @@
+db.users.find({name: {"$regularExpression": {"pattern": "^ac", "options": "i"}}})

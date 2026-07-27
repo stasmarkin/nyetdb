@@ -1,0 +1,1 @@
+SELECT s.email FROM users u JOIN (SELECT id, contact AS email FROM signups) s ON s.id = u.id
