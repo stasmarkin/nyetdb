@@ -27,6 +27,11 @@ toml = "1.1.3"
 unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 
 [dev-dependencies]
+# Generator for the validator's property test (src/validator/property.rs).
+# Without the default `fork`/`timeout` features: those exist to isolate a test
+# that may crash or hang the process, and this one only calls a pure function —
+# skipping them keeps five crates out of the tree instead of nine.
+proptest = { version = "1.11.0", default-features = false, features = ["std", "bit-set"] }
 tempfile = "3.27.0"
 testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb", "mongo"] }
 # The PostgreSQL tests build a multi-thread runtime (testcontainers + its async

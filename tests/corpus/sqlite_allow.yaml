@@ -83,3 +83,11 @@
 # twin `FROM (DELETE ...)` lives in sqlite_deny.yaml; guards against over-deny)
 - query: SELECT * FROM (SELECT id FROM users) d
   verdict: allow
+# a KEYWORD in an expression position is an identifier, not a statement:
+# `SELECT (BEGIN)` reads a column named `begin` and mutates nothing, so the
+# TXN_CONTROL twin (`BEGIN`, in sqlite_deny.yaml) does not reach here. Pinned
+# because the property generator learned it the hard way — a bare keyword put
+# where a query belongs stops being a write, and scoring it as one produced 18
+# phantom "bypasses" (src/validator/property.rs).
+- query: SELECT (BEGIN)
+  verdict: allow

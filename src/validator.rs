@@ -2241,6 +2241,12 @@ fn deny(reason: DenyReason, message: String, hint: &str) -> Verdict {
     }
 }
 
+/// Property-based companion to the golden corpus: a generator that composes
+/// write nodes into read scaffolding and asserts the one guarantee (see the
+/// module's own doc comment).
+#[cfg(test)]
+mod property;
+
 #[cfg(test)]
 mod tests {
     use super::*;
