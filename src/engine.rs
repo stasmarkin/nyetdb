@@ -1019,6 +1019,15 @@ fn apply_host_override(
 }
 
 impl Postgres {
+    /// The ONE owner of "how large a `statement_timeout` this server accepts":
+    /// PostgreSQL rejects anything above INT_MAX ms (~24.8 days) at connect, so
+    /// an unclamped value turns a generous timeout into CONNECTION_FAILED.
+    /// Every place that fills `statement_timeout_ms` goes through here — the
+    /// cli builds the engine with it, and shrinks it through it too.
+    pub fn clamp_statement_timeout(ms: u64) -> u64 {
+        ms.min(i32::MAX as u64)
+    }
+
     /// Build the connect options (layer 2 + the tunnel override) and run the
     /// handshake under its own generous deadline. Shared by `execute` and
     /// `schema`, so introspection gets the same read-only, timeout-capped
@@ -1688,16 +1697,6 @@ fn pg_display(schema: &str, name: &str) -> String {
     }
 }
 
-/// Split the agent's `[table]` argument into `(schema, name)`. Both halves are
-/// bound as parameters, never interpolated; an unqualified name matches in
-/// every non-system schema.
-fn split_qualified(table: &str) -> (Option<&str>, &str) {
-    match table.split_once('.') {
-        Some((schema, name)) => (Some(schema), name),
-        None => (None, table),
-    }
-}
-
 /// PostgreSQL introspection: four pg_catalog queries (objects, columns,
 /// constraints, indexes) grouped back together by table. Every one of them is a
 /// constant string plus the two bound filter parameters.
@@ -1706,8 +1705,12 @@ async fn pg_schema(
     table: Option<&str>,
 ) -> Result<Schema, EngineError> {
     let (schema_filter, name_filter) = match table {
+        // The `[table]` argument is split on the first dot by the one rule
+        // `nyet sample` also applies to it. Both halves are BOUND as parameters
+        // below, never interpolated; an unqualified name matches in every
+        // non-system schema.
         Some(t) => {
-            let (schema, name) = split_qualified(t);
+            let (schema, name) = crate::sample::split_qualified(t);
             (schema, Some(name))
         }
         None => (None, None),
@@ -2242,6 +2245,14 @@ fn apply_mysql_host_override(
 }
 
 impl Mysql {
+    /// The `Postgres::clamp_statement_timeout` twin: `max_execution_time` is an
+    /// unsigned 32-bit millisecond value (`max_statement_time` is its MariaDB
+    /// seconds-typed sibling), and a value outside that range is a hard server
+    /// error on the SET, not a capped query.
+    pub fn clamp_statement_timeout(ms: u64) -> u64 {
+        ms.min(u32::MAX as u64)
+    }
+
     /// Connect options (password + tunnel override) and the handshake under its
     /// own generous deadline. Shared by `execute` and `schema`.
     async fn connect(&self) -> Result<sqlx::MySqlConnection, EngineError> {
@@ -2796,8 +2807,13 @@ async fn mysql_probe_column(
     table: &str,
     column: &str,
 ) -> Option<bool> {
-    let quote = |name: &str| name.replace('`', "``");
-    let sql = format!("SELECT `{}` FROM `{}` WHERE 0", quote(column), quote(table));
+    // The names come from the config, but backquoting them is still the one
+    // rule that keeps a name a name — so it is the one nyet has (`sample`).
+    let sql = format!(
+        "SELECT {} FROM {} WHERE 0",
+        crate::sample::backquote(column),
+        crate::sample::backquote(table)
+    );
     match sqlx::query(sqlx::AssertSqlSafe(sql))
         .fetch_optional(&mut *conn)
         .await

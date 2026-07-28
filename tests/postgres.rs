@@ -1501,3 +1501,141 @@ fn postgres_pii_mask_end_to_end() {
         container.rm().await.unwrap();
     });
 }
+
+/// `nyet sample` on a real PostgreSQL: the qualified name, the PII policy, and
+/// the one path only a server engine has — the guardrail refusing the random
+/// draw, which turns into the cheap answer plus `SAMPLE_FALLBACK`.
+#[test]
+fn postgres_sample_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        {
+            use sqlx::{ConnectOptions, Connection, Executor};
+            let opts: sqlx::postgres::PgConnectOptions =
+                format!("postgres://postgres@127.0.0.1:{port}/postgres")
+                    .parse()
+                    .unwrap();
+            let mut w = opts.password(PW).connect().await.unwrap();
+            for sql in [
+                "CREATE SCHEMA sales",
+                "CREATE TABLE sales.orders (id int primary key, total int)",
+                "INSERT INTO sales.orders VALUES (1, 10), (2, 20)",
+                // Big enough that sorting it (a random draw) plans far above a
+                // plain LIMIT, so the fallback below is decided by the planner's
+                // arithmetic and not by a lucky magnitude.
+                "CREATE TABLE big AS SELECT g AS n, 'row' || g AS label \
+                 FROM generate_series(1, 20000) g",
+                "ANALYZE big",
+            ] {
+                w.execute(sql).await.unwrap();
+            }
+            w.close().await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_pg_config(tmp.path(), port);
+
+        // 1) The ordinary answer: the query envelope, every column of the table.
+        let out = run(tmp.path(), &cfg, &["sample", "pg", "users"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_no_password_leak(&out);
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["meta"]["row_count"], 3);
+        assert_eq!(v["meta"]["truncated"], false);
+        assert!(v["rows"][0]["id"].is_number(), "{v}");
+        assert!(v["rows"][0].get("email").is_some(), "{v}");
+
+        // 2) `schema.table` outside the search_path — the same argument shape
+        //    `nyet schema` takes, split on the first dot.
+        let out = run(tmp.path(), &cfg, &["sample", "pg", "sales.orders"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["meta"]["row_count"], 2);
+        // Unqualified, that same table is not on the search_path: a database
+        // error, with the hint pointing at the name the agent can fix.
+        let out = run(tmp.path(), &cfg, &["sample", "pg", "orders"]);
+        assert_eq!(out.status.code(), Some(7), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["code"], "DB_ERROR");
+        assert!(
+            v["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("nyet schema pg"),
+            "{v}"
+        );
+
+        // 3) The guardrail refuses the random draw (sorting 20000 rows), so
+        //    nyet asks the cheap question instead and SAYS SO. A plain
+        //    `LIMIT 11` plans far under this threshold; the sort does not.
+        let guarded = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.guardrail]\nmode = \"cost\"\nmax_cost = 50.0\n",
+        );
+        let out = run(tmp.path(), &guarded, &["sample", "pg", "big"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["meta"]["row_count"], 10);
+        let warnings = v["warnings"].as_array().unwrap();
+        let fallback = warnings
+            .iter()
+            .find(|w| w["code"] == "SAMPLE_FALLBACK")
+            .unwrap_or_else(|| panic!("no SAMPLE_FALLBACK: {v}"));
+        // It must say what the rows are NOT, and how to insist on a real draw —
+        // as a line that survives being pasted into a shell, quotes and all.
+        let message = fallback["message"].as_str().unwrap();
+        assert!(
+            message.contains("nyet query pg 'SELECT * FROM \"big\" ORDER BY random() LIMIT 10'"),
+            "{message}"
+        );
+        // The refusal is gone: the answer is a success, not a NYET.
+        assert_eq!(v["ok"], true);
+        // ...and the guardrail still refuses the draw when it is asked for
+        // deliberately, which is what the warning promises.
+        let out = run(
+            tmp.path(),
+            &guarded,
+            &[
+                "query",
+                "pg",
+                "SELECT * FROM \"big\" ORDER BY random() LIMIT 10",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["reason"], "EXPENSIVE_QUERY");
+
+        // 4) A threshold under even the cheap statement: the fallback is
+        //    refused too, and that refusal IS the answer — there is no third try.
+        let strict = write_pg_config_with(
+            tmp.path(),
+            port,
+            "[connections.pg.guardrail]\nmode = \"cost\"\nmax_cost = 0.001\n",
+        );
+        let out = run(tmp.path(), &strict, &["sample", "pg", "big"]);
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["code"], "NYET");
+        assert_eq!(v["error"]["reason"], "EXPENSIVE_QUERY");
+        assert!(v["estimate"]["plan"].is_array(), "{v}");
+
+        // 5) `sample` is a SELECT *, so a protected column refuses it in BOTH
+        //    modes — the agent is told to name the columns it needs instead.
+        for pii in [
+            "[connections.pg.pii]\ncolumns = [\"users.email\"]\n",
+            "[connections.pg.pii]\ncolumns = [\"users.email\"]\nmode = \"mask\"\n",
+        ] {
+            let cfg = write_pg_config_with(tmp.path(), port, pii);
+            let out = run(tmp.path(), &cfg, &["sample", "pg", "users"]);
+            assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            assert_eq!(v["error"]["code"], "NYET");
+            assert_eq!(v["error"]["reason"], "PII_COLUMN");
+            // An unprotected table still samples.
+            let out = run(tmp.path(), &cfg, &["sample", "pg", "sales.orders"]);
+            assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        }
+
+        container.rm().await.unwrap();
+    });
+}

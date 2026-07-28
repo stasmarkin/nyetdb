@@ -143,7 +143,14 @@ introspection, auto-guardrail через EXPLAIN). Ниша подтвержде
       вещи — схлопывание control-стейтментов и переиспользование форварда (см.
       «Сделано вне вех»). Демон остаётся не сделан; решать заново по латентности
       TLS/auth и по topology discovery MongoDB
-- [ ] `nyet sample <alias> <table>` — сэмплирование данных
+- [x] `nyet sample <alias> <table>` — сэмплирование данных. Сахар над кодпутём
+      `query`: nyet сам пишет запрос (случайная выборка, по умолчанию 10 строк;
+      `$sample` на MongoDB) и гонит его НЕИЗМЕНЁННЫМ конвейером — валидатор,
+      guardrail, обе PII-сетки, лимит, форматтеры, одна запись в аудит. Если
+      guardrail отказал случайной выборке как дорогой (`EXPENSIVE_QUERY`) —
+      одна автоматическая попытка дешёвым `LIMIT`-запросом с warning'ом
+      `SAMPLE_FALLBACK` («это первые строки, не случайные»); на любой другой
+      отказ (PII, ошибка БД, timeout) повтора нет
 - [x] PII-защита (per-connection колонки). Шаг PII-1: секция
       `[connections.X.pii] columns = ["users.email", ...]`, отказ всего запроса
       (`NYET`/`PII_COLUMN`/`PII_UNPROVABLE`, exit 5) по имени до выполнения и по

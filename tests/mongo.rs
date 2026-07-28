@@ -557,9 +557,66 @@ fn mongo_query_end_to_end() {
         explain_shows_the_plan_without_running_the_query(tmp.path(), &cfg, port);
         doctor_proves_read_only_from_privileges(tmp.path(), port);
         pii_policy_denies_and_masks(tmp.path(), port);
+        sample_draws_documents_and_cannot_miss_a_collection(tmp.path(), &cfg, port);
 
         drop(container);
     });
+}
+
+/// `nyet sample` on MongoDB is one `$sample` aggregation — already on the
+/// allowlist, and unguarded (this engine's guardrail is `off`), so there is no
+/// fallback to reach. What it must still say honestly: zero documents does NOT
+/// mean the collection is missing, because MongoDB has no catalog to miss.
+fn sample_draws_documents_and_cannot_miss_a_collection(home: &Path, cfg: &Path, port: u16) {
+    let out = run(home, cfg, &["sample", "mg", "small"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = envelope(&out);
+    assert_eq!(v["meta"]["row_count"], 5);
+    assert_eq!(v["meta"]["truncated"], false);
+    // Documents, so the columns are the union of the top-level field names.
+    assert!(v["rows"][0]["name"].is_string(), "{v}");
+
+    let out = run(home, cfg, &["sample", "mg", "small", "--limit", "3"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = envelope(&out);
+    assert_eq!(v["meta"]["row_count"], 3);
+    assert_eq!(v["meta"]["truncated"], true);
+
+    // The one MongoDB answer that would be an error anywhere else.
+    let out = run(home, cfg, &["sample", "mg", "no_such_collection"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert_eq!(envelope(&out)["meta"]["row_count"], 0);
+
+    // Net B still judges the documents a sample drew: deny refuses the answer,
+    // mask redacts it in place — the value never reaches either stream.
+    let deny_cfg = write_config(
+        home,
+        port,
+        "[connections.mg.pii]\ncolumns = [\"validated.email\"]\n",
+    );
+    let out = run(home, &deny_cfg, &["sample", "mg", "validated"]);
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+    assert_eq!(envelope(&out)["error"]["reason"], "PII_COLUMN");
+    assert!(!stdout(&out).contains("a@b.c"), "leaked to stdout");
+
+    let mask_cfg = write_config(
+        home,
+        port,
+        "[connections.mg.pii]\ncolumns = [\"validated.email\"]\nmode = \"mask\"\n",
+    );
+    let out = run(home, &mask_cfg, &["sample", "mg", "validated"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v = envelope(&out);
+    assert_eq!(v["rows"][0]["email"], "[REDACTED]");
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "PII_MASKED"),
+        "{v}"
+    );
+    assert!(!stdout(&out).contains("a@b.c"), "leaked to stdout");
 }
 
 /// The `[pii]` policy on a live server (PII-M1): net A refuses a mention, net B

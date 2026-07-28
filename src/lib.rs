@@ -14,6 +14,7 @@ pub mod guardrail;
 pub mod mongo;
 pub mod output;
 pub mod resolver;
+pub mod sample;
 pub mod skill;
 pub mod tunnel;
 pub mod validator;

@@ -80,3 +80,7 @@
 # derived table (subquery in FROM) with a plain read -> allowed
 - query: SELECT * FROM (SELECT id FROM users) d
   verdict: allow
+# the statement `nyet sample` writes for MySQL/MariaDB (src/sample.rs): it goes
+# down the ordinary query path, so the validator must keep accepting it
+- query: SELECT * FROM `users` ORDER BY RAND() LIMIT 11
+  verdict: allow

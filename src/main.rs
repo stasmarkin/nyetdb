@@ -5,7 +5,9 @@
 
 // The modules live in the lib target (src/lib.rs) so the fuzz targets can link
 // against them; this binary is just their cli layer.
-use nyetdb::{audit, config, engine, guardrail, mongo, output, resolver, skill, tunnel, validator};
+use nyetdb::{
+    audit, config, engine, guardrail, mongo, output, resolver, sample, skill, tunnel, validator,
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use engine::Engine;
@@ -84,6 +86,43 @@ enum Command {
         /// Max rows to return (default: per-connection row_limit, then
         /// [defaults].row_limit, then 1000)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
+        /// Query timeout in seconds (default: per-connection timeout_secs,
+        /// then [defaults].timeout_secs, then 30)
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+    },
+    /// Show a few rows of one table, to see what the data actually looks like
+    ///
+    /// Sugar over `nyet query`: nyet writes the statement itself (a random draw
+    /// of 10 rows) and runs it through the very same pipeline, so the validator,
+    /// the guardrail and the PII policy judge it exactly as they would judge
+    /// your own SQL. If the guardrail refuses the random draw as too expensive,
+    /// nyet retries with the first N rows and says so (warning SAMPLE_FALLBACK).
+    ///
+    /// Examples:
+    ///   nyet sample prod users               # 10 rows, drawn at random
+    ///   nyet sample prod users --limit 3
+    ///   nyet sample prod sales.orders        # PostgreSQL: outside the public schema
+    ///   nyet sample events users             # MongoDB: a collection, same command
+    // verbatim: see the Schema arm — the examples are the point (UX-3).
+    #[command(verbatim_doc_comment)]
+    Sample {
+        /// Connection alias from the config
+        alias: String,
+        /// The table, view or collection to sample (PostgreSQL: `schema.table`
+        /// outside public)
+        table: String,
+        /// Output format (default: [defaults].format from the config, then json)
+        #[arg(long, value_enum)]
+        format: Option<Format>,
+        /// Max rows to return (default: 10, at most 1000000 — ask for a table,
+        /// not a sample, with `nyet query`)
+        // A sample is a handful of rows by definition, and the number lands in
+        // the statement nyet writes: without a ceiling here, `--limit
+        // 9223372036854775807` reaches the database as a LIMIT it cannot read
+        // and comes back as a DB_ERROR about text the agent never wrote (Д10).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
         limit: Option<u64>,
         /// Query timeout in seconds (default: per-connection timeout_secs,
         /// then [defaults].timeout_secs, then 30)
@@ -353,6 +392,29 @@ impl Db {
             // straight to them, around the bastion (see engine::Mongo::open).
             Db::Mongo(mg) => mg.host_override = Some(over),
             Db::Sqlite(_) => {}
+        }
+    }
+
+    /// Shrink the per-query budget for the NEXT statement — `sample`'s fallback
+    /// runs on what its refused first attempt left of the owner's timeout, not
+    /// on a fresh one. Server-side and in-process bounds move together, since
+    /// both engines that have a fallback arm the server at connect time and
+    /// `execute` connects per statement — through the engines' OWN clamps, so
+    /// what a server will not accept is refused in one place, not two (a raw
+    /// `statement_timeout` past INT_MAX makes the retry fail to connect at all).
+    /// Exhaustive: a future engine that keeps a budget of its own must say so.
+    fn set_query_timeout_ms(&mut self, ms: u64) {
+        match self {
+            Db::Sqlite(e) => e.query_timeout_ms = ms,
+            Db::Postgres(e) => {
+                e.query_timeout_ms = ms;
+                e.statement_timeout_ms = engine::Postgres::clamp_statement_timeout(ms);
+            }
+            Db::Mysql(e) => {
+                e.query_timeout_ms = ms;
+                e.statement_timeout_ms = engine::Mysql::clamp_statement_timeout(ms);
+            }
+            Db::Mongo(e) => e.query_timeout_ms = ms,
         }
     }
 
@@ -708,209 +770,38 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             format: _,
             limit,
             timeout,
-        } => {
-            let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, timeout)?;
-            // Audit identity, captured before the body consumes `query`/`alias`.
-            let engine = conn.engine.clone();
-            let raw_sql = query.clone();
-            let cwd_str = cwd.display().to_string();
-            let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
-            let redact_db_errors = session.redact_db_errors();
-            // The whole command as ONE Result so both success and every failure
-            // path (validator/guardrail refusal, DB error) flow through
-            // audit_finish — the log is written before the result is released.
-            let outcome = (|| -> Result<Emitted, Failure> {
-                // Flag > per-connection > [defaults] > built-in, capped by the
-                // config owner's max_row_limit (see config::capped).
-                let limit = cfg.row_limit(conn, limit);
-                // Layer 1. Any deny -> code NYET + reason, exit 5. Which layer 1
-                // runs is decided by the engine: MongoDB has its own parser and
-                // allowlist (mongosh text is not SQL and sqlparser must never
-                // see it), everything else goes through the SQL validator.
-                let (query, is_query, mut warnings, pii_exempt) = match session.db.is_mongo() {
-                    true => validate_mongo(&query, session.policy.pii())?,
-                    false => validate(&query, &session.policy)?,
-                };
-                // Layer 1.5: the guardrail. Only a plain query can be wrapped in an
-                // EXPLAIN; SHOW/DESCRIBE are metadata no planner estimates, so they
-                // run unguarded (documented). An EXPLAIN ANALYZE never gets here —
-                // the validator refuses it (reason EXPLAIN_ANALYZE).
-                let guardrail = match is_query {
-                    true => {
-                        config::guardrail(&alias, conn).map_err(|e| config_failure(e, &path))?
-                    }
-                    false => guardrail::Guardrail::OFF,
-                };
-                // The tunnel is opened AFTER the validator (a refused query exits 5
-                // without paying for ssh); the guard decides on drop whether the
-                // forward is kept for the next run or removed (see tunnel.rs).
-                // Fetch limit+1 to detect truncation without reading everything.
-                let _tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
-                let ((outcome, masked), duration_ms) = run_db(
-                    redact_db_errors,
-                    session.db.execute(
-                        &query,
-                        limit.saturating_add(1),
-                        &guardrail,
-                        session.policy.pii(),
-                        &pii_exempt,
-                    ),
-                )?;
-                if !masked.is_empty() {
-                    warnings.push(pii_masked_warning(&masked));
-                }
-
-                let (mut rs, estimate) = match outcome {
-                    // The guardrail refused: nothing ran, and the envelope carries
-                    // the plan that justified it (NYET/EXPENSIVE_QUERY, exit 5).
-                    engine::QueryOutcome::Refused { estimate, value } => {
-                        let (message, hint) = guardrail.refusal(&alias, value);
-                        return Err(Failure {
-                            code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
-                            message,
-                            hint,
-                            estimate: Some(Box::new(guardrail.describe(estimate))),
-                        });
-                    }
-                    // Planning itself outran the guardrail's budget. Fail closed:
-                    // planning time is agent-controllable, so "no plan in time" must
-                    // not be a way to switch the guard off. Same reason code — the
-                    // verdict is the same, only the evidence differs.
-                    engine::QueryOutcome::PlanTooSlow { budget_ms } => {
-                        let (message, hint) = guardrail::planning_too_slow(&alias, budget_ms);
-                        return Err(Failure {
-                            code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
-                            message,
-                            hint,
-                            estimate: None,
-                        });
-                    }
-                    // Net B refused the result: the rows exist but are never
-                    // formatted, logged or emitted (the check runs inside
-                    // Db::execute, before this match).
-                    engine::QueryOutcome::PiiRefused(refusal) => {
-                        return Err(refusal_failure(*refusal))
-                    }
-                    engine::QueryOutcome::Ran { result, estimate } => (result, estimate),
-                };
-                // The guardrail was on but reached no verdict — the database would
-                // not plan the statement (no estimate at all), or the plan carried
-                // no number it could judge. Fail open by design (see docs/DEV.md),
-                // but never silently: the timeout and the row limit are what is left.
-                if guardrail.plans()
-                    && estimate.is_none_or(|e| guardrail.check(&e) == guardrail::Check::NoEstimate)
-                {
-                    warnings.push(guardrail_skipped_warning());
-                }
-
-                // Two ways an answer can fall short of the whole truth: nyet
-                // fetched limit+1 and cut it, or the ENGINE was cut off before
-                // it got there (MongoDB's 16 MiB reply cap stops a batch before
-                // the row limit). Either one must reach the agent as
-                // `truncated` — a partial answer that reads as complete is the
-                // worst failure a read tool has (UX-1).
-                // The server stopped early on its own (MongoDB's 16 MiB
-                // reply cap), which the row count cannot show — the answer is
-                // SHORTER than the limit and still incomplete.
-                let server_cut = rs.truncated;
-                let over_limit = rs.rows.len() as u64 > limit;
-                let truncated = over_limit || server_cut;
-                if over_limit {
-                    rs.rows
-                        .truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-                }
-                if truncated {
-                    warnings.push(output::Warning {
-                        code: "TRUNCATED",
-                        message: match over_limit {
-                            true => format!(
-                                "result truncated to {limit} rows; add WHERE/LIMIT or raise --limit"
-                            ),
-                            // Telling the agent to raise --limit here would be
-                            // wrong: the limit was never reached (Д10).
-                            false => format!(
-                                "result truncated to {} rows by the database's own reply-size \
-                                 limit (16 MiB), reached before the {limit}-row limit: there \
-                                 ARE more rows — narrow the query, project away large fields, \
-                                 or page through it",
-                                rs.rows.len()
-                            ),
-                        },
-                    });
-                }
-                // Warned for every format (json/jsonl collapse same-named keys to
-                // the last value; table/csv keep the columns but the ambiguity is
-                // still worth flagging) — so the message stays format-neutral.
-                let duplicates = duplicate_columns(&rs.columns);
-                if !duplicates.is_empty() {
-                    warnings.push(output::Warning {
-                        code: "DUPLICATE_COLUMNS",
-                        message: format!(
-                            "duplicate column name(s): {}; disambiguate with AS aliases — \
-                             in JSON/JSONL output duplicates collapse to the last value",
-                            duplicates.join(", ")
-                        ),
-                    });
-                }
-                if session.insecure_transport {
-                    warnings.push(insecure_transport_warning());
-                }
-                let meta = output::QueryMeta {
-                    row_count: rs.rows.len() as u64,
-                    truncated,
-                    duration_ms,
-                    connection: alias.clone(),
-                };
-                let (data, envelope) = match format {
-                    Format::Json => (
-                        String::new(),
-                        output::query_json(&rs.columns, &rs.rows, &meta, &warnings),
-                    ),
-                    Format::Jsonl => (
-                        output::query_jsonl(&rs.columns, &rs.rows),
-                        output::query_meta_json(&meta, &warnings),
-                    ),
-                    Format::Table => (
-                        output::query_table(&rs.columns, &rs.rows),
-                        output::query_meta_json(&meta, &warnings),
-                    ),
-                    Format::Csv => (
-                        output::query_csv(&rs.columns, &rs.rows),
-                        output::query_meta_json(&meta, &warnings),
-                    ),
-                };
-                let warning_codes = warnings.iter().map(|w| w.code).collect();
-                // The data/envelope strings are built; rs is now free to MOVE
-                // into the response (log_responses only) — keeps column order,
-                // no clone. Exactly what the agent received, post-truncation.
-                let response = log_responses.then_some(audit::Response::Rows {
-                    columns: rs.columns,
-                    rows: rs.rows,
-                });
-                Ok(Emitted {
-                    data,
-                    envelope,
-                    duration_ms,
-                    row_count: Some(meta.row_count),
-                    truncated: Some(truncated),
-                    warnings: warning_codes,
-                    response,
-                })
-            })();
-            audit_finish(
-                &cfg,
-                AuditMeta {
-                    command: "query",
-                    alias: &alias,
-                    engine: &engine,
-                    cwd: &cwd_str,
-                    sql: Some(&raw_sql),
-                    table: None,
-                },
+        } => rows_command(
+            &cfg,
+            &path,
+            &cwd,
+            &allowed,
+            RowsRequest {
+                alias,
+                source: RowSource::Query(query),
                 format,
-                outcome,
-            )
-        }
+                limit,
+                timeout,
+            },
+        ),
+        Command::Sample {
+            alias,
+            table,
+            format: _,
+            limit,
+            timeout,
+        } => rows_command(
+            &cfg,
+            &path,
+            &cwd,
+            &allowed,
+            RowsRequest {
+                alias,
+                source: RowSource::Sample(table),
+                format,
+                limit,
+                timeout,
+            },
+        ),
         Command::Schema {
             alias,
             table,
@@ -1295,6 +1186,602 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
         // read), so this arm is dead — it exists only for match exhaustiveness.
         Command::AgentSetup { .. } => unreachable!("agent-setup is short-circuited above"),
     }
+}
+
+/// Where the statement of a rows-returning command comes from.
+enum RowSource {
+    /// `query`: the agent's own text, run exactly as written.
+    Query(String),
+    /// `sample`: the raw `[table]` argument. nyet writes the statement itself
+    /// (`src/sample.rs`) and then runs it as if the agent had written it —
+    /// which is the entire difference between the two commands.
+    Sample(String),
+}
+
+/// What `query` and `sample` hand to the shared pipeline.
+struct RowsRequest {
+    alias: String,
+    source: RowSource,
+    format: Format,
+    limit: Option<u64>,
+    timeout: Option<u64>,
+}
+
+/// The rows-returning pipeline, shared by `query` and `sample`: layer 1, the
+/// guardrail, the engine (net B inside `Db::execute`), the row limit, the
+/// formatters, and ONE audit record written before anything is released
+/// (UX-8).
+///
+/// `sample` differs in exactly four places, all of them here: the statement is
+/// nyet's own, its default limit is small, a guardrail refusal earns one
+/// cheaper second attempt, and the texts that would otherwise say "fix your
+/// SQL" (the `TRUNCATED` warning, the `DB_ERROR`/`TIMEOUT`/`EXPENSIVE_QUERY`
+/// hints) are rewritten for an agent that never wrote the statement.
+/// Everything else is byte-for-byte the `query` path — the point of the
+/// command is that no layer is skipped or repeated for it.
+fn rows_command(
+    cfg: &config::Config,
+    path: &Path,
+    cwd: &Path,
+    allowed: &dyn Fn(&config::Connection) -> bool,
+    req: RowsRequest,
+) -> Result<(), Failure> {
+    let RowsRequest {
+        alias,
+        source,
+        format,
+        limit,
+        timeout,
+    } = req;
+    let (conn, mut session) = open_session(cfg, path, &alias, cwd, allowed, timeout)?;
+    // Audit identity, captured before the body borrows everything.
+    let engine = conn.engine.clone();
+    let cwd_str = cwd.display().to_string();
+    let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
+    let is_sample = matches!(source, RowSource::Sample(_));
+    // Flag > per-connection > [defaults] > built-in, capped by the config
+    // owner's max_row_limit (see config::capped). `sample` brings its own small
+    // built-in and enters it at the FLAG position: a handful of rows is the
+    // whole point of the command, so a connection's `row_limit` (set for real
+    // queries) must not inflate it — while `max_row_limit` still clamps it,
+    // silently, exactly like everywhere else.
+    let limit = match is_sample {
+        true => cfg.row_limit(conn, Some(limit.unwrap_or(sample::DEFAULT_ROWS))),
+        false => cfg.row_limit(conn, limit),
+    };
+    // `max_row_limit` clamps silently, so a `sample` sitting ON the ceiling must
+    // not be told to raise `--limit` — that is the one thing that cannot work,
+    // and an agent that tries it tries it forever (Д10). Asking for the ceiling
+    // is how the ceiling is read back: without one, nothing caps u64::MAX.
+    let clamped = is_sample && limit >= cfg.row_limit(conn, Some(u64::MAX));
+    // Fetch limit+1 to detect truncation without reading everything: the
+    // statement asks for the same one row over the limit that the engine does,
+    // so `rows.len() > limit` means "there are more" and nothing else.
+    let (first, cheap) = statements(&source, &session.db, limit.saturating_add(1));
+    // What the audit record names: the statement nyet actually SENT. After a
+    // fallback that is the cheap one — the refused random draw never ran, only
+    // its EXPLAIN did. It is replaced below by the text as the database saw it;
+    // this initial value is what a statement that never ran is logged as.
+    let mut executed = first.clone();
+    // The ssh forward, opened by whichever attempt gets past the validator and
+    // held until this function returns: a fallback must not tear the tunnel
+    // down and build it again (with `reuse_forward = false` that is a second
+    // bastion login, 2FA included) to ask the same connection one more question.
+    let mut tunnel = None;
+    // The whole command as ONE Result so both success and every failure path
+    // (validator/guardrail refusal, DB error) flow through audit_finish — the
+    // log is written before the result is released.
+    let outcome = (|| -> Result<Emitted, Failure> {
+        let started = Instant::now();
+        let mut attempt = run_attempt(path, &alias, conn, &mut session, &mut tunnel, &first, limit);
+        // A refused attempt keeps no duration of its own (a `Failure` carries
+        // none), so the wall time of this one is taken here — it is only ever
+        // read on the fallback path below.
+        let first_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // The ONE thing `sample` retries. A guardrail refusal here is about the
+        // random ORDER BY (sorting the whole table), not about the table, so
+        // nyet asks the cheap question instead of handing the agent a refusal
+        // it did not cause and cannot fix. Every other outcome — a PII refusal,
+        // a DB error, a timeout — IS the answer, and a retry would only repeat
+        // it; a fallback that is refused too is likewise final (no third try).
+        // The retry is a full second pass over the same open tunnel — but NOT
+        // over a fresh timeout: the two passes share the one budget the config
+        // owner granted, or `sample` would be handing itself twice the ceiling
+        // nobody else can raise.
+        let expensive =
+            matches!(&attempt, Err(f) if matches!(f.code, ErrorCode::Nyet("EXPENSIVE_QUERY")));
+        let mut fell_back = false;
+        if expensive {
+            if let (Some(cheap), Some(left)) =
+                (&cheap, fallback_budget_ms(session.timeout_secs, first_ms))
+            {
+                session.db.set_query_timeout_ms(left);
+                executed = cheap.clone();
+                attempt = run_attempt(path, &alias, conn, &mut session, &mut tunnel, cheap, limit);
+                fell_back = true;
+            }
+        }
+        let attempt = attempt.map_err(|f| match is_sample {
+            true => sample_failure_hint(
+                f,
+                &SampleFailure {
+                    alias: &alias,
+                    engine: &engine,
+                    fell_back,
+                    withheld: session.redact_db_errors(),
+                },
+            ),
+            false => f,
+        })?;
+        let Attempt {
+            rows: mut rs,
+            mut warnings,
+            sql: sent,
+            mut duration_ms,
+        } = attempt;
+        // The text that actually reached the database — the validator's Unicode
+        // normalization included, since a name with hidden characters is sent
+        // stripped. The raw ask is not lost: it is the audit record's `table`.
+        if is_sample {
+            executed = sent;
+        }
+        if fell_back {
+            // The refused draw cost real time (its EXPLAIN ran to a verdict, or
+            // to the planning budget); reporting only the second pass would
+            // hide most of the wait from the agent AND from the audit log.
+            duration_ms = duration_ms.saturating_add(first_ms);
+            // The suggestion is the very draw that was refused, spelled with
+            // the agent's own limit (no truncation probe row) so it can be run
+            // as printed.
+            let suggestion = statements(&source, &session.db, limit).0;
+            warnings.insert(0, sample_fallback_warning(&alias, &suggestion));
+        }
+
+        // Two ways an answer can fall short of the whole truth: nyet
+        // fetched limit+1 and cut it, or the ENGINE was cut off before
+        // it got there (MongoDB's 16 MiB reply cap stops a batch before
+        // the row limit). Either one must reach the agent as
+        // `truncated` — a partial answer that reads as complete is the
+        // worst failure a read tool has (UX-1).
+        // The server stopped early on its own (MongoDB's 16 MiB
+        // reply cap), which the row count cannot show — the answer is
+        // SHORTER than the limit and still incomplete.
+        let server_cut = rs.truncated;
+        let over_limit = rs.rows.len() as u64 > limit;
+        let truncated = over_limit || server_cut;
+        if over_limit {
+            rs.rows
+                .truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        if truncated {
+            warnings.push(output::Warning {
+                code: "TRUNCATED",
+                message: match (over_limit, is_sample) {
+                    // `sample` wrote the statement, so "add WHERE/LIMIT" would
+                    // be advice about SQL the agent never saw (Д10): the two
+                    // things it can actually do are ask for more rows, or go
+                    // read the table itself. Unless the ceiling already cut the
+                    // ask — then "raise --limit" is the one advice that cannot
+                    // work, and saying it sends the agent round the loop again.
+                    (true, true) if clamped => format!(
+                        "this is a sample of {limit} rows, not the table: there ARE more rows, \
+                         and {limit} is the max_row_limit the owner of this connection set — a \
+                         bigger --limit returns no more. To read further, say what you need \
+                         with nyet query {} \"<your own SELECT>\"",
+                        skill::shell_quote(&alias)
+                    ),
+                    (true, true) => format!(
+                        "this is a sample of {limit} rows, not the table: there ARE more rows \
+                         — raise --limit for a bigger sample, or read the table itself with \
+                         nyet query {} \"<your own SELECT>\"",
+                        skill::shell_quote(&alias)
+                    ),
+                    (true, false) => format!(
+                        "result truncated to {limit} rows; add WHERE/LIMIT or raise --limit"
+                    ),
+                    // The rows are big, not many — so "narrow the query" is
+                    // again advice about a statement the agent never wrote
+                    // (Д10); what it holds is a SMALLER --limit and the choice
+                    // of fields.
+                    (false, true) => format!(
+                        "the database cut this answer off at {} rows on its own reply-size \
+                         limit (16 MiB) — these rows are large, and there ARE more in the \
+                         table. Ask for fewer (--limit N), or take only the fields you need \
+                         with nyet query {} \"<your own query, projecting the fields>\"",
+                        rs.rows.len(),
+                        skill::shell_quote(&alias)
+                    ),
+                    // Telling the agent to raise --limit here would be
+                    // wrong: the limit was never reached (Д10).
+                    (false, false) => format!(
+                        "result truncated to {} rows by the database's own reply-size \
+                         limit (16 MiB), reached before the {limit}-row limit: there \
+                         ARE more rows — narrow the query, project away large fields, \
+                         or page through it",
+                        rs.rows.len()
+                    ),
+                },
+            });
+        }
+        // Warned for every format (json/jsonl collapse same-named keys to
+        // the last value; table/csv keep the columns but the ambiguity is
+        // still worth flagging) — so the message stays format-neutral.
+        let duplicates = duplicate_columns(&rs.columns);
+        if !duplicates.is_empty() {
+            warnings.push(output::Warning {
+                code: "DUPLICATE_COLUMNS",
+                message: format!(
+                    "duplicate column name(s): {}; disambiguate with AS aliases — \
+                     in JSON/JSONL output duplicates collapse to the last value",
+                    duplicates.join(", ")
+                ),
+            });
+        }
+        if session.insecure_transport {
+            warnings.push(insecure_transport_warning());
+        }
+        let meta = output::QueryMeta {
+            row_count: rs.rows.len() as u64,
+            truncated,
+            duration_ms,
+            connection: alias.clone(),
+        };
+        let (data, envelope) = match format {
+            Format::Json => (
+                String::new(),
+                output::query_json(&rs.columns, &rs.rows, &meta, &warnings),
+            ),
+            Format::Jsonl => (
+                output::query_jsonl(&rs.columns, &rs.rows),
+                output::query_meta_json(&meta, &warnings),
+            ),
+            Format::Table => (
+                output::query_table(&rs.columns, &rs.rows),
+                output::query_meta_json(&meta, &warnings),
+            ),
+            Format::Csv => (
+                output::query_csv(&rs.columns, &rs.rows),
+                output::query_meta_json(&meta, &warnings),
+            ),
+        };
+        let warning_codes = warnings.iter().map(|w| w.code).collect();
+        // The data/envelope strings are built; rs is now free to MOVE
+        // into the response (log_responses only) — keeps column order,
+        // no clone. Exactly what the agent received, post-truncation.
+        let response = log_responses.then_some(audit::Response::Rows {
+            columns: rs.columns,
+            rows: rs.rows,
+        });
+        Ok(Emitted {
+            data,
+            envelope,
+            duration_ms,
+            row_count: Some(meta.row_count),
+            truncated: Some(truncated),
+            warnings: warning_codes,
+            response,
+        })
+    })();
+    let (command, table) = match &source {
+        RowSource::Query(_) => ("query", None),
+        // The RAW argument, not the statement built from it: the human reading
+        // the log wants to see what the agent asked for.
+        RowSource::Sample(table) => ("sample", Some(table.as_str())),
+    };
+    audit_finish(
+        cfg,
+        AuditMeta {
+            command,
+            alias: &alias,
+            engine: &engine,
+            cwd: &cwd_str,
+            sql: Some(&executed),
+            table,
+        },
+        format,
+        outcome,
+    )
+}
+
+/// What one pass of the pipeline produced. The guardrail's own verdicts are
+/// already spent by the time this exists — a refusal is an `Err`, not a field.
+struct Attempt {
+    rows: engine::ResultSet,
+    warnings: Vec<output::Warning>,
+    /// The text as the database saw it — the validator's normalization applied
+    /// — so the audit log can name what actually ran rather than what was built.
+    sql: String,
+    duration_ms: u64,
+}
+
+/// One full pass over ONE statement: layer 1, the guardrail, the engine (net B
+/// lives inside `Db::execute`). Every refusal on the way comes back as a
+/// `Failure`, and the caller decides whether that is the answer or — for
+/// `sample`'s cheap retry — grounds for one more pass.
+fn run_attempt(
+    path: &Path,
+    alias: &str,
+    conn: &config::Connection,
+    session: &mut Session,
+    tunnel: &mut Option<tunnel::Tunnel>,
+    sql: &str,
+    limit: u64,
+) -> Result<Attempt, Failure> {
+    // Layer 1. Any deny -> code NYET + reason, exit 5. Which layer 1
+    // runs is decided by the engine: MongoDB has its own parser and
+    // allowlist (mongosh text is not SQL and sqlparser must never
+    // see it), everything else goes through the SQL validator.
+    let (sql, is_query, mut warnings, pii_exempt) = match session.db.is_mongo() {
+        true => validate_mongo(sql, session.policy.pii())?,
+        false => validate(sql, &session.policy)?,
+    };
+    // Layer 1.5: the guardrail. Only a plain query can be wrapped in an
+    // EXPLAIN; SHOW/DESCRIBE are metadata no planner estimates, so they
+    // run unguarded (documented). An EXPLAIN ANALYZE never gets here —
+    // the validator refuses it (reason EXPLAIN_ANALYZE).
+    let guardrail = match is_query {
+        true => config::guardrail(alias, conn).map_err(|e| config_failure(e, path))?,
+        false => guardrail::Guardrail::OFF,
+    };
+    // The tunnel is opened AFTER the validator (a refused query exits 5
+    // without paying for ssh); the guard is the CALLER's, and lives across a
+    // fallback retry, so the second pass finds it already open. What its drop
+    // does (keep the forward for the next run or remove it) is tunnel.rs's
+    // business.
+    // Fetch limit+1 to detect truncation without reading everything.
+    if tunnel.is_none() {
+        *tunnel = open_tunnel(conn, session.timeout_secs, &mut session.db)?;
+    }
+    let ((outcome, masked), duration_ms) = run_db(
+        session.redact_db_errors(),
+        session.db.execute(
+            &sql,
+            limit.saturating_add(1),
+            &guardrail,
+            session.policy.pii(),
+            &pii_exempt,
+        ),
+    )?;
+    if !masked.is_empty() {
+        warnings.push(pii_masked_warning(&masked));
+    }
+
+    let (rows, estimate) = match outcome {
+        // The guardrail refused: nothing ran, and the envelope carries
+        // the plan that justified it (NYET/EXPENSIVE_QUERY, exit 5).
+        engine::QueryOutcome::Refused { estimate, value } => {
+            let (message, hint) = guardrail.refusal(alias, value);
+            return Err(Failure {
+                code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
+                message,
+                hint,
+                estimate: Some(Box::new(guardrail.describe(estimate))),
+            });
+        }
+        // Planning itself outran the guardrail's budget. Fail closed:
+        // planning time is agent-controllable, so "no plan in time" must
+        // not be a way to switch the guard off. Same reason code — the
+        // verdict is the same, only the evidence differs.
+        engine::QueryOutcome::PlanTooSlow { budget_ms } => {
+            let (message, hint) = guardrail::planning_too_slow(alias, budget_ms);
+            return Err(Failure {
+                code: ErrorCode::Nyet("EXPENSIVE_QUERY"),
+                message,
+                hint,
+                estimate: None,
+            });
+        }
+        // Net B refused the result: the rows exist but are never
+        // formatted, logged or emitted (the check runs inside
+        // Db::execute, before this match).
+        engine::QueryOutcome::PiiRefused(refusal) => return Err(refusal_failure(*refusal)),
+        engine::QueryOutcome::Ran { result, estimate } => (result, estimate),
+    };
+    // The guardrail was on but reached no verdict — the database would
+    // not plan the statement (no estimate at all), or the plan carried
+    // no number it could judge. Fail open by design (see docs/DEV.md),
+    // but never silently: the timeout and the row limit are what is left.
+    if guardrail.plans()
+        && estimate.is_none_or(|e| guardrail.check(&e) == guardrail::Check::NoEstimate)
+    {
+        warnings.push(guardrail_skipped_warning());
+    }
+    Ok(Attempt {
+        rows,
+        warnings,
+        sql,
+        duration_ms,
+    })
+}
+
+/// The statement(s) to run, in attempt order. `query` has exactly one — the
+/// agent's own text. `sample` gets nyet's own: the random draw it tries first,
+/// plus the cheap `LIMIT`-only spelling to fall back on when the guardrail
+/// refuses the sort. `rows` is the FETCH count (the row limit plus the one
+/// extra row that proves truncation), so the statement asks for exactly what
+/// the engine will read.
+///
+/// A fallback exists only where a guardrail can actually fire: PostgreSQL and
+/// MySQL/MariaDB. SQLite and MongoDB accept `off` and nothing else
+/// (`guardrail::engine_modes`), so a second statement for them would be text
+/// that can never run.
+fn statements(source: &RowSource, db: &Db, rows: u64) -> (String, Option<String>) {
+    match source {
+        RowSource::Query(sql) => (sql.clone(), None),
+        RowSource::Sample(table) => match db {
+            Db::Sqlite(_) => (sample::sqlite(table, rows), None),
+            Db::Postgres(_) => (
+                sample::postgres(table, rows, true),
+                Some(sample::postgres(table, rows, false)),
+            ),
+            Db::Mysql(_) => (
+                sample::mysql(table, rows, true),
+                Some(sample::mysql(table, rows, false)),
+            ),
+            Db::Mongo(_) => (sample::mongo(table, rows), None),
+        },
+    }
+}
+
+/// `sample` asked for a random draw and the guardrail refused the sort, so what
+/// came back is whatever the database returned first. The agent MUST be told
+/// (UX-2): a biased handful read as representative is precisely the wrong
+/// conclusion to take from a sample, and the way to a real random draw is a
+/// deliberate `query` — which the guardrail judges again, that time with an
+/// estimate in the refusal the agent can act on.
+///
+/// The invocation is printed to be RUN, so both arguments are shell-quoted: the
+/// statement carries `"` on PostgreSQL/SQLite and backticks on MySQL, and a
+/// backtick inside a double-quoted shell word is command substitution. A hint
+/// that cannot be pasted is a hint that lies (Д10); one that runs something
+/// else entirely is worse.
+fn sample_fallback_warning(alias: &str, suggestion: &str) -> output::Warning {
+    output::Warning {
+        code: "SAMPLE_FALLBACK",
+        message: format!(
+            "a random sample of this table was refused by this connection's guardrail as too \
+             expensive (drawing at random means sorting the whole table), so these are the \
+             FIRST rows the database returned, in its own storage order — typically the \
+             oldest or lowest-key ones. Do not read them as representative of the table. To \
+             insist on a real random draw, ask for it yourself: nyet query {} {}",
+            skill::shell_quote(alias),
+            skill::shell_quote(suggestion)
+        ),
+    }
+}
+
+/// What the `sample` texts have to know about the run that failed. The advice
+/// only holds if it names what THIS run did: which engine answered, whether the
+/// random sort was still in the statement, and whether the server's own words
+/// reached the agent at all.
+struct SampleFailure<'a> {
+    alias: &'a str,
+    /// `postgres` | `mysql` | `mariadb` | `sqlite` | `mongodb`.
+    engine: &'a str,
+    /// The guardrail refused the random draw and the plain `LIMIT` ran instead,
+    /// so the sort is no longer anything to blame.
+    fell_back: bool,
+    /// This connection's PII policy withholds the database's error text — and
+    /// with it the advice that came attached, which is about editing a
+    /// statement the agent did not write.
+    withheld: bool,
+}
+
+/// A `sample` failure is read by an agent that never wrote the statement, so
+/// every hint that says "narrow your query" is a dead end here (Д10): what the
+/// agent actually chose is the NAME, `--limit`, `--timeout` — and the option of
+/// writing the query itself. Only the outcomes it can act on are rewritten, and
+/// the original hint is KEPT wherever it still carries something these texts
+/// cannot know: a permission error's own advice, the guardrail's config key.
+fn sample_failure_hint(mut f: Failure, ctx: &SampleFailure) -> Failure {
+    let alias = skill::shell_quote(ctx.alias);
+    match f.code {
+        // A name is the likeliest cause and the cheapest to check, but it is
+        // not the only one: "permission denied" arrives here too, and sending
+        // that agent renaming tables costs it the whole recovery.
+        ErrorCode::DbError => {
+            // Only PostgreSQL has a search_path to fall outside of; on the
+            // others the argument is one name and qualifying it is nonsense.
+            let qualify = match ctx.engine {
+                "postgres" => " (qualify it as schema.table when it is outside the search_path)",
+                _ => "",
+            };
+            // MongoDB has no tables or views to list, and telling an agent to
+            // look for one is a hint about somebody else's database.
+            let objects = match ctx.engine {
+                "mongodb" => "collections",
+                _ => "tables and views",
+            };
+            // The withheld hint's own advice — check the schema, simplify the
+            // query clause by clause — is either already said here or about a
+            // statement nyet wrote; what still holds is that the SCHEMA is not
+            // withheld, and that the real message is in the server's log.
+            let otherwise = match ctx.withheld {
+                true => "this connection's PII policy withheld the database's own message \
+                         (types and column names are not withheld, so `nyet schema` still \
+                         answers in full), and the full error text is in the database's log \
+                         — ask whoever owns this connection for it"
+                    .to_string(),
+                false => f.hint.clone(),
+            };
+            f.hint = format!(
+                "check the name first: nyet schema {alias} lists the {objects} this \
+                 connection can read{qualify}. If the name is right, the failure is about \
+                 something else — {otherwise}"
+            );
+        }
+        // The statement is nyet's own, so "add a WHERE clause" would be about
+        // text the agent has never seen; what it holds are the two flags.
+        ErrorCode::Timeout => {
+            let cause = match ctx.fell_back {
+                // The sort was already refused by the guardrail — what timed
+                // out is a plain read, and blaming the sort would send the
+                // agent after something that did not run. The seconds in the
+                // engine's own message are the REMAINDER this second attempt
+                // ran on, not the timeout anyone configured (both attempts
+                // share one budget), so say that rather than let the number
+                // read as the connection's setting.
+                true => {
+                    "the random draw was refused as too expensive and even a plain read of \
+                         this table did not finish in what the refused attempt left of the \
+                         timeout (both attempts of a sample share one budget)"
+                }
+                false => "a random draw sorts the whole table, which is what takes the time",
+            };
+            f.hint = format!(
+                "{cause}: ask for fewer rows (--limit N), give it longer (--timeout SECS), \
+                 or read the table on your own terms with a filtered nyet query {alias} \
+                 \"<your own SELECT>\""
+            );
+        }
+        ErrorCode::Nyet("EXPENSIVE_QUERY") => {
+            let what = match ctx.fell_back {
+                true => {
+                    "nyet already retried without the random sort and the guardrail \
+                         refused that too, so a plain read of this table is what it considers \
+                         expensive"
+                }
+                // No retry happened: either the engine has no cheaper spelling,
+                // or the first attempt had already spent the timeout budget.
+                false => {
+                    "this connection's guardrail refused the random draw, which has to \
+                          sort the whole table"
+                }
+            };
+            // The guardrail's own hint already says HOW to narrow a query (and
+            // names the plan and the config key); this only has to say that
+            // writing one is the way out of a command that cannot.
+            f.hint = format!(
+                "{what}, and nyet sample has no narrower form to offer — write the read \
+                 yourself: nyet query {alias} \"<your own SELECT>\", and {}",
+                f.hint
+            );
+        }
+        // The likeliest refusal of all: `sample` is a `SELECT *`, which a
+        // protected column refuses in BOTH modes. Every hint on that road says
+        // "name the columns instead" — true, and impossible with this command.
+        ErrorCode::Nyet("PII_COLUMN" | "PII_UNPROVABLE") => {
+            f.hint = format!(
+                "{} — and nyet sample cannot do that for you: it always writes SELECT *. Name \
+                 the columns yourself: nyet query {alias} \"SELECT <the columns you need> FROM \
+                 <table> LIMIT 10\"",
+                f.hint.trim_end_matches('.')
+            );
+        }
+        _ => {}
+    }
+    f
+}
+
+/// How long `sample`'s second pass may take: what is LEFT of the one budget the
+/// config owner granted, never a fresh one — an agent that cannot raise its own
+/// timeout must not get two of them by being refused once. `None` when what
+/// remains is under a second, which is both useless and below the floor the
+/// engines' own EXPLAIN budget assumes: then the guardrail's refusal stands as
+/// the answer, hint included.
+fn fallback_budget_ms(timeout_secs: u64, spent_ms: u64) -> Option<u64> {
+    let left = timeout_secs.saturating_mul(1000).saturating_sub(spent_ms);
+    (left >= 1000).then_some(left)
 }
 
 /// Generate the SKILL.md and emit it (DESIGN §1 stream routing). Markdown is a
@@ -1692,10 +2179,9 @@ fn build_engine(
                 Db::Postgres(engine::Postgres {
                     url: url.clone(),
                     password,
-                    // Postgres rejects statement_timeout > INT_MAX ms
-                    // at connect; clamp so a huge timeout_secs still
-                    // connects. i32::MAX ms is ~24.8 days.
-                    statement_timeout_ms: timeout_secs.saturating_mul(1000).min(i32::MAX as u64),
+                    statement_timeout_ms: engine::Postgres::clamp_statement_timeout(
+                        timeout_secs.saturating_mul(1000),
+                    ),
                     // The in-process query-phase deadline (unclamped): the
                     // full per-query wall budget, backstopping the server
                     // statement_timeout above.
@@ -1732,9 +2218,9 @@ fn build_engine(
                 Db::Mysql(engine::Mysql {
                     url: url.clone(),
                     password,
-                    // Clamp to u32::MAX ms so a huge timeout_secs stays
-                    // within MySQL's max_execution_time range.
-                    statement_timeout_ms: timeout_secs.saturating_mul(1000).min(u32::MAX as u64),
+                    statement_timeout_ms: engine::Mysql::clamp_statement_timeout(
+                        timeout_secs.saturating_mul(1000),
+                    ),
                     // The in-process query-phase deadline (unclamped): the
                     // full per-query wall budget, backstopping the server
                     // max_execution_time/max_statement_time above.
@@ -1915,7 +2401,7 @@ fn command_format_flag(command: &Command) -> Option<Format> {
         Command::Schema { format, .. }
         | Command::Explain { format, .. }
         | Command::Doctor { format, .. } => format.map(PlainFormat::as_format),
-        Command::Query { format, .. } => *format,
+        Command::Query { format, .. } | Command::Sample { format, .. } => *format,
         // agent-setup has its own format enum and sets its routing itself; the
         // value here is unused (it short-circuits run() before any error path).
         Command::AgentSetup { .. } => None,
@@ -2421,5 +2907,301 @@ mod tests {
         let f = output_write_failure(io::Error::from(io::ErrorKind::Other));
         assert_eq!(f.code.exit(), 1);
         assert!(!f.hint.is_empty());
+    }
+
+    /// Ask a REAL shell to split the tail of a printed invocation into words.
+    /// Nothing weaker proves the claim: the danger is precisely what `sh` does
+    /// to a string nyet composed (`` ` ``, `$( )`, quote stripping), so `sh`
+    /// has to be the judge.
+    #[cfg(unix)]
+    fn shell_words(command: &str) -> Vec<String> {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "for w in {command}; do printf '%s\\n' \"$w\"; done"
+            ))
+            .output()
+            .expect("sh");
+        assert!(out.status.success(), "sh refused: {command}");
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The `SAMPLE_FALLBACK` warning prints an invocation to be RUN, and both of
+    /// its arguments are agent-influenced: the alias comes from the config, the
+    /// statement embeds the `<table>` argument. A shell must read them back as
+    /// exactly two words — the table name is nyet's own quoting all the way to
+    /// the database, and a paste that runs `$(...)` on the human's machine is
+    /// the injection that skipped the database entirely.
+    #[cfg(unix)]
+    #[test]
+    fn the_fallback_suggestion_survives_a_real_shell_verbatim() {
+        for table in [
+            "users",
+            "we`ird",
+            "$(touch /tmp/nyet_pwned)",
+            "`touch /tmp/nyet_pwned`",
+            r#"we"ird"#,
+            "two words",
+            "it's",
+            "a;b|c&d",
+        ] {
+            for suggestion in [
+                sample::sqlite(table, 10),
+                sample::postgres(table, 10, true),
+                sample::mysql(table, 10, true),
+            ] {
+                let w = sample_fallback_warning("prod db", &suggestion);
+                let (_, command) = w.message.rsplit_once("nyet query ").expect("the example");
+                assert_eq!(
+                    shell_words(&format!("nyet query {command}")),
+                    vec![
+                        "nyet".to_string(),
+                        "query".to_string(),
+                        "prod db".to_string(),
+                        suggestion.clone()
+                    ],
+                    "{suggestion}"
+                );
+            }
+        }
+    }
+
+    /// The `sample` run these tests describe unless they say otherwise: a
+    /// PostgreSQL connection that answered in full, on its first attempt.
+    fn pg_sample() -> SampleFailure<'static> {
+        SampleFailure {
+            alias: "prod",
+            engine: "postgres",
+            fell_back: false,
+            withheld: false,
+        }
+    }
+
+    /// Д10: the hint of a `sample` failure must point at something the agent can
+    /// do — and must not throw away what the original hint knew. The withheld
+    /// database error is the case that matters: its hint is the ONLY place the
+    /// agent learns the real message is in the server's log.
+    #[test]
+    fn a_sample_failure_keeps_the_original_hint_and_adds_its_own() {
+        let withheld = sample_failure_hint(
+            db_error_withheld(),
+            &SampleFailure {
+                withheld: true,
+                ..pg_sample()
+            },
+        );
+        assert!(
+            withheld.hint.contains("nyet schema prod"),
+            "{}",
+            withheld.hint
+        );
+        assert!(
+            withheld.hint.contains("the database's log"),
+            "{}",
+            withheld.hint
+        );
+        // ...and the other half of what the withheld hint knew: the schema is
+        // not part of the secret, so `nyet schema` is still worth running.
+        assert!(
+            withheld.hint.contains("types and column names"),
+            "{}",
+            withheld.hint
+        );
+        // ...without the withheld hint's own advice, which repeats the schema
+        // instruction (with an unsubstituted alias) and talks about editing a
+        // statement nyet wrote.
+        assert!(
+            !withheld.hint.contains("<alias>") && !withheld.hint.contains("one clause at a time"),
+            "{}",
+            withheld.hint
+        );
+        // A server that DID speak keeps its own words — "permission denied" is
+        // not a misspelled table.
+        let spoke = sample_failure_hint(
+            Failure::new(ErrorCode::DbError, "permission denied", "ask for a GRANT"),
+            &pg_sample(),
+        );
+        assert!(spoke.hint.contains("ask for a GRANT"), "{}", spoke.hint);
+        // The search_path belongs to PostgreSQL alone.
+        assert!(spoke.hint.contains("search_path"), "{}", spoke.hint);
+        // ...and so does the vocabulary: MongoDB has collections, not tables.
+        for (engine, objects) in [
+            ("sqlite", "tables and views"),
+            ("mysql", "tables and views"),
+            ("mariadb", "tables and views"),
+            ("mongodb", "collections"),
+        ] {
+            let f = sample_failure_hint(
+                Failure::new(ErrorCode::DbError, "m", "h"),
+                &SampleFailure {
+                    engine,
+                    ..pg_sample()
+                },
+            );
+            assert!(!f.hint.contains("search_path"), "{engine}: {}", f.hint);
+            assert!(f.hint.contains(objects), "{engine}: {}", f.hint);
+        }
+
+        // A timeout is about the flags and about writing your own query — never
+        // about editing SQL the agent never saw. And it must not blame a sort
+        // that the guardrail already refused.
+        let engine_hint = "narrow the query (WHERE / LIMIT)";
+        let timeout = sample_failure_hint(
+            Failure::new(ErrorCode::Timeout, "m", engine_hint),
+            &pg_sample(),
+        );
+        assert!(timeout.hint.contains("--limit"), "{}", timeout.hint);
+        assert!(timeout.hint.contains("--timeout"), "{}", timeout.hint);
+        assert!(
+            !timeout.hint.contains("narrow the query"),
+            "{}",
+            timeout.hint
+        );
+        assert!(
+            timeout.hint.contains("sorts the whole table"),
+            "{}",
+            timeout.hint
+        );
+        let after_fallback = sample_failure_hint(
+            Failure::new(ErrorCode::Timeout, "m", engine_hint),
+            &SampleFailure {
+                fell_back: true,
+                ..pg_sample()
+            },
+        );
+        assert!(
+            !after_fallback.hint.contains("sorts the whole table"),
+            "{}",
+            after_fallback.hint
+        );
+        assert!(
+            after_fallback.hint.contains("plain read"),
+            "{}",
+            after_fallback.hint
+        );
+        // The engine's message names the REMAINDER the retry ran on; the hint
+        // has to say so, or that number reads as the configured timeout.
+        assert!(
+            after_fallback.hint.contains("share one budget"),
+            "{}",
+            after_fallback.hint
+        );
+
+        let refused = sample_failure_hint(
+            Failure::new(ErrorCode::Nyet("EXPENSIVE_QUERY"), "m", "raise max_cost"),
+            &SampleFailure {
+                fell_back: true,
+                ..pg_sample()
+            },
+        );
+        assert!(refused.hint.contains("nyet query prod"), "{}", refused.hint);
+        assert!(refused.hint.contains("raise max_cost"), "{}", refused.hint);
+        // No retry ran (no budget left, or no cheaper spelling): claiming one
+        // did would be a lie about what happened.
+        let no_retry = sample_failure_hint(
+            Failure::new(ErrorCode::Nyet("EXPENSIVE_QUERY"), "m", "raise max_cost"),
+            &pg_sample(),
+        );
+        assert!(
+            !no_retry.hint.contains("already retried"),
+            "{}",
+            no_retry.hint
+        );
+
+        // The likeliest refusal of all: SELECT * over a protected column. Every
+        // PII hint says "name the columns instead", which `sample` cannot do.
+        for reason in ["PII_COLUMN", "PII_UNPROVABLE"] {
+            let pii = sample_failure_hint(
+                Failure::new(ErrorCode::Nyet(reason), "m", "select the other columns."),
+                &pg_sample(),
+            );
+            assert!(pii.hint.contains("select the other columns"), "{reason}");
+            assert!(
+                pii.hint.contains("nyet query prod"),
+                "{reason}: {}",
+                pii.hint
+            );
+        }
+    }
+
+    /// One budget for the whole `sample`, not one per attempt: the fallback gets
+    /// what the refused draw left, and nothing at all when that is under a
+    /// second.
+    #[test]
+    fn the_fallback_runs_on_what_is_left_of_the_owners_timeout() {
+        assert_eq!(fallback_budget_ms(30, 0), Some(30_000));
+        assert_eq!(fallback_budget_ms(30, 4_500), Some(25_500));
+        assert_eq!(fallback_budget_ms(5, 4_000), Some(1_000));
+        // Under a second left -> no second attempt at all.
+        assert_eq!(fallback_budget_ms(5, 4_001), None);
+        assert_eq!(fallback_budget_ms(5, 9_999), None);
+        assert_eq!(fallback_budget_ms(1, 0), Some(1_000));
+        // Neither end overflows. The budget stays the honest wall clock — what
+        // a SERVER will accept as its own timeout is clamped where it is
+        // applied, not here (see the test below).
+        assert_eq!(fallback_budget_ms(u64::MAX, 0), Some(u64::MAX));
+        assert_eq!(fallback_budget_ms(1, u64::MAX), None);
+    }
+
+    /// Shrinking the budget must not smuggle a value the server rejects: a
+    /// `statement_timeout` past INT_MAX makes PostgreSQL refuse the CONNECT, so
+    /// the retry would fail to reach the database at all — a worse answer than
+    /// the refusal it was retrying. The clamps live with the engines, so both
+    /// the build and this path get them.
+    #[test]
+    fn shrinking_the_budget_keeps_each_engine_inside_what_it_accepts() {
+        // Past both ceilings (`--timeout 5000000` reaches exactly this).
+        let huge = 5_000_000_000_u64;
+        let mut pg = Db::Postgres(engine::Postgres {
+            url: String::new(),
+            password: None,
+            statement_timeout_ms: 0,
+            query_timeout_ms: 0,
+            host_override: None,
+            connect_timeout_ms: None,
+            resolve_column_origins: false,
+        });
+        pg.set_query_timeout_ms(huge);
+        let Db::Postgres(pg) = &pg else {
+            unreachable!()
+        };
+        assert_eq!(pg.statement_timeout_ms, i32::MAX as u64);
+        // The in-process deadline is nobody's protocol field: it keeps the
+        // whole budget, and backstops the clamped server one.
+        assert_eq!(pg.query_timeout_ms, huge);
+
+        let mut my = Db::Mysql(engine::Mysql {
+            url: String::new(),
+            password: None,
+            statement_timeout_ms: 0,
+            query_timeout_ms: 0,
+            host_override: None,
+            connect_timeout_ms: None,
+            mariadb: false,
+        });
+        my.set_query_timeout_ms(huge);
+        let Db::Mysql(my) = &my else { unreachable!() };
+        assert_eq!(my.statement_timeout_ms, u32::MAX as u64);
+        assert_eq!(my.query_timeout_ms, huge);
+
+        // A budget under the ceilings passes through untouched.
+        let mut pg = Db::Postgres(engine::Postgres {
+            url: String::new(),
+            password: None,
+            statement_timeout_ms: 0,
+            query_timeout_ms: 0,
+            host_override: None,
+            connect_timeout_ms: None,
+            resolve_column_origins: false,
+        });
+        pg.set_query_timeout_ms(25_500);
+        let Db::Postgres(pg) = &pg else {
+            unreachable!()
+        };
+        assert_eq!(pg.statement_timeout_ms, 25_500);
     }
 }

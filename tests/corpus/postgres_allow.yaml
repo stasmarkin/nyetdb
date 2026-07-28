@@ -90,3 +90,8 @@
 # derived table (subquery in FROM) with a plain read -> allowed
 - query: SELECT * FROM (SELECT id FROM users) d
   verdict: allow
+# the statement `nyet sample` writes for PostgreSQL (src/sample.rs), qualified
+# form included: it goes down the ordinary query path, so the validator must
+# keep accepting it
+- query: SELECT * FROM "sales"."orders" ORDER BY random() LIMIT 11
+  verdict: allow

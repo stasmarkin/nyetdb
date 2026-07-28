@@ -35,6 +35,9 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MongoDB.
   `BEGIN READ ONLY`; MySQL/MariaDB an explicit `START TRANSACTION READ ONLY` +
   a server-side `max_execution_time`/`max_statement_time`), row limit, timeout,
   json / jsonl / csv / table output;
+- `nyet sample <alias> <table>`: a few rows of one table (random draw, 10 by
+  default) — sugar over `nyet query`, running the statement nyet writes through
+  the same validator, guardrail, PII policy and audit log (see below);
 - **SSH tunnels** for PostgreSQL and MySQL/MariaDB: reach a database behind a
   bastion by shelling out to the system `ssh` (see the SSH tunnels section below);
 - `nyet explain` and the **auto-guardrail**: the query plan, a cost estimate and
@@ -503,6 +506,12 @@ nyet query prod "SELECT * FROM orders WHERE uid IN (SELECT id FROM users)"
 nyet query prod "SELECT o.* FROM orders o JOIN users u ON u.id = o.uid"
 ```
 
+`nyet sample <alias> <table>` is a `SELECT *` of that table, so on a protected
+one it is refused by this very rule — in `deny` **and** in `mask` (see below):
+name the columns you want with `nyet query` instead. On MongoDB there is no
+wildcard to refuse, so a sample runs and the documents are judged on the way
+back: refused under `deny`, `[REDACTED]` under `mask`.
+
 A wildcard is judged against **its own source**: the last two are fine because
 `*` and `o.*` expand `orders`, which carries no rules — reading a protected
 table elsewhere in the statement does not make them unsafe. The same proof
@@ -523,7 +532,7 @@ Refusals are deliberately wider than that in two places, both fail-closed:
 
 **Database errors are withheld.** On a connection with a PII policy, `nyet`
 never passes the raw text of an error the DATABASE raised while running a
-statement — in `query`, `schema`, `explain` and `doctor` alike: PostgreSQL and MySQL
+statement — in `query`, `sample`, `schema`, `explain` and `doctor` alike: PostgreSQL and MySQL
 quote the offending **cell value** in their messages (`invalid input syntax for
 type integer: "alice@example.com"`), which is an exfiltration channel one cell
 per query that no filter on the result can see. The whole message is replaced by
@@ -873,6 +882,7 @@ Rules:
 nyet list                  # connections available from the current directory
 nyet list --format table   # human-friendly table (envelope goes to stderr)
 nyet schema <alias> [table] [--format json|table]
+nyet sample <alias> <table> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
 nyet explain <alias> <sql> [--format json|table]
 nyet query <alias> <sql> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
 nyet doctor [alias] [--format json|table]
@@ -1312,6 +1322,57 @@ users table
   index users_org_idx (org_id)
   fk (org_id) -> orgs (id)
 ```
+
+### nyet sample
+
+```sh
+nyet sample <alias> <table> [--limit N] [--timeout SECS] [--format json|jsonl|table|csv]
+```
+
+A few rows of one table, to see what the data actually looks like — the question
+that follows `nyet schema` (which tells you the columns, never the values).
+
+```sh
+$ nyet sample localdev users --limit 2
+{"v":1,"ok":true,"rows":[{"id":17,"email":"d@e.f"},{"id":3,"email":"a@b.c"}],"meta":{"row_count":2,"truncated":true,"duration_ms":4,"connection":"localdev"},"warnings":[{"code":"TRUNCATED","message":"this is a sample of 2 rows, not the table: ..."}]}
+```
+
+It is **sugar over `nyet query`**: nyet writes the statement (a random draw of
+10 rows by default; `--limit N`, up to 1000000, for more — past that, ask for
+what you want with `nyet query`) and runs it through exactly the same
+pipeline — the validator, the guardrail, your `[pii]` policy, the row limit, the
+audit log. Nothing is relaxed for nyet's own SQL, so `sample` can never see a
+row a `query` could not. The answer is the ordinary `query` envelope.
+
+The draw is **random**, because the first ten rows of a table are not a sample
+of it. A random draw has to sort the whole table, though, so on a big one the
+guardrail refuses it — and then nyet retries once with the first N rows instead
+(inside what is left of the connection's timeout: the two attempts share one
+budget, so a sample never costs more time than a query would) and says so:
+
+```json
+{"code":"SAMPLE_FALLBACK","message":"a random sample of this table was refused by this connection's guardrail as too expensive (drawing at random means sorting the whole table), so these are the FIRST rows the database returned, in its own storage order — typically the oldest or lowest-key ones. Do not read them as representative of the table. To insist on a real random draw, ask for it yourself: nyet query prod ..."}
+```
+
+Only that one refusal is retried. A PII refusal, a database error, a timeout —
+those are the answer, with a hint written for someone who did not write the
+statement: which flag to reach for, or the `nyet query` to write instead. (On
+MySQL/MariaDB the guardrail counts estimated ROWS and its estimate ignores
+`LIMIT`, so a strict `max_rows` can refuse the fallback too; that refusal
+stands, there is no third attempt and no `--force`.)
+
+Per engine: `ORDER BY RANDOM()` on SQLite, `ORDER BY random()` on PostgreSQL
+(where `<table>` may be `schema.table`, split on the first dot exactly like
+`nyet schema`), `ORDER BY RAND()` on MySQL/MariaDB, and `{$sample: {size: N}}`
+on MongoDB. The `<table>` argument is always a NAME — quoted into a single
+identifier, never spliced into SQL — so a name that does not exist is a plain
+`DB_ERROR` (exit 7) whose hint points at `nyet schema`. On MongoDB there is no
+catalog to miss: a collection that does not exist samples as **0 documents,
+exit 0**, exactly like an empty one.
+
+Because a sample is a `SELECT *`, a table with a column marked in `[pii]`
+refuses it in **both** modes, `mask` included (see "PII columns"): ask for the
+columns you want by name with `nyet query` instead.
 
 ### nyet explain
 
@@ -1811,6 +1872,9 @@ encrypted or verified; the message says how to force TLS),
 tables + views, or a MongoDB listing, which is always names-only),
 `SCHEMA_SAMPLED` (MongoDB: part of that schema answer was INFERRED from a
 sample of documents — see "MongoDB schema, explain and doctor"),
+`SAMPLE_FALLBACK` (`nyet sample`: the guardrail refused the random draw, so the
+rows are the first ones the database returned rather than a sample — see
+"nyet sample"),
 `PII_MASKED` (`[pii] mode = "mask"`: the named columns came back as
 `[REDACTED]` — see "PII columns").
 
@@ -1823,8 +1887,8 @@ corpus case first, then fixed.
 
 Letting an agent near a database is only safe if you can see afterwards what it
 did — so the audit log is part of the contract, not an optional extra (UX-8).
-Every command that reaches a database (`query`, `schema`, `explain`, and
-`doctor <alias>`) appends one JSON line to
+Every command that reaches a database (`query`, `sample`, `schema`, `explain`,
+and `doctor <alias>`) appends one JSON line to
 
 ```
 $XDG_DATA_HOME/nyet/audit.jsonl        # default: ~/.local/share/nyet/audit.jsonl
@@ -1845,9 +1909,10 @@ Example lines (one JSON object per line — a successful query, then a refusal):
 
 Fields: `audit_v` (the record-schema version, independent of the envelope `v`),
 `ts` (ISO 8601 UTC, ms), `command`, `alias`, `engine`, `cwd`, `sql`
-(query/explain — the RAW text, so a hidden-character injection is visible) or
-`table` (schema's argument), `verdict` (`ok`/`refused`/`error`), `reason` (the
-NYET reason or the `error.code`), `exit_code`, `row_count`+`truncated` (query),
+(query/explain — the RAW text, so a hidden-character injection is visible; for
+`sample`, the statement nyet wrote and sent) or `table` (the `schema`/`sample`
+argument), `verdict` (`ok`/`refused`/`error`), `reason` (the
+NYET reason or the `error.code`), `exit_code`, `row_count`+`truncated` (query/sample),
 `duration_ms`, and `warnings` (the warning codes). **Never logged: passwords,
 `password_env` values, or the connection url** — only the alias and engine, so
 an inline-password url can never leak into the log.
@@ -1918,7 +1983,7 @@ see [Audit log](#audit-log)), `NYET` (with `reason`, see above),
 `CONNECTION_FAILED`, `DB_ERROR`, `TIMEOUT`.
 Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
 `INSECURE_TRANSPORT`, `SCHEMA_TRUNCATED`, `SCHEMA_SAMPLED`,
-`GUARDRAIL_SKIPPED`, `NO_PLAN`.
+`GUARDRAIL_SKIPPED`, `NO_PLAN`, `SAMPLE_FALLBACK`, `PII_MASKED`.
 
 `nyet doctor` carries a `checks` array instead — one object per diagnostic
 (`{name, status, message, hint?}`) — and always `ok: true` (it ran; the verdicts

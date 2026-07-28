@@ -91,3 +91,7 @@
 # phantom "bypasses" (src/validator/property.rs).
 - query: SELECT (BEGIN)
   verdict: allow
+# the statement `nyet sample` writes for SQLite (src/sample.rs): it goes down
+# the ordinary query path, so the validator must keep accepting it
+- query: SELECT * FROM "users" ORDER BY RANDOM() LIMIT 11
+  verdict: allow

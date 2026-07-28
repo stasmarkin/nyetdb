@@ -16,12 +16,18 @@
 
 ```
 nyet query <alias> <query> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
+nyet sample <alias> <table> [--format json|jsonl|table|csv] [--limit N] [--timeout SECS]
 nyet list [--format json|table]
 nyet schema <alias> [table] [--format json|table]
 nyet explain <alias> <query> [--format json|table]
 nyet doctor [alias] [--format json|table]
 nyet agent-setup [--format markdown|json]
 ```
+
+`sample` — сахар над `query`: nyet сам пишет запрос (случайная выборка N строк,
+по умолчанию 10) и прогоняет его тем же конвейером. Конверт, warnings, коды
+ошибок и exit-коды — ровно как у `query`; новых кодов нет, кроме warning'а
+`SAMPLE_FALLBACK` (guardrail отказал случайной выборке — отданы первые N строк).
 
 ### Потоки
 

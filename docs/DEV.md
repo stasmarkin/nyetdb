@@ -259,6 +259,11 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 ├─ output    (src/output.rs)    — pure: values -> envelope/table strings;
 │                                 also owns the `schema` and `doctor` data
 │                                 models (the contract shapes) + their rules
+├─ sample    (src/sample.rs)    — pure: (table name, row count) -> the statement
+│                                 `nyet sample` runs, per dialect. Quoting only;
+│                                 std alone, and the text it returns is judged by
+│                                 the validator like any other (see the section
+│                                 below)
 ├─ skill     (src/skill.rs)     — pure: (instruction template + the user's
 │                                 connections) -> the `agent-setup` SKILL.md
 │                                 string; std only, no IO
@@ -653,6 +658,193 @@ state). Naming a table always returns full detail. An argument that matches
 nothing comes back as an empty table list, which the **cli** turns into
 `DB_ERROR` (exit 7) — the engines do not know the alias the message needs, and
 no new error code was introduced for it.
+
+## `nyet sample` (`src/sample.rs` builders, the shared `rows_command` in cli)
+
+`nyet sample <alias> <table>` answers the question an agent asks right after
+`nyet schema`: *what does this data actually look like?* It is **sugar over the
+`query` code path**, and that is a security decision, not a convenience one:
+nyet builds the text an agent would have written and then hands it to the
+UNCHANGED pipeline — layer 1 (`validator::validate` / `mongo::check`), the
+guardrail, `Db::execute` (net B inside it), the `limit + 1` truncation probe,
+the formatters, one `audit_finish` record. No layer is skipped for nyet's own
+SQL and none is duplicated: `query` and `sample` are literally the same function
+(`rows_command`), differing in four named places — where the statement comes
+from, the default limit, the fallback retry, and two texts written for an agent
+that never wrote the statement.
+
+The consequence worth stating: `sample` inherits every refusal. A protected
+column refuses it (it is a `SELECT *` — see the PII section), a guardrail
+refuses it, a MySQL `max_row_limit` clamps it. That is the point; a command that
+could see rows the other commands cannot would be a hole with a friendly name.
+
+### Semantics: random, with a fallback
+
+The first attempt draws at RANDOM, because the first ten rows of a table are
+never a sample of it (they are the oldest rows, or whatever the storage returns
+first) and an agent that reasons about "the data" from them reasons wrongly:
+
+| engine | first attempt | fallback |
+|---|---|---|
+| SQLite | `SELECT * FROM "t" ORDER BY RANDOM() LIMIT n+1` | none (guardrail is `off`-only) |
+| PostgreSQL | `SELECT * FROM "s"."t" ORDER BY random() LIMIT n+1` | `SELECT * FROM "s"."t" LIMIT n+1` |
+| MySQL/MariaDB | ``SELECT * FROM `t` ORDER BY RAND() LIMIT n+1`` | ``SELECT * FROM `t` LIMIT n+1`` |
+| MongoDB | `db.c.aggregate([{$sample: {size: n+1}}])` | none (guardrail is `off` by config) |
+
+A random draw sorts the whole table, so on a big one the guardrail refuses it —
+and a refusal the agent did not cause and cannot fix is the worst possible
+answer (UX-2). So **exactly one** refusal is retried: `NYET`/`EXPENSIVE_QUERY`
+(both spellings — the plan over the threshold, and planning that outran its
+budget), with the cheap `LIMIT`-only statement, and the answer carries the new
+`SAMPLE_FALLBACK` warning saying these are the FIRST rows, not a sample, plus
+the `nyet query` invocation that would insist on a real draw. Everything else —
+a PII refusal, a DB error, a timeout, a connection failure — is the answer as it
+stands. If the fallback is refused too, that refusal is final: there is no third
+attempt, and no `--force`.
+
+A cheap statement only exists where a guardrail can actually fire, so only
+PostgreSQL and MySQL/MariaDB have one: SQLite and MongoDB accept `mode = "off"`
+and nothing else (`guardrail::engine_modes`), and text that can never run is
+text nobody maintains. The retry is a second pass through the same
+`run_attempt` — same validator, same guardrail, same engine — over the SSH
+TUNNEL THE FIRST PASS OPENED: `rows_command` owns the guard for both attempts,
+because with `reuse_forward = false` dropping it in between means tearing the
+forward down and logging into the bastion again (2FA and all) to ask the same
+connection one more question. `meta.duration_ms` (and the audit record's) covers
+both passes: the refused draw ran a real EXPLAIN, sometimes to the full planning
+budget, and hiding that wait would misreport the command's cost.
+
+The two passes also SHARE one timeout. A fresh budget for the retry would let
+`sample` spend `2 × timeout_secs` on a connection whose owner said one — and an
+agent that can double its own ceiling by being refused once does not have one
+(the same reasoning as the guardrail's missing `--force`). So
+`fallback_budget_ms` hands the second pass what the first left, applied through
+`Db::set_query_timeout_ms` (server-side bound included: both engines with a
+fallback arm the server at connect time, and `execute` connects per statement —
+through `Postgres::clamp_statement_timeout` / `Mysql::clamp_statement_timeout`,
+the single owners of "how large a timeout this server will accept", so a
+`statement_timeout` past INT_MAX cannot turn the retry into a failed CONNECT).
+Under a second left, there is no second pass at all: the guardrail's refusal is
+the answer, and its hint says so honestly (`fell_back` reaches the hint texts,
+so nothing claims a retry that never ran). The wall time measured is the whole
+first attempt, tunnel included — conservative on purpose: erring toward "no
+retry" keeps the owner's ceiling, erring the other way breaks it.
+
+The statement asks for `limit + 1` rows, exactly like `Db::execute`'s fetch
+limit, so the ordinary `rows.len() > limit` check still means "there are more"
+and the ordinary `TRUNCATED` warning still fires — with a `sample`-specific
+message, because "add a WHERE clause" is advice about SQL the agent never saw.
+
+The default of 10 rows enters at the **flag** position of `Config::row_limit`:
+it beats a per-connection `row_limit` (set for real queries, and inflating a
+sample to 1000 rows would defeat the command), while `max_row_limit` still
+clamps it, silently, like everywhere else. `--limit` itself is bounded by clap
+(`1..=1_000_000`): the number is spliced into the statement nyet writes, and
+`--limit 9223372036854775807` reaching PostgreSQL as a `LIMIT` it cannot read
+is a `DB_ERROR` about text the agent never wrote. A usage error (exit 2) names
+the real mistake.
+
+### The texts, and what an agent can actually do with them
+
+Every text on this path is written for a reader who did NOT write the statement,
+which rules out most of the advice the shared paths give (Д10). `rows_command`
+rewrites the two `TRUNCATED` messages, and `sample_failure_hint` — which takes a
+`SampleFailure` describing what THIS run did (engine, whether the fallback ran,
+whether the server's words were withheld), because advice that ignores that is
+advice about some other run — rewrites four hints:
+
+- **`TRUNCATED`, row limit** — "raise `--limit`", unless the answer is already
+  sitting on the connection's `max_row_limit` (whether the ceiling cut the ask or
+  merely equals it), in which case raising it is the one thing that cannot work
+  and the message names the ceiling instead.
+- **`TRUNCATED`, server cut** — the rows are big, not many (MongoDB's 16 MiB
+  reply cap), so the lever is a SMALLER `--limit` or a query that projects the
+  fields — not "narrow the query", which `sample` cannot do.
+- **`DB_ERROR`** — the name is the likeliest cause, so the hint leads with
+  `nyet schema <alias>`, naming what that lists in the engine's own vocabulary
+  (`collections` on MongoDB) and adding the `schema.table` note only on
+  PostgreSQL, the one engine with a `search_path`; the ORIGINAL hint is kept
+  behind it, because "permission denied" arrives on this path too. On a PII
+  connection the withheld hint's own advice is replaced instead of appended — it
+  repeats the schema instruction and talks about simplifying a statement nyet
+  wrote — keeping the two parts that still hold: the schema is not withheld, and
+  the real message is in the database's log.
+- **`TIMEOUT`** — the engine's "narrow the query (WHERE / LIMIT)" is about SQL
+  the agent never saw; what it holds is `--limit`, `--timeout`, and the option
+  of writing the query itself. After a fallback the sort is no longer blamed (it
+  never ran), and the hint says the attempt ran on what was LEFT of the budget —
+  otherwise the seconds in the engine's own timeout message read as the
+  connection's setting, which nobody configured.
+- **`NYET`/`EXPENSIVE_QUERY`** — the guardrail's own hint (which names the plan
+  and the config key, and says how to narrow a query) is kept whole, so the
+  sentence in front only adds what it cannot know: whether the cheap retry was
+  already tried and refused or never ran at all, and that `sample` has no
+  narrower form of its own to offer.
+- **`NYET`/`PII_COLUMN` and `PII_UNPROVABLE`** — the likeliest refusal of all,
+  since `sample` is a `SELECT *`. Every PII hint says "name the columns
+  instead", which is exactly what this command cannot do, so the composed hint
+  names `nyet query` as the way to.
+
+The `SAMPLE_FALLBACK` warning prints a runnable `nyet query` invocation, and
+both of its arguments go through `skill::shell_quote`: the statement carries `"`
+on PostgreSQL/SQLite and backticks on MySQL, and a backtick inside a
+double-quoted shell word is command substitution — a hint that runs something
+else when pasted is worse than no hint. A unit test in `main.rs` hands the
+rendered line to a real `sh` and demands the words back verbatim, for table
+names containing `` ` ``, `$( )`, quotes and spaces.
+
+### Quoting, and why the argument is only ever a name
+
+`src/sample.rs` is pure and does one thing: turn an agent-supplied name into ONE
+identifier. `"` doubled for SQLite/PostgreSQL, `` ` `` doubled for MySQL.
+Quoting is injection-prevention code, so it exists in ONE copy: `engine`'s
+introspection calls `sample::backquote` and `sample::split_qualified` rather
+than keeping its own (the dependency points at the pure, std-only module, which
+is the direction Д2 asks for). PostgreSQL therefore splits on the FIRST dot by
+the very function `nyet schema` uses — so `nyet schema pg sales.orders`
+and `nyet sample pg sales.orders` read one argument the same way; SQLite and
+MySQL take the whole argument as one name (neither `nyet schema` nor `sample`
+accepts a database qualifier there). MongoDB gets no quoting because mongosh has
+none: a collection name that is not a plain identifier simply fails to parse and
+is refused (exit 5), which is the fail-closed answer.
+
+The unit tests pin the security claim directly: an injecting name
+(`users"; DROP TABLE x --` and friends) either fails to parse or stays one plain
+read statement — never `WRITE_OPERATION`, never `MULTI_STATEMENT`. The built
+texts also live in the golden corpus (`tests/corpus/*_allow.yaml`), so a future
+validator rule that would refuse nyet's own statement breaks a test rather than
+the command.
+
+### Corner cases worth knowing
+
+- **MySQL can refuse the fallback too.** Its guardrail mode is `rows`, read off
+  the classic `EXPLAIN`, whose row estimate does NOT account for the `LIMIT`. A
+  low `max_rows` therefore refuses `SELECT * FROM t LIMIT 11` on a big table
+  just as it refuses the sorted version — the agent gets `EXPENSIVE_QUERY`, the
+  honest answer for a connection configured that way.
+- **MongoDB: zero documents is not "no such collection".** There is no catalog
+  to miss, so a sample of a name that does not exist is an empty, successful
+  answer — the same as an empty collection. The skill tells the agent to check
+  with `nyet schema` rather than conclude the data is gone.
+- **A PII table refuses in BOTH modes.** `SELECT *` beside a protected column is
+  refused even under `mode = "mask"` (nyet cannot tell which result column is
+  which — `pii_mask_wildcard_deny`), so `sample` on such a table always exits 5.
+  The way in is naming the columns with `nyet query`.
+- **A bare PostgreSQL name resolves through `search_path`.** `nyet sample pg
+  orders` for a table in `sales` is a DB error, exactly as the same query
+  written by hand would be; the `DB_ERROR` hint says to qualify it. That hint
+  matters more here than elsewhere: on a connection with a PII policy the
+  server's own message is withheld (see "Database errors are withheld"), so the
+  hint is all the agent gets.
+- **The audit record.** One line, `command: "sample"`, `table` = the agent's raw
+  argument, `sql` = the statement nyet actually SENT (after a fallback, the cheap
+  one — the refused draw never ran, only its EXPLAIN did), with the validator's
+  Unicode normalization applied, since that is the form the database saw. The
+  raw ask is not lost: a name smuggling a zero-width character shows up in
+  `table`, which is where a human looks for the trick. (`query` keeps logging
+  the RAW text — there the raw text IS the agent's statement.) Only a
+  SUCCEEDED read reports the text it sent, so anything that did not come back
+  with rows — refused, failed, timed out — is logged as built.
 
 ## Auto-guardrail and `nyet explain` (`src/guardrail.rs`)
 
@@ -2109,6 +2301,30 @@ Dev:
   index over `a` kept) and
   `mysql8_functional_index_key_part_is_not_dropped` (`mysql:8.4` — MariaDB has
   no functional indexes).
+- `nyet sample` is covered at three levels. Unit tests in `src/sample.rs` (the
+  quoting of every dialect, the first-dot split, the built text passing its own
+  validator, an injecting name that never becomes a second statement, and the
+  MongoDB text parsing into an allowlisted `$sample` aggregation) and in
+  `src/main.rs` (the `SAMPLE_FALLBACK` invocation handed to a real `sh` and
+  demanded back verbatim; the failure hints — what they keep, what they replace,
+  and that none of them describes a run that did not happen; the shared-timeout
+  arithmetic of `fallback_budget_ms`, and that shrinking the budget stays inside
+  what each server accepts as its own timeout),
+  plus one allow case per dialect in the golden corpus. SQLite e2e in
+  `tests/cli.rs`: the query envelope, the default of 10 rows and `--limit`, an
+  out-of-range `--limit` as a usage error, `max_row_limit` clamping (and the
+  truncation message that then stops advising `--limit`), an empty table as a
+  successful 0 rows, an unknown/injecting name (exit 7 with the schema hint, and
+  every table intact), a PII table refused in both modes, the format routing,
+  and the audit record — including a zero-width character in the name, logged
+  raw in `table` and normalized in `sql`. Container e2e:
+  `postgres_sample_end_to_end` (qualified `schema.table`, the bare name outside
+  `search_path` as DB_ERROR, the **guardrail fallback** — a configured threshold
+  that refuses the sort but not the plain LIMIT, producing rows plus
+  `SAMPLE_FALLBACK` — a threshold under both, which stays a refusal, and the PII
+  refusal in both modes), `mysql_sample_end_to_end` (a table name that only
+  survives backquoted) and the MongoDB leg of `mongo_query_end_to_end`
+  (`$sample`, a missing collection as 0 documents, net B deny and mask).
 - The guardrail is covered at three levels. Pure unit tests in
   `src/guardrail.rs` (fixture plans: a PostgreSQL `FORMAT JSON` tree, both MySQL
   and MariaDB classic EXPLAIN shapes including the string-typed `rows`, a
@@ -3233,6 +3449,9 @@ outran its BUDGET is NOT in this list: that refuses the query, exit 5. On
 budget case — the verdict is `no_estimate` either way),
 `NO_PLAN` (`nyet explain` was handed a metadata statement, which has no plan —
 answered without touching the database),
+`SAMPLE_FALLBACK` (`nyet sample` only: the guardrail refused the random draw, so
+the rows are the FIRST ones the database returned, in its own order — the agent
+must not read them as representative; see the `nyet sample` section),
 `PII_MASKED` (`[connections.X.pii] mode = "mask"`: the named result columns came
 back as `[REDACTED]` — every value in them, whatever its type, NULL included. The
 agent MUST see this, or it reads the mask as data; the warning names columns
@@ -3259,7 +3478,9 @@ like every command, only a non-broken-pipe stdout write failure (a full disk ->
 `nyet query` pipeline order is pinned by tests: format (right after config
 parse — it routes every later envelope) -> alias -> directory scoping ->
 engine support / connection config -> validator -> **guardrail (EXPLAIN)** ->
-execution. The guardrail sits after the validator (a refused query never pays
+execution. `nyet sample` IS this pipeline (same function, `rows_command`) with a
+statement nyet wrote and one conditional second pass through it — see the
+`nyet sample` section. The guardrail sits after the validator (a refused query never pays
 for a connection, and only validated SQL is ever appended to an EXPLAIN prefix)
 and inside the engine's own read-only session (see below).
 `nyet explain` runs the same order and stops at the guardrail step: it produces

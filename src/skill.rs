@@ -29,7 +29,7 @@ pub enum Connections {
 /// per-user "Your connections" section begins.
 const HEAD: &str = r#"---
 name: nyet
-description: Read-only database access for AI agents. Use nyet to inspect database schemas and run safe read-only SQL (SELECT, SHOW, DESCRIBE, EXPLAIN) against the user's configured databases (PostgreSQL, MySQL/MariaDB, SQLite) or read-only mongosh queries against MongoDB. It enforces read-only, keeps credentials behind aliases, and returns compact JSON. Reach for it whenever a task needs to read from a database.
+description: Read-only database access for AI agents. Use nyet to inspect database schemas, sample a table's rows and run safe read-only SQL (SELECT, SHOW, DESCRIBE, EXPLAIN) against the user's configured databases (PostgreSQL, MySQL/MariaDB, SQLite) or read-only mongosh queries against MongoDB. It enforces read-only, keeps credentials behind aliases, and returns compact JSON. Reach for it whenever a task needs to read from a database.
 ---
 
 # nyet — read-only database access
@@ -47,13 +47,24 @@ a URL, host, or password. The user owns the config; credentials never reach you.
 
     nyet list --format json                     # connections reachable from here
     nyet schema <alias> [table] --format json   # tables, columns, keys, indexes
+    nyet sample <alias> <table> --format json   # a few rows, to see what the data looks like
     nyet explain <alias> "<SQL>" --format json  # query plan + cost/rows (none on SQLite), without running it
     nyet query <alias> "<SQL>" --format json    # run one read-only query
     nyet doctor [alias]                         # (for the human) diagnose the setup
 
 Usual flow: `nyet list` to see aliases, `nyet schema <alias>` to learn the
-tables, then `nyet query <alias> "SELECT ..."`. Run `nyet <command> --help` for
-more.
+tables, `nyet sample <alias> <table>` to see what is actually in one, then
+`nyet query <alias> "SELECT ..."`. Run `nyet <command> --help` for more.
+
+`sample` is sugar over `query`: nyet writes the statement itself — 10 rows
+(`--limit N` for more) drawn at RANDOM — and runs it through the very same
+rules, so a refusal reads exactly like a `query` refusal. If the connection's
+guardrail refuses the random draw as too expensive, nyet retries with the first
+N rows and adds a `SAMPLE_FALLBACK` warning: those rows are then in the
+database's own storage order, not a random draw, so do not read them as
+representative. `sample` is a `SELECT *`, so on a table with a protected column
+it is refused in both PII modes (see below) — name the columns you need with
+`nyet query` instead.
 
 **Always pass `--format json` when you parse the output.** `query`/`list`/
 `schema`/`explain` otherwise follow the user's `[defaults].format`, and `doctor`
@@ -82,7 +93,9 @@ Success is `{"v":1,"ok":true, ...}`:
   errors; the answer is valid. Codes include `TRUNCATED`, `SCHEMA_TRUNCATED`,
   `SCHEMA_SAMPLED` (MongoDB: part of that schema answer is a guess drawn from a
   sample — see below), `GUARDRAIL_SKIPPED`, `DUPLICATE_COLUMNS`,
-  `UNICODE_STRIPPED`, `INSECURE_TRANSPORT`, `PII_MASKED` (see below).
+  `UNICODE_STRIPPED`, `INSECURE_TRANSPORT`, `SAMPLE_FALLBACK` (`nyet sample`
+  could not draw at random — the rows are the first ones, not a sample),
+  `PII_MASKED` (see below).
 
 Failure is `{"v":1,"ok":false,"error":{"code":...,"message":...,"hint":...}}`.
 Always read `hint` — it tells you how to fix it. A refusal (`"code":"NYET"`)
@@ -122,6 +135,11 @@ Refused, by an allowlist that is closed by design: every write (including the
 know, command options (`allowDiskUse`, `let`, `readConcern`, ...) and
 `db.runCommand`/`db.adminCommand`. `nyet explain <alias> '<query>'` runs the
 same allowlist, so it is not a way around any of this.
+
+`nyet sample <alias> <collection>` works here too (one `$sample` aggregation).
+Careful with an empty answer: MongoDB has no catalog to miss, so **0 documents
+means the collection is empty OR does not exist** — it is never an error. Check
+the name with `nyet schema <alias>` before concluding the data is not there.
 
 `nyet schema <alias>` lists collections and views by name; `nyet schema <alias>
 <collection>` describes ONE of them. **MongoDB has no schema, so read the
@@ -225,19 +243,25 @@ pub fn skill(connections: &Connections) -> String {
     out
 }
 
-/// Shell-safe rendering of an alias for a copy-pasteable example: bare when it
-/// is a plain identifier, otherwise POSIX single-quoted (only `'` is special
-/// inside single quotes). `nyet` itself takes the alias as one positional arg,
-/// so `nyet query 'prod db' ...` resolves the alias `prod db`.
-fn shell_quote(alias: &str) -> String {
-    let safe = !alias.is_empty()
-        && alias
+/// Shell-safe rendering of one argument of a copy-pasteable example: bare when
+/// it is a plain identifier, otherwise POSIX single-quoted (only `'` is special
+/// inside single quotes, and `'\''` is how it closes, escapes and reopens).
+/// `nyet` itself takes the alias as one positional arg, so `nyet query 'prod db'
+/// ...` resolves the alias `prod db`.
+///
+/// Public because the cli prints runnable invocations too — a `sample` fallback
+/// suggests the `nyet query` that would draw at random, and THAT argument is
+/// SQL: unquoted it carries `"`, `` ` `` and `$(...)` straight into the user's
+/// shell. Every example nyet writes goes through here.
+pub fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
     if safe {
-        alias.to_string()
+        arg.to_string()
     } else {
-        format!("'{}'", alias.replace('\'', r"'\''"))
+        format!("'{}'", arg.replace('\'', r"'\''"))
     }
 }
 
@@ -350,6 +374,7 @@ mod tests {
         for cmd in [
             "nyet list",
             "nyet schema",
+            "nyet sample",
             "nyet explain",
             "nyet query",
             "nyet doctor",
@@ -369,6 +394,8 @@ mod tests {
             "PII_COLUMN",
             "PII_MASKED",
             "[REDACTED]",
+            // `sample` draws at random, and says so when it could not.
+            "SAMPLE_FALLBACK",
         ] {
             assert!(text.contains(marker), "missing marker: {marker}");
         }

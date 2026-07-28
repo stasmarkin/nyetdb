@@ -1220,3 +1220,65 @@ fn mysql_pii_mask_end_to_end() {
         container.rm().await.unwrap();
     });
 }
+
+/// `nyet sample` against a real MariaDB: the ordinary answer, and a table name
+/// that only survives as a BACKQUOTED identifier — the proof that the argument
+/// is a name and not a fragment of SQL.
+#[test]
+fn mysql_sample_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        {
+            use sqlx::{ConnectOptions, Connection, Executor};
+            let opts: sqlx::mysql::MySqlConnectOptions =
+                format!("mysql://root@127.0.0.1:{port}/test")
+                    .parse()
+                    .unwrap();
+            let mut w = opts.connect().await.unwrap();
+            // A space and a reserved word: unquoted, this is a syntax error.
+            w.execute("CREATE TABLE `odd order` (id int, v varchar(10))")
+                .await
+                .unwrap();
+            w.execute("INSERT INTO `odd order` VALUES (1, 'x'), (2, 'y')")
+                .await
+                .unwrap();
+            w.close().await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_mysql_config(tmp.path(), port);
+
+        let out = run(tmp.path(), &cfg, &["sample", "my", "users"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_no_password_leak(&out);
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["meta"]["row_count"], 3);
+        assert_eq!(v["meta"]["truncated"], false);
+        assert!(v["rows"][0].get("email").is_some(), "{v}");
+
+        let out = run(
+            tmp.path(),
+            &cfg,
+            &["sample", "my", "odd order", "--limit", "1"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["meta"]["row_count"], 1);
+        assert_eq!(v["meta"]["truncated"], true);
+
+        // A name that matches nothing is a database error with a hint about
+        // the name — the agent never wrote the statement.
+        let out = run(tmp.path(), &cfg, &["sample", "my", "nope"]);
+        assert_eq!(out.status.code(), Some(7), "{}", stdout(&out));
+        let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+        assert_eq!(v["error"]["code"], "DB_ERROR");
+        assert!(
+            v["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("nyet schema my"),
+            "{v}"
+        );
+
+        container.rm().await.unwrap();
+    });
+}

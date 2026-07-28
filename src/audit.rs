@@ -66,7 +66,7 @@ pub struct Event<'a> {
     pub audit_v: u8,
     /// ISO 8601 UTC, millisecond precision (`2026-07-26T12:34:56.789Z`).
     pub ts: &'a str,
-    /// `query` | `schema` | `explain` | `doctor`.
+    /// `query` | `sample` | `schema` | `explain` | `doctor`.
     pub command: &'a str,
     pub alias: &'a str,
     pub engine: &'a str,
@@ -74,10 +74,14 @@ pub struct Event<'a> {
     pub cwd: &'a str,
     /// The full SQL the agent submitted (query/explain) — the RAW text, before
     /// the validator's Unicode normalization, so a zero-width-injection attempt
-    /// is visible in the log.
+    /// is visible in the log. For `sample` it is the statement NYET wrote: as
+    /// the database saw it when the read SUCCEEDED (the human sees what
+    /// actually reached their database), as built otherwise — a refused, failed
+    /// or timed-out attempt returns no text to log, so the built form is what
+    /// there is. Either way `table` below holds the agent's raw argument.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<&'a str>,
-    /// The table argument (schema only), when one was given.
+    /// The table argument (schema/sample), when one was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table: Option<&'a str>,
     /// `ok` | `refused` (a NYET verdict) | `error` (any other failure).

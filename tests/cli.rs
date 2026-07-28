@@ -1254,6 +1254,288 @@ fn config_deny_functions_blocks_and_allow_functions_permits() {
 }
 
 // ---------------------------------------------------------------------------
+// nyet sample (SQLite end-to-end). `sample` is sugar over `query`: what these
+// pin is that it is the SAME pipeline (envelope, limits, refusals, audit) with
+// a statement nyet wrote — and that the table argument stays a NAME.
+// ---------------------------------------------------------------------------
+
+/// 25 rows in `t`, plus an empty table — enough to see the default limit cut a
+/// sample, and enough for "empty" to be a real answer rather than an error.
+const SAMPLE_DDL: &[&str] = &[
+    "CREATE TABLE t (n INTEGER, label TEXT)",
+    "INSERT INTO t(n, label) WITH RECURSIVE c(x) AS \
+     (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 25) SELECT x, 'row' || x FROM c",
+    "CREATE TABLE nothing_here (n INTEGER)",
+];
+
+fn sample_fixture(extra_config: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, cfg) = schema_fixture(SAMPLE_DDL);
+    if !extra_config.is_empty() {
+        let text = fs::read_to_string(&cfg).unwrap();
+        fs::write(&cfg, format!("{extra_config}\n{text}")).unwrap();
+    }
+    (tmp, cfg)
+}
+
+fn run_sample(tmp: &Path, cfg: &Path, args: &[&str]) -> Output {
+    nyet(tmp)
+        .arg("sample")
+        .args(args)
+        .arg("--config")
+        .arg(cfg)
+        .current_dir(tmp)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn sample_answers_in_the_query_envelope_with_ten_rows_by_default() {
+    let (tmp, cfg) = sample_fixture("");
+    let out = run_sample(tmp.path(), &cfg, &["db", "t"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = success_envelope(&stdout(&out));
+    // Same envelope as `query`: rows + meta, nothing new.
+    assert_eq!(v["meta"]["row_count"], 10);
+    assert_eq!(v["meta"]["truncated"], true);
+    assert_eq!(v["meta"]["connection"], "db");
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 10);
+    // `SELECT *`, so every column of the table is there, in column order.
+    assert!(rows[0]["n"].is_u64(), "{v}");
+    assert!(rows[0]["label"].is_string(), "{v}");
+    // The truncation warning tells the agent what IT can do (not "add WHERE").
+    assert_eq!(v["warnings"][0]["code"], "TRUNCATED");
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    assert!(message.contains("--limit"), "{message}");
+}
+
+#[test]
+fn sample_limit_flag_wins_and_the_default_beats_a_configured_row_limit() {
+    // A `row_limit` set for real queries must not shrink (or inflate) a sample:
+    // the sample default enters at the flag position.
+    let (tmp, cfg) = sample_fixture("[defaults]\nrow_limit = 1\n");
+    let out = run_sample(tmp.path(), &cfg, &["db", "t"]);
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["meta"]["row_count"], 10);
+    // ...and `query` on the same config still honors row_limit = 1.
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT n FROM t", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(success_envelope(&stdout(&out))["meta"]["row_count"], 1);
+
+    // The flag wins over the built-in default, both ways.
+    let out = run_sample(tmp.path(), &cfg, &["db", "t", "--limit", "3"]);
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["meta"]["row_count"], 3);
+    assert_eq!(v["meta"]["truncated"], true);
+    let out = run_sample(tmp.path(), &cfg, &["db", "t", "--limit", "30"]);
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["meta"]["row_count"], 25);
+    assert_eq!(v["meta"]["truncated"], false);
+    assert!(v.get("warnings").is_none(), "{v}");
+}
+
+/// The config owner's ceiling beats the sample's own default and its flag —
+/// silently, like everywhere else. What must NOT stay silent is the advice: an
+/// agent told to "raise --limit" against a ceiling raises it forever (Д10).
+#[test]
+fn sample_is_clamped_by_max_row_limit() {
+    let (tmp, cfg) = sample_fixture("[defaults]\nmax_row_limit = 2\n");
+    for args in [&["db", "t"][..], &["db", "t", "--limit", "30"][..]] {
+        let out = run_sample(tmp.path(), &cfg, args);
+        let v = success_envelope(&stdout(&out));
+        assert_eq!(v["meta"]["row_count"], 2, "{args:?}");
+        assert_eq!(v["meta"]["truncated"], true, "{args:?}");
+        assert_eq!(v["warnings"][0]["code"], "TRUNCATED", "{args:?}");
+        let message = v["warnings"][0]["message"].as_str().unwrap();
+        assert!(message.contains("max_row_limit"), "{args:?}: {message}");
+        assert!(!message.contains("raise --limit"), "{args:?}: {message}");
+    }
+    // A ceiling that happens to equal the default is still a ceiling: the ask
+    // was not cut, and raising --limit is still useless.
+    let (tmp, cfg) = sample_fixture("[defaults]\nmax_row_limit = 10\n");
+    let out = run_sample(tmp.path(), &cfg, &["db", "t"]);
+    let v = success_envelope(&stdout(&out));
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    assert!(message.contains("max_row_limit"), "{message}");
+    // Under the ceiling there is room to ask for more, so the ordinary advice
+    // is back.
+    let (tmp, cfg) = sample_fixture("[defaults]\nmax_row_limit = 30\n");
+    let out = run_sample(tmp.path(), &cfg, &["db", "t", "--limit", "2"]);
+    let v = success_envelope(&stdout(&out));
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    assert!(message.contains("raise --limit"), "{message}");
+}
+
+/// A sample is a handful of rows by definition, and the number is spliced into
+/// the statement nyet writes — so an absurd one is a usage error (exit 2), not
+/// a database error about SQL the agent never wrote.
+#[test]
+fn sample_limit_above_the_ceiling_is_a_usage_error_exit_2() {
+    let (tmp, cfg) = sample_fixture("");
+    for n in [
+        "0",
+        "1000001",
+        "9223372036854775807",
+        "18446744073709551615",
+    ] {
+        let out = run_sample(tmp.path(), &cfg, &["db", "t", "--limit", n]);
+        assert_eq!(out.status.code(), Some(2), "{n}: {}", stdout(&out));
+    }
+    // The ceiling itself is accepted (the table simply has fewer rows).
+    let out = run_sample(tmp.path(), &cfg, &["db", "t", "--limit", "1000000"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(success_envelope(&stdout(&out))["meta"]["row_count"], 25);
+}
+
+#[test]
+fn sample_of_an_empty_table_is_zero_rows_not_an_error() {
+    let (tmp, cfg) = sample_fixture("");
+    let out = run_sample(tmp.path(), &cfg, &["db", "nothing_here"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["rows"], serde_json::json!([]));
+    assert_eq!(v["meta"]["row_count"], 0);
+    assert_eq!(v["meta"]["truncated"], false);
+}
+
+/// The `<table>` argument is a NAME: it is quoted into one identifier, never
+/// spliced into the statement — so an injection attempt is a table that does
+/// not exist, and the fixture survives every one of them.
+#[test]
+fn sample_unknown_table_is_exit_7_and_an_injecting_name_runs_nothing() {
+    let (tmp, cfg) = sample_fixture("");
+    let out = run_sample(tmp.path(), &cfg, &["db", "nope"]);
+    assert_eq!(out.status.code(), Some(7), "{}", stdout(&out));
+    let v = error_envelope(&out);
+    assert_eq!(v["error"]["code"], "DB_ERROR");
+    // The agent never wrote the statement, so the hint points at the name.
+    assert!(
+        v["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("nyet schema db"),
+        "{v}"
+    );
+
+    for arg in [
+        "t\"; DROP TABLE t --",
+        "t; DROP TABLE t",
+        "t'--",
+        "t' UNION SELECT 1--",
+        "') OR 1=1--",
+    ] {
+        let out = run_sample(tmp.path(), &cfg, &["db", arg]);
+        // Either the validator refuses the name outright (5) or the database
+        // says there is no such table (7) — never a run.
+        let code = out.status.code();
+        assert!(code == Some(5) || code == Some(7), "{arg}: {code:?}");
+    }
+    // Both tables are still there, with all their rows.
+    let out = nyet(tmp.path())
+        .args(["query", "db", "SELECT count(*) AS n FROM t", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        success_envelope(&stdout(&out))["rows"],
+        serde_json::json!([{"n": 25}])
+    );
+    let out = nyet(tmp.path())
+        .args(["schema", "db", "--config"])
+        .arg(&cfg)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(v["meta"]["table_count"], 2);
+}
+
+/// `sample` is a `SELECT *`, and net A refuses a wildcard over a protected
+/// table in BOTH modes (mask included — nyet could not tell which result column
+/// is which). The agent is told to name the columns it needs instead.
+#[test]
+fn sample_of_a_pii_table_is_refused_in_both_modes() {
+    for section in [PII_SECTION, PII_MASK_SECTION] {
+        let (tmp, cfg) = pii_fixture(section);
+        let out = run_sample(tmp.path(), &cfg, &["db", "users"]);
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "NYET");
+        assert_eq!(v["error"]["reason"], "PII_COLUMN");
+        // "name the columns instead" is the advice, and `sample` cannot: the
+        // hint has to say which command can (Д10).
+        let hint = v["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("nyet query db"), "{hint}");
+        assert_no_pii_leak(&out, "sample users");
+        // A table with no protected column samples as usual.
+        let out = run_sample(tmp.path(), &cfg, &["db", "orders"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    }
+}
+
+#[test]
+fn sample_routes_the_row_formats_like_query_does() {
+    let (tmp, cfg) = sample_fixture("");
+    for format in ["table", "csv", "jsonl"] {
+        let out = run_sample(
+            tmp.path(),
+            &cfg,
+            &["db", "t", "--limit", "2", "--format", format],
+        );
+        assert_eq!(out.status.code(), Some(0), "{format}: {}", stderr(&out));
+        // Data on stdout, envelope as one JSON line on stderr.
+        assert!(stdout(&out).contains("row"), "{format}: {}", stdout(&out));
+        let v = success_envelope(stderr(&out).trim().lines().last().unwrap());
+        assert_eq!(v["meta"]["row_count"], 2, "{format}");
+        assert!(v.get("rows").is_none(), "{format}");
+    }
+}
+
+#[test]
+fn audit_records_sample_with_the_name_and_the_statement_nyet_wrote() {
+    let (tmp, cfg) = sample_fixture("");
+    run_sample(tmp.path(), &cfg, &["db", "t", "--limit", "2"]);
+    let rec = one_audit_record(tmp.path());
+    assert_eq!(rec["command"], "sample");
+    // The RAW argument, and the statement that actually ran.
+    assert_eq!(rec["table"], "t");
+    assert_eq!(rec["sql"], "SELECT * FROM \"t\" ORDER BY RANDOM() LIMIT 3");
+    assert_eq!(rec["verdict"], "ok");
+    assert_eq!(rec["row_count"], 2);
+    assert_eq!(rec["truncated"], true);
+}
+
+/// `sql` is what the database SAW, and the validator strips hidden characters
+/// before it gets there — so a name carrying a zero-width joiner is logged in
+/// the form that ran, while the agent's raw argument survives in `table`. Both
+/// halves matter: the human reads one to see the trick, the other to see the
+/// effect.
+#[test]
+fn audit_records_the_sample_statement_as_the_database_saw_it() {
+    let (tmp, cfg) = sample_fixture("");
+    let out = run_sample(tmp.path(), &cfg, &["db", "t\u{200D}", "--limit", "2"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v = success_envelope(&stdout(&out));
+    assert_eq!(v["meta"]["row_count"], 2);
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "UNICODE_STRIPPED"),
+        "{v}"
+    );
+    let rec = one_audit_record(tmp.path());
+    assert_eq!(rec["table"], "t\u{200D}");
+    assert_eq!(rec["sql"], "SELECT * FROM \"t\" ORDER BY RANDOM() LIMIT 3");
+}
+
+// ---------------------------------------------------------------------------
 // nyet schema (SQLite end-to-end)
 // ---------------------------------------------------------------------------
 
