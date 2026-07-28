@@ -72,24 +72,39 @@ jobs:
           # runner. No corpus is carried between nightly runs: each one starts
           # from the seeds with a fresh RNG.
           mkdir -p "fuzz/corpus/$TARGET"
+          # --target: the prebuilt cargo-fuzz binary (musl, from install-action)
+          # defaults its build target to its own compile-time triple —
+          # x86_64-unknown-linux-musl — whose crt-static is incompatible with
+          # -Zsanitizer=address. Pin the gnu host triple, where ASan builds fine.
           # $ARGS is deliberately unquoted: it is empty for the targets with no
           # dictionary, and quoting it would pass libFuzzer an empty argument.
-          cargo fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
+          cargo fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" \
+            --target x86_64-unknown-linux-gnu -- \
             $ARGS \
             -max_total_time=900 \
             -max_len=4096 \
             -timeout=25
 
-      # Everything needed to reproduce: `cargo fuzz run <target> <file>`.
-      #
-      # `steps.fuzz.outcome` as well as `failure()`, on this step and the next:
-      # a bare `failure()` also fires when the job died BEFORE the fuzzer ever
-      # ran (toolchain install, a build broken by bit-rot in fuzz/), which would
-      # file a "found a panic" issue about a crash that never happened — and the
-      # dedupe below would then swallow the real one. A failure before this
-      # point leaves the outcome `skipped`, not `failure`.
-      - name: Upload the crashing input
+      # A failed Fuzz step is ambiguous: a real crash drops a reproducer into
+      # fuzz/artifacts/$TARGET/, but a broken build (bit-rot in fuzz/, a
+      # toolchain/target mismatch, a broken install) fails the SAME step with no
+      # artifact. Only a real artifact is a panic worth an issue; a build failure
+      # must stay red in Actions without filing one. So gate upload+issue on the
+      # artifact actually existing, not on `steps.fuzz.outcome == 'failure'`
+      # alone — which cannot tell a crash from a build error.
+      - name: Detect a crash artifact
+        id: crash
         if: failure() && steps.fuzz.outcome == 'failure'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [ -n "$(ls -A "fuzz/artifacts/$TARGET" 2>/dev/null)" ]; then
+            echo "crashed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Everything needed to reproduce: `cargo fuzz run <target> <file>`.
+      - name: Upload the crashing input
+        if: failure() && steps.crash.outputs.crashed == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts-${{ matrix.target }}
@@ -97,7 +112,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: File an issue
-        if: failure() && steps.fuzz.outcome == 'failure'
+        if: failure() && steps.crash.outputs.crashed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           # Through env rather than inline `${{ }}` in the script: no expansion
