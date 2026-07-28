@@ -60,6 +60,21 @@ file it privately as above.
   are a **known and deliberately accepted** limitation. The real confidentiality boundary is the
   database (column-level grants, views, RLS); see "PII columns" in the README.
 
+- **MongoDB's PII policy leans on a closed list of "movers".** With no schema
+  and no column provenance, the MongoDB nets hold on one invariant: a value
+  cannot leave without its field name (net A refuses every mention, net B scans
+  the result documents for protected keys). The operators that break the
+  invariant — converting field names to values or reaching fields through
+  computed names (`$objectToArray`, `$getField`, ...) — are refused wholesale,
+  but the completeness of *that list* is **not proven**, and MongoDB adds
+  operators every release (the allowlist refuses new ones by default, which is
+  the real backstop). A parent-path count (`countDocuments({profile: {$exists:
+  true}})`) still leaks the *presence* of a subdocument, one bit per query —
+  same accepted class as the SQL `WHERE` oracle above. MongoDB has no
+  field-level privileges, so unlike SQL there is **no server-side twin** of the
+  policy: the honest boundary is a view minus the protected fields with a role
+  scoped to it, and `nyet doctor` says so.
+
 - **A read that causes a side effect is only as complete as the denylist.** A
   `SELECT` can call a function that writes or reaches outside the database
   (`setval`, `lo_export`, `pg_read_file`, `dblink`, `query_to_xml`, a volatile

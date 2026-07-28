@@ -1285,11 +1285,25 @@ which is the point of the shape.
   a secondary is routed to the primary and creates the collection. So layer 1
   and layer 3 are the whole story, which is why the README's read-only-role
   recipe is not optional advice here.
-- **No `[pii]`.** The section is a hard config error (`PiiUnsupported`, exit 3),
-  not an ignored setting: nyet's rules name a `table.column` pair and net B
-  cross-checks them against the column provenance the server reports, and a
-  schemaless document has neither. A collection-level deny may come later, as
-  its own step; there is no groundwork for it here on purpose (Д5).
+- **`[pii]` exists, but stands on different legs (PII-M1).** There is no schema
+  to resolve names against and no column provenance from the server, so both
+  nets are rebuilt on what MongoDB does have: a rule is exactly
+  `collection.field` (deeper paths are a config error — path precision would be
+  a lie) and protects the field NAME at any depth of every collection the query
+  reads. Net A rides the classifier's own walk (`mongo::PiiCtx`) and refuses
+  every mention — document keys, `"$field"` references, name-position strings
+  (`distinct`, `$lookup.localField`, ...) — plus the operators that move values
+  without naming fields (`PII_UNPROVABLE_KEYS`: `$objectToArray`,
+  `$arrayToObject`, `$getField`, `$setField`, `$unsetField`, `$densify`,
+  `$fill`). Net B (`mongo::scan_reply`, applied in the cli's `Db::execute`
+  where every row leaves the engine layer) scans the self-describing result
+  documents recursively: a protected key at any depth refuses the answer
+  (deny) or is redacted in place (mask). The pair holds because a value cannot
+  travel without its name once the movers above are refused — which is exactly
+  the surface W7's adversarial audit should attack first. Mask's one
+  relaxation is a literal `0/1/true/false` projection key (`$project`, find's
+  projection, `$unset`), where the field either stays home or arrives under
+  its own name for the scan to redact.
 - **No guardrail.** `explain` in `queryPlanner` mode publishes neither a cost
   nor a row estimate, and `executionStats` RUNS the query. `off` is the only
   accepted mode (`guardrail::engine_modes`), so a `cost`/`rows` mode is a config
@@ -1498,15 +1512,18 @@ different operator", and a single code would make both hints vague.
 
 ### Tests
 
-- **Golden corpus** — `tests/corpus/mongo/{allow,deny}.yaml`, ~240 cases, same
-  tiny line format as the SQL corpus and read by the runner in `src/mongo.rs`.
+- **Golden corpus** — `tests/corpus/mongo/{allow,deny,pii,pii_mask}.yaml`,
+  ~270 cases, same tiny line format as the SQL corpus (the `pii*` files carry
+  the same `pii:`/`pii_mode:` headers) and read by the runner in `src/mongo.rs`.
   It lives in a SUBdirectory because the SQL runner globs `tests/corpus/*.yaml`
   and would otherwise hand mongosh to sqlparser. Covers: every writing method,
   `$out`/`$merge` in every position (nested pipelines included), all of the
   server JS, `$_internal*`, unknown `$`-keys, the refused stages, options and
   service fields, database-level commands, `system.*`, the cursor chain
   (including a repeated call), extended-JSON types with a wrong payload,
-  duplicate keys, regex flags, and a wide range of malformed input.
+  duplicate keys, regex flags, a wide range of malformed input, and net A of
+  the `[pii]` policy in both modes (mentions in every position, the refused
+  movers, the mask projection relaxation, collection scoping via `$lookup`).
 - **Pure unit tests** (`src/mongo.rs`): list sortedness/disjointness, the shared
   reason codes, `no_input_can_panic` (every PREFIX of a set of nasty seeds, plus
   5000-level nesting in three shapes and an oversized input), the BSON types the
@@ -1535,7 +1552,7 @@ different operator", and a single code would make both hints vague.
   `explain`, because explain must refuse exactly what query refuses; doctor
   against a dead connection reading `fail`/`warn` and never `ok`; the
   MongoDB-only check not appearing on other engines; and the two config errors
-  (`[pii]`, `guardrail.mode`).
+  (a `[pii]` rule deeper than `collection.field`, `guardrail.mode`).
 - **Container e2e** (`tests/mongo.rs`, `mongo:8` digest-pinned, ONE container
   with auth enabled, three accounts — `read`, `read` + `readWrite` elsewhere,
   and a role scoped to a view): the read shapes and the union of document keys,
@@ -1550,9 +1567,12 @@ different operator", and a single code would make both hints vague.
   answering in milliseconds under a one-second budget, which is the proof that
   nothing was executed; doctor `ok` under `read`, `warn` naming the other
   database under `read`+`readWrite`, and the view-scoped role still getting a
-  listing and a sampled description. Readiness is polled with a real `ping`
-  rather than trusted to the log line, because the official image restarts
-  mongod once while applying the root credentials.
+  listing and a sampled description; and the `[pii]` policy live — net A's
+  refusal, net B refusing a `find({})` that never named the field (deny) and
+  redacting in place with `PII_MASKED` (mask), the value reaching neither
+  stdout nor stderr, and `nyet schema` marking the field. Readiness is polled
+  with a real `ping` rather than trusted to the log line, because the official
+  image restarts mongod once while applying the root credentials.
 
 ## Round trips (the control statements, per engine)
 

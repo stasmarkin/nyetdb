@@ -1,0 +1,53 @@
+# Golden corpus — the PII policy, net A for MongoDB, mode = "mask".
+# The one relaxation over deny: a protected name as a projection key with a
+# literal 0/1/true/false (find projection, $project, nested plain subdocuments,
+# $unset) — the field is then excluded, or arrives under its own name and net B
+# redacts it. Every OTHER mention is refused exactly like deny.
+pii: users.email, users.ssn
+pii_mode: mask
+
+# --- the relaxation: plain include/exclude projections ---
+- query: db.users.find({}, {email: 1})
+  verdict: allow
+- query: db.users.find({}, {email: 0})
+  verdict: allow
+- query: db.users.find({}, {name: 1, email: true})
+  verdict: allow
+- query: db.users.find({}, {profile: {email: 1}})
+  verdict: allow
+- query: db.users.find({}, {"profile.email": 1})
+  verdict: allow
+- query: db.users.aggregate([{$project: {name: 1, email: 1}}])
+  verdict: allow
+- query: db.users.aggregate([{$unset: "email"}])
+  verdict: allow
+- query: db.users.aggregate([{$unset: ["email", "ssn"]}])
+  verdict: allow
+
+# --- everything else stays refused ---
+- query: db.users.find({email: "a@b.c"})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.find({}).sort({email: 1})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.find({}, {alias: "$email"})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$project: {x: "$email"}}])
+  verdict: deny
+  reason: PII_COLUMN
+# a computed value under the protected NAME would create a key net B then
+# falsely judges — refused up front
+- query: db.users.aggregate([{$project: {email: {$toUpper: "$name"}}}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$set: {email: "$name"}}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.distinct("email")
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$project: {kv: {$objectToArray: "$$ROOT"}}}])
+  verdict: deny
+  reason: PII_UNPROVABLE

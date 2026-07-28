@@ -3690,8 +3690,9 @@ impl Engine for Mongo {
         Ok(QueryOutcome::Ran {
             result: ResultSet {
                 // Provenance does not exist here: a document field has no
-                // catalog origin, and net B never runs (a `[pii]` section on a
-                // MongoDB connection is a config error).
+                // catalog origin. Net B for MongoDB does not read origins — it
+                // scans the self-describing documents instead (mongo::scan_reply,
+                // applied in the cli's Db::execute).
                 origins: vec![Origin::Unknown; reply.columns.len()],
                 columns: reply.columns,
                 rows: reply.rows,
@@ -3765,7 +3766,9 @@ impl Engine for Mongo {
                 return Diagnosis {
                     connect: ConnectFact::Failed { message, hint },
                     server: None,
-                    // No `[pii]` on a MongoDB connection (config error).
+                    // Empty even under a policy: MongoDB has no field-level
+                    // privileges to ask the server about, and the doctor check
+                    // says so itself (see output::pii_columns_check).
                     pii: Vec::new(),
                 };
             }

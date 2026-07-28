@@ -1,0 +1,108 @@
+# Golden corpus — the PII policy, net A for MongoDB, mode = "deny".
+# The rule protects the field NAME at every depth of every collection the query
+# reads (root + $lookup/$graphLookup/$unionWith sources). Any mention — a
+# document key, a "$field" reference, a name-position string — is refused.
+pii: users.email, users.ssn
+
+# --- naming the field as a key ---
+- query: db.users.find({email: "a@b.c"})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.find({EMAIL: "a@b.c"})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.find({email: {$exists: true}})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.find({"profile.email": {$gt: ""}})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.find({}, {email: 1})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.find({}, {email: 0})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.find({}).sort({email: 1})
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.countDocuments({email: {$ne: null}})
+  verdict: deny
+  reason: PII_COLUMN
+# an equality literal is an oracle by guessing — the KEY inside it is judged too
+- query: db.users.find({profile: {$eq: {ssn: "123-45-6789"}}})
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- naming the field as a "$field" reference ---
+- query: db.users.aggregate([{$project: {x: "$email"}}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$group: {_id: "$email", n: {$sum: 1}}}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$match: {$expr: {$eq: ["$email", "a@b.c"]}}}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$sortByCount: "$email"}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$project: {n: {$toUpper: "$profile.email"}}}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$project: {n: {$map: {input: "$contacts", as: "c", in: "$$c.email"}}}}])
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- name-position strings ---
+- query: db.users.distinct("email")
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.orders.aggregate([{$lookup: {from: "users", localField: "buyer", foreignField: "email", as: "who"}}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$count: "email"}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.users.aggregate([{$unset: "email"}])
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- the name↔value converters are refused wholesale under a policy ---
+- query: db.users.aggregate([{$project: {kv: {$objectToArray: "$$ROOT"}}}])
+  verdict: deny
+  reason: PII_UNPROVABLE
+- query: db.users.aggregate([{$project: {v: {$getField: {field: "name", input: "$$ROOT"}}}}])
+  verdict: deny
+  reason: PII_UNPROVABLE
+- query: db.users.aggregate([{$densify: {field: "ts", range: {step: 1, unit: "hour", bounds: "full"}}}])
+  verdict: deny
+  reason: PII_UNPROVABLE
+
+# --- the policy follows every collection the query reads ---
+- query: db.orders.aggregate([{$lookup: {from: "users", localField: "buyer", foreignField: "_id", as: "who"}}, {$match: {"who.email": {$exists: true}}}])
+  verdict: deny
+  reason: PII_COLUMN
+- query: db.orders.aggregate([{$unionWith: {coll: "users", pipeline: [{$project: {e: "$email"}}]}}])
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- what stays allowed: no protected collection, or no protected name ---
+- query: db.users.find({name: "alice"}, {name: 1, city: 1})
+  verdict: allow
+- query: db.users.find({}).sort({name: 1}).limit(5)
+  verdict: allow
+- query: db.users.aggregate([{$match: {active: true}}, {$group: {_id: "$city", n: {$sum: 1}}}])
+  verdict: allow
+- query: db.orders.find({email: "a@b.c"})
+  verdict: allow
+- query: db.orders.aggregate([{$project: {kv: {$objectToArray: "$$ROOT"}}}])
+  verdict: allow
+- query: db.users.distinct("city")
+  verdict: allow
+# a filter VALUE that merely contains the word is data, not a mention
+- query: db.users.find({note: "email me later"})
+  verdict: allow
+# $$ROOT alone moves the document WITH its keys — net B's scan sees them
+- query: db.users.aggregate([{$group: {_id: "$city", docs: {$push: "$$ROOT"}}}])
+  verdict: allow

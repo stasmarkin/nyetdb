@@ -1159,6 +1159,24 @@ fn human_age(secs: u64) -> String {
 /// server-side recipe, not a `fail`: the policy still works for every query that
 /// goes through nyet, which is what the config owner asked for.
 fn pii_columns_check(input: &DoctorInput, mode: &'static str) -> DoctorCheck {
+    if input.engine == EngineKind::Mongo {
+        // Not `na` like SQLite: the boundary CAN be made the server's, just not
+        // with field-level grants — so this is an actionable warn, not a shrug.
+        return warn_check(
+            "pii_columns",
+            format!(
+                "MongoDB has no field-level privileges, so nyet cannot verify (and the \
+                 server does not enforce) that this role is kept away from the protected \
+                 fields: the [pii] policy (mode = \"{mode}\") is the only layer on this \
+                 connection"
+            ),
+            "make the boundary the server's: create a view that removes the protected \
+             fields (db.createView(\"<name>\", \"<collection>\", [{ $unset: [<the \
+             fields>] }])) and grant the role find on the VIEW only, not on the \
+             collection; the [pii] policy then becomes a second, local layer instead of \
+             the only one",
+        );
+    }
     if input.engine == EngineKind::Sqlite {
         return na_check(
             "pii_columns",

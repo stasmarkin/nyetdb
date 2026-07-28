@@ -556,9 +556,97 @@ fn mongo_query_end_to_end() {
         schema_says_what_is_a_schema_and_what_is_a_guess(tmp.path(), &cfg);
         explain_shows_the_plan_without_running_the_query(tmp.path(), &cfg, port);
         doctor_proves_read_only_from_privileges(tmp.path(), port);
+        pii_policy_denies_and_masks(tmp.path(), port);
 
         drop(container);
     });
+}
+
+/// The `[pii]` policy on a live server (PII-M1): net A refuses a mention, net B
+/// refuses a result that carries the field the query never named (deny) or
+/// redacts it in place at every depth (mask), and the value never reaches
+/// stdout or stderr either way.
+fn pii_policy_denies_and_masks(home: &Path, port: u16) {
+    // `validated` holds emails; `small` does not (its rule stays dormant).
+    let deny_cfg = write_config(
+        home,
+        port,
+        "[connections.mg.pii]\ncolumns = [\"validated.email\"]\n",
+    );
+    let mask_cfg = write_config(
+        home,
+        port,
+        "[connections.mg.pii]\ncolumns = [\"validated.email\"]\nmode = \"mask\"\n",
+    );
+    let leak = |out: &Output, what: &str| {
+        assert!(!stdout(out).contains("a@b.c"), "{what}: leaked to stdout");
+        assert!(!stderr(out).contains("a@b.c"), "{what}: leaked to stderr");
+    };
+
+    // Net A: naming the field refuses before execution, in both modes.
+    for cfg in [&deny_cfg, &mask_cfg] {
+        let out = run(
+            home,
+            cfg,
+            &["query", "mg", "db.validated.find({email: \"a@b.c\"})"],
+        );
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        assert_eq!(envelope(&out)["error"]["reason"], "PII_COLUMN");
+        leak(&out, "net A");
+    }
+
+    // Net B, deny: `find({})` never names the field, the documents carry it.
+    let out = run(home, &deny_cfg, &["query", "mg", "db.validated.find({})"]);
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+    let v = envelope(&out);
+    assert_eq!(v["error"]["code"], "NYET");
+    assert_eq!(v["error"]["reason"], "PII_COLUMN");
+    leak(&out, "net B deny");
+
+    // Net B, mask: the same read succeeds, the value is [REDACTED], and the
+    // warning names the field.
+    let out = run(
+        home,
+        &mask_cfg,
+        &["query", "mg", "db.validated.find({}).sort({age: -1})"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v = envelope(&out);
+    assert_eq!(v["rows"][0]["email"], "[REDACTED]");
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "PII_MASKED"),
+        "{v}"
+    );
+    leak(&out, "net B mask");
+
+    // A projection that excludes the field is the deny-mode way in.
+    let out = run(
+        home,
+        &deny_cfg,
+        &["query", "mg", "db.validated.find({}, {age: 1})"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    leak(&out, "deny with projection");
+
+    // A rule on a collection the query does not read stays out of the way.
+    let out = run(
+        home,
+        &deny_cfg,
+        &["query", "mg", "db.small.find({}).limit(2)"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    // `nyet schema` marks the protected field on the live catalog.
+    let out = run(home, &mask_cfg, &["schema", "mg", "validated"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v = envelope(&out);
+    let columns = v["schema"]["tables"][0]["columns"].as_array().unwrap();
+    let email = columns.iter().find(|c| c["name"] == "email").unwrap();
+    assert_eq!(email["pii"], "mask", "{v}");
 }
 
 /// `nyet schema` on a real server: the listing, a collection with a declared

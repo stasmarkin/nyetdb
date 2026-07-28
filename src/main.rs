@@ -291,19 +291,37 @@ impl Db {
         }?;
         let mut masked = Vec::new();
         if let engine::QueryOutcome::Ran { result, .. } = &mut outcome {
-            match validator::check_origins(pii, &result.columns, &result.origins, pii_exempt) {
-                Err(refusal) => {
-                    return Ok((
-                        engine::QueryOutcome::PiiRefused(Box::new(refusal)),
-                        Vec::new(),
-                    ))
+            if self.is_mongo() {
+                // MongoDB's net B is a scan of the documents themselves (they
+                // are self-describing; there is no provenance to ask for, and
+                // `check_origins` on all-Unknown origins would refuse
+                // everything). See mongo::scan_reply.
+                if !pii.is_empty() {
+                    match mongo::scan_reply(sql, pii, &result.columns, &mut result.rows) {
+                        Err(r) => {
+                            return Ok((
+                                engine::QueryOutcome::PiiRefused(Box::new(mongo_pii_refusal(r))),
+                                Vec::new(),
+                            ))
+                        }
+                        Ok(fields) => masked = fields,
+                    }
                 }
-                Ok(indexes) => {
-                    masked = indexes
-                        .iter()
-                        .map(|i| result.columns[*i].clone())
-                        .collect::<Vec<_>>();
-                    output::redact(&mut result.rows, &indexes);
+            } else {
+                match validator::check_origins(pii, &result.columns, &result.origins, pii_exempt) {
+                    Err(refusal) => {
+                        return Ok((
+                            engine::QueryOutcome::PiiRefused(Box::new(refusal)),
+                            Vec::new(),
+                        ))
+                    }
+                    Ok(indexes) => {
+                        masked = indexes
+                            .iter()
+                            .map(|i| result.columns[*i].clone())
+                            .collect::<Vec<_>>();
+                        output::redact(&mut result.rows, &indexes);
+                    }
                 }
             }
         }
@@ -346,9 +364,8 @@ impl Db {
     fn resolve_column_origins(&mut self) {
         match self {
             Db::Postgres(pg) => pg.resolve_column_origins = true,
-            // MongoDB never reaches here: a `[pii]` section on a MongoDB
-            // connection is a config error (exit 3), because a document field
-            // has no provenance net B could check.
+            // MongoDB needs no origins: its net B scans the self-describing
+            // result documents instead (see mongo::scan_reply in Db::execute).
             Db::Mysql(_) | Db::Sqlite(_) | Db::Mongo(_) => {}
         }
     }
@@ -711,7 +728,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // allowlist (mongosh text is not SQL and sqlparser must never
                 // see it), everything else goes through the SQL validator.
                 let (query, is_query, mut warnings, pii_exempt) = match session.db.is_mongo() {
-                    true => validate_mongo(&query)?,
+                    true => validate_mongo(&query, session.policy.pii())?,
                     false => validate(&query, &session.policy)?,
                 };
                 // Layer 1.5: the guardrail. Only a plain query can be wrapped in an
@@ -914,10 +931,19 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     run_db(redact_db_errors, session.db.schema(table.as_deref()))?;
                 // The policy is config, so the marking happens here and not in
                 // the engines: they only report what the catalog (already
-                // privilege-filtered) holds.
+                // privilege-filtered) holds. MongoDB's rules protect a field
+                // NAME at any depth, so a dotted path is marked when any of its
+                // segments is protected — the same match nets A and B apply.
                 let pii = session.policy.pii();
                 if !pii.is_empty() {
-                    output::mark_pii(&mut schema, pii.mode().as_str(), |t, c| pii.protects(t, c));
+                    match is_mongo {
+                        true => output::mark_pii(&mut schema, pii.mode().as_str(), |t, c| {
+                            c.split('.').any(|segment| pii.protects(t, segment))
+                        }),
+                        false => output::mark_pii(&mut schema, pii.mode().as_str(), |t, c| {
+                            pii.protects(t, c)
+                        }),
+                    }
                 }
 
                 // An explicit [table] that matched nothing: the catalog answered,
@@ -1054,7 +1080,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // allowlist that refuse `db.c.aggregate([{$out: ...}])` for
                 // `query` refuse it here, before any connect (exit 5).
                 let (query, is_query, mut warnings, _) = match is_mongo {
-                    true => validate_mongo(&query)?,
+                    true => validate_mongo(&query, session.policy.pii())?,
                     false => validate(&query, &session.policy)?,
                 };
                 // The verdict is informational here, but it is measured against this
@@ -1385,8 +1411,9 @@ fn validate(
 /// filter VALUES, which are data.
 fn validate_mongo(
     query: &str,
+    pii: &validator::PiiRules,
 ) -> Result<(String, bool, Vec<output::Warning>, Vec<usize>), Failure> {
-    match mongo::check(query) {
+    match mongo::check_with_pii(query, pii) {
         Ok(_request) => Ok((query.to_string(), false, Vec::new(), Vec::new())),
         Err(r) => Err(Failure::new(ErrorCode::Nyet(r.reason), r.message, r.hint)),
     }
@@ -1395,6 +1422,21 @@ fn validate_mongo(
 /// One validator refusal -> one NYET failure (exit 5).
 fn refusal_failure(r: validator::Refusal) -> Failure {
     Failure::new(ErrorCode::Nyet(r.reason.as_str()), r.message, r.hint)
+}
+
+/// A mongo-layer PII refusal in the validator's shape, so `PiiRefused` carries
+/// one type whatever the engine. The reasons share their spellings on purpose
+/// (pinned by a unit test in mongo.rs).
+fn mongo_pii_refusal(r: mongo::Refusal) -> validator::Refusal {
+    validator::Refusal {
+        reason: match r.reason {
+            mongo::PII_UNPROVABLE => validator::DenyReason::PiiUnprovable,
+            mongo::INTERNAL_ERROR => validator::DenyReason::InternalError,
+            _ => validator::DenyReason::PiiColumn,
+        },
+        message: r.message,
+        hint: r.hint,
+    }
 }
 
 /// The guardrail asked for a plan and got nothing it could judge. Д10 — what
@@ -1836,9 +1878,8 @@ fn redact_diagnosis(diagnosis: &mut output::Diagnosis) {
             output::ProbeFact::Blocked { detail, .. } | output::ProbeFact::Unknown { detail } => {
                 *detail = WITHHELD.to_string()
             }
-            // MongoDB reaches neither: a `[pii]` section on a MongoDB
-            // connection is a config error, and its grants carry action and
-            // resource NAMES only — never a value from a document.
+            // MongoDB's grants carry action and resource NAMES only — never a
+            // value from a document — so there is nothing to withhold.
             output::ProbeFact::Wrote { .. } | output::ProbeFact::Grants(_) => {}
         }
     }
@@ -2186,23 +2227,6 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
                  \"table.column\" (or \"schema.table.column\"), e.g. \
                  columns = [\"users.email\", \"users.phone\"]; matching is \
                  case-insensitive and any schema qualifier is ignored"
-            ),
-        ),
-        config::ConfigError::PiiUnsupported { alias, engine } => (
-            format!(
-                "config file {}: connection '{alias}' is engine = \"{engine}\", which nyet's \
-                 [pii] policy does not support",
-                path.display()
-            ),
-            format!(
-                "remove the [connections.{alias}.pii] section — keeping it would look like \
-                 protection that is not there. nyet's PII rules name a table.column pair and \
-                 are cross-checked against the column provenance the server reports; a \
-                 MongoDB document has neither, so nyet cannot prove a rule covers what you \
-                 meant. Protect the data in the database instead (a role without read \
-                 access to the collection, or a view that projects the sensitive fields \
-                 away), which holds for every client — not just for the ones going \
-                 through nyet"
             ),
         ),
         config::ConfigError::MongoTunnelInvalid { alias, message } => (

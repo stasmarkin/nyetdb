@@ -22,7 +22,8 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MongoDB.
 - `nyet query`, `schema`, `explain` and `doctor` for **MongoDB**: a parser for a
   subset of the mongosh read syntax plus a closed allowlist over what it parsed
   (see "MongoDB" below) — reads only, and honestly weaker than the SQL engines
-  (no read-only session exists in MongoDB, no `[pii]`, no guardrail). `schema`
+  (no read-only session exists in MongoDB, no guardrail; `[pii]` works, with
+  its own mechanics — see "PII columns"). `schema`
   marks every field it INFERRED from a sample as a guess, `explain` shows the
   plan without executing anything and invents no cost, and `doctor` proves
   read-only from the privileges the server publishes — without writing a byte;
@@ -163,8 +164,9 @@ engine = "mongodb"
 url = "mongodb://nyet_ro@mongo.internal:27017/events?tls=true"
 password_env = "EVENTS_DB_PASSWORD"
 allowed_dirs = ["~/Workspace/app"]
-# NOTE: [connections.events.pii] and a guardrail mode other than "off" are
-# hard config errors for MongoDB — see "MongoDB specifics" below.
+# NOTE: a guardrail mode other than "off" is a hard config error for MongoDB;
+# [connections.events.pii] works, with rules of exactly "collection.field" —
+# see "MongoDB specifics" and "PII columns" below.
 
 [connections.localdev]
 engine = "sqlite"
@@ -254,14 +256,16 @@ layers; MongoDB has two, and nyet says so rather than implying otherwise:
   and executes there (measured). So layer 1 (nyet's allowlist) and layer 3 (a
   read-only role) are the whole story — which makes the read-only role below
   much more important here than on the SQL engines.
-- **no `[pii]` policy.** A `[connections.X.pii]` section on a MongoDB connection
-  is a hard config error (exit 3), not a silently ignored setting: nyet's rules
-  name a `table.column` pair and are cross-checked against the column
-  provenance the server reports, and a schemaless document has neither. A
-  policy that protects nothing is worse than no policy. Protect the data in the
-  database instead (a role without access to the collection, or a view that
-  projects the sensitive fields away) — that holds for every client, not only
-  for the ones going through nyet.
+- **`[pii]` works, but by a different mechanism.** There is no column
+  provenance to cross-check, so the rules are `collection.field` exactly (a
+  deeper path is a config error) and protect the field NAME at every depth of
+  every document: naming it anywhere in a query is refused, and the result
+  documents — which carry their own field names — are scanned before anything
+  is returned. See "PII columns" for the mechanics and the honest cost. The
+  server itself still cannot enforce any of this (no field-level privileges),
+  so a view that projects the sensitive fields away plus a role scoped to the
+  view remains the boundary that holds for every client — `nyet doctor` says
+  exactly that.
 - **no auto-guardrail.** MongoDB's `explain` publishes no cost and no row
   estimate in `queryPlanner` mode, and its `executionStats` mode *runs* the
   query — the one thing a guardrail must never do. So `off` is the only
@@ -332,9 +336,8 @@ Then `url = "postgres://nyet_ro@db.internal:5432/app"` and
 
 A connection can declare which columns hold personal data. `nyet` then either
 refuses any query that could expose them, or returns them fully redacted.
-**SQL engines only** — a `[pii]` section on a MongoDB connection is a hard
-config error (exit 3), not a setting that is quietly ignored; see "MongoDB
-specifics" above for why:
+The mechanics below are the SQL engines'; MongoDB gets the same policy through
+a different pair of nets — see "PII on MongoDB" at the end of this section:
 
 ```toml
 [connections.prod.pii]
@@ -648,6 +651,41 @@ an honest `na`: there are no roles, so nothing can be hidden below nyet.
   With those in place `nyet schema` reports only what the role may read, and a
   bypass attempt gets nothing either. The `[pii]` section is the fast, local,
   reviewable layer on top — not a replacement.
+
+**PII on MongoDB.** The same `[pii]` section works on a MongoDB connection, but
+the mechanics are inverted, because the two things the SQL nets stand on do not
+exist there — a schema to resolve names against, and column provenance from the
+server:
+
+- A rule is **exactly `collection.field`** (a deeper path like
+  `users.profile.ssn` is a config error) and protects the field **name at
+  every depth** of every document — `email` at the top level, inside
+  `profile`, inside an array of subdocuments. A same-named field that is not
+  personal data is refused too; that is the fail-closed price of having no
+  schema to tell them apart.
+- **Net A refuses any query that names the field** — a filter key (even inside
+  an equality literal: guessing is an oracle), a sort, a projection, a
+  `"$field"` reference in a pipeline, `distinct`, a `$lookup`
+  `localField`/`foreignField`. The rules follow every collection the query
+  reads: `$lookup`/`$graphLookup`/`$unionWith` sources included.
+- **Net B scans the result documents themselves.** Documents carry their own
+  field names, so before anything is returned nyet walks every document at
+  every depth: a protected key refuses the whole answer under `deny` — even
+  when the query never named the field (`find({})` returns everything) — and
+  is replaced with `[REDACTED]` in place under `mask`, with the same
+  `PII_MASKED` warning.
+- **Mask's one relaxation** is a plain projection: `{email: 1}` (arrives
+  redacted), `{email: 0}` or `$unset` (excluded). Under `deny`, project the
+  fields you need (`{name: 1, city: 1}`) so the field never enters the result.
+- **A handful of operators is refused on a PII connection**
+  (`PII_UNPROVABLE`): `$objectToArray`, `$arrayToObject`, `$getField`,
+  `$setField`, `$unsetField`, `$densify`, `$fill`. They move values around
+  without naming the field — the one thing the two nets cannot see.
+- The server cannot enforce any of this: MongoDB has **no field-level
+  privileges**, so unlike the SQL engines there is no `REVOKE` twin of the
+  policy. `nyet doctor` reports that as a warning with the honest recipe — a
+  view created with `$unset` over the protected fields, and a role granted
+  `find` on the view only.
 
 ### SSH tunnels (a database behind a bastion)
 

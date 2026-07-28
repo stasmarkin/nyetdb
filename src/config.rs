@@ -177,12 +177,9 @@ pub enum ConfigError {
     /// parse (fail-fast) rather than as a runtime tunnel error.
     SshInvalid { alias: String, message: String },
     /// A `[connections.X.pii] columns` entry that is not `table.column` or
-    /// `schema.table.column`. Fail loud rather than silently protecting nothing.
+    /// `schema.table.column` (for MongoDB: exactly `collection.field`). Fail
+    /// loud rather than silently protecting nothing.
     PiiRuleInvalid { alias: String, message: String },
-    /// A `[connections.X.pii]` section on an engine whose PII policy nyet does
-    /// not implement (MongoDB). Refused rather than ignored: a human who wrote
-    /// the section believes something is protected.
-    PiiUnsupported { alias: String, engine: String },
     /// A MongoDB `[ssh]` combination that would route the driver around the
     /// tunnel (see `validate_mongodb`).
     MongoTunnelInvalid { alias: String, message: String },
@@ -345,14 +342,12 @@ fn validate_ssh(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
 
 /// What MongoDB cannot honor, said LOUDLY at parse time (exit 3) instead of
 /// being silently ignored — the same reflex as a guardrail mode an engine has
-/// no estimates for. All three cases are promises nyet would otherwise appear
+/// no estimates for. Every case is a promise nyet would otherwise appear
 /// to make and could not keep:
 ///
-/// - **`[pii]`** — nyet has no way to prove which field of a schemaless
-///   document a `table.column` rule covers, and MongoDB reports no column
-///   provenance for net B to cross-check. A policy that protects nothing is
-///   worse than no policy (UX-7), so the section is refused outright rather
-///   than accepted and ignored.
+/// - **A `[pii]` rule deeper than `collection.field`** — MongoDB's PII policy
+///   protects a field NAME at every depth (no schema means no provable paths),
+///   so a path-shaped rule would read as precision that is not there.
 /// - **`[ssh]` + `mongodb+srv://`** — SRV names the cluster's members by DNS
 ///   and the driver re-resolves them periodically, which would route around
 ///   the bastion. Refused rather than half-supported.
@@ -366,11 +361,24 @@ fn validate_mongodb(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
     if conn.engine != "mongodb" {
         return Ok(());
     }
-    if conn.pii.is_some() {
-        return Err(ConfigError::PiiUnsupported {
-            alias: alias.to_string(),
-            engine: conn.engine.clone(),
-        });
+    // A MongoDB rule is exactly `collection.field`. The protection is by field
+    // NAME at any depth (documents have no fixed paths — see mongo::PiiCtx), so
+    // a deeper spelling like `users.profile.ssn` would promise a path precision
+    // nyet does not deliver: the same class of lie as a rule that never matches.
+    if let Some(pii) = &conn.pii {
+        for rule in pii.columns.as_deref().unwrap_or(&[]) {
+            if rule.split('.').count() != 2 {
+                return Err(ConfigError::PiiRuleInvalid {
+                    alias: alias.to_string(),
+                    message: format!(
+                        "\"{rule}\": a MongoDB rule is \"collection.field\" — the field is \
+                         protected by NAME at every depth of the documents, so a deeper \
+                         path would look more precise than the protection is; write \
+                         \"users.ssn\" to protect every field named `ssn` in `users`"
+                    ),
+                });
+            }
+        }
     }
     if conn.ssh.is_none() {
         return Ok(());
@@ -1246,32 +1254,38 @@ mod tests {
         ));
     }
 
-    /// MongoDB has no PII policy and no tunnel-safe replica-set discovery, and
-    /// nyet says so LOUDLY at parse time instead of accepting a section it
-    /// would then ignore (UX-7: a policy that protects nothing is the worst
-    /// outcome, and a tunnel the driver can route around is not a tunnel).
+    /// MongoDB's `[pii]` rules are `collection.field` exactly (protection is
+    /// by field name at any depth, so a deeper path would read as a precision
+    /// that is not there), and there is no tunnel-safe replica-set discovery —
+    /// nyet says both LOUDLY at parse time (UX-7: a policy that looks more
+    /// precise than it is misleads, and a tunnel the driver can route around
+    /// is not a tunnel).
     #[test]
     fn mongodb_refuses_the_promises_it_cannot_keep() {
         let base = "[connections.m]\nengine = \"mongodb\"\n\
                     url = \"mongodb://u@h:27017/app\"\nallowed_dirs = [\"~\"]\n";
-        // A [pii] section on a MongoDB connection is a hard error — even an
-        // empty one, because a human who wrote it believes something is
-        // protected.
-        for pii in [
-            "[connections.m.pii]\ncolumns = [\"users.email\"]\n",
-            "[connections.m.pii]\ncolumns = []\n",
-        ] {
-            match parse(&format!("{base}{pii}"), &env_of(&[])).unwrap_err() {
-                ConfigError::PiiUnsupported { alias, engine } => {
-                    assert_eq!(alias, "m");
-                    assert_eq!(engine, "mongodb");
-                }
-                other => panic!("expected PiiUnsupported, got {other:?}"),
+        // Two-segment rules are accepted now (PII-M1).
+        parse(
+            &format!("{base}[connections.m.pii]\ncolumns = [\"users.email\"]\n"),
+            &env_of(&[]),
+        )
+        .unwrap();
+        // A deeper path is a hard error, not a silently widened rule.
+        match parse(
+            &format!("{base}[connections.m.pii]\ncolumns = [\"users.profile.ssn\"]\n"),
+            &env_of(&[]),
+        )
+        .unwrap_err()
+        {
+            ConfigError::PiiRuleInvalid { alias, message } => {
+                assert_eq!(alias, "m");
+                assert!(message.contains("collection.field"), "{message}");
             }
+            other => panic!("expected PiiRuleInvalid, got {other:?}"),
         }
-        // The same section on a supported engine is still fine.
+        // The three-segment spelling stays fine on a SQL engine.
         let sql = "[connections.p]\nengine = \"postgres\"\nurl = \"postgres://h/db\"\n\
-                   [connections.p.pii]\ncolumns = [\"users.email\"]\n";
+                   [connections.p.pii]\ncolumns = [\"app.users.email\"]\n";
         parse(sql, &env_of(&[])).unwrap();
 
         // An ssh tunnel plus a url nyet could not honor inside it: one the

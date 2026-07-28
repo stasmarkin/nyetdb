@@ -44,6 +44,13 @@ pub const DENIED_OPERATOR: &str = "DENIED_OPERATOR";
 /// This module panicked while classifying — a bug in nyet, reported as an
 /// ordinary refusal. Same spelling and same meaning as the SQL validator's.
 pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+/// The query names (net A) or the result carries (net B) a field protected by
+/// the connection's `[pii]` policy. Same spelling as the SQL validator's.
+pub const PII_COLUMN: &str = "PII_COLUMN";
+/// The query uses an operator that moves field values around without naming
+/// the field, so nyet cannot prove a protected one stays protected. Same
+/// spelling as the SQL validator's.
+pub const PII_UNPROVABLE: &str = "PII_UNPROVABLE";
 
 /// One refusal, ready for the cli's NYET envelope (exit 5).
 #[derive(Debug)]
@@ -384,6 +391,25 @@ const JS_KEYS: &[&str] = &["$accumulator", "$function", "$where"];
 /// sharpens the message for the ones an agent is likely to try.
 const NYET_OWNED: &[&str] = &["$comment", "$db", "$hint", "$maxTimeMS", "$readPreference"];
 
+/// Refused on a connection with a `[pii]` policy, on top of the allowlists.
+/// Net A refuses any query that NAMES a protected field, and net B scans the
+/// result documents for protected KEYS — which together only hold if a value
+/// cannot travel without its name. These operators are exactly the ones that
+/// break that: `$objectToArray`/`$arrayToObject` convert field names to and
+/// from plain values, `$getField`/`$setField`/`$unsetField` reach a field
+/// through a computed name, and `$densify`/`$fill` take field names in
+/// plain-string positions nyet does not track (and generate values on them).
+/// Sorted — `is_listed` binary searches.
+const PII_UNPROVABLE_KEYS: &[&str] = &[
+    "$arrayToObject",
+    "$densify",
+    "$fill",
+    "$getField",
+    "$objectToArray",
+    "$setField",
+    "$unsetField",
+];
+
 fn is_listed(list: &[&str], name: &str) -> bool {
     list.binary_search(&name).is_ok()
 }
@@ -400,6 +426,15 @@ fn is_listed(list: &[&str], name: &str) -> bool {
 /// this boundary either — same policy, same one mechanism as the SQL validator
 /// (`validator::catching_panics`, which also keeps the trace off stderr).
 pub fn check(text: &str) -> Result<Request, Refusal> {
+    check_with_pii(text, &crate::validator::PiiRules::default())
+}
+
+/// [`check`], plus net A of the connection's `[pii]` policy: any query that
+/// NAMES a protected field — as a document key, a `"$field"` reference, or a
+/// name-position string (`distinct`, `$lookup.localField`, ...) — is refused
+/// before anything connects. The one relaxation is mask mode's plain
+/// projection, see [`PiiCtx`]. With an empty policy this IS `check`.
+pub fn check_with_pii(text: &str, pii: &crate::validator::PiiRules) -> Result<Request, Refusal> {
     crate::validator::catching_panics(|| {
         // Panic injection for the boundary test; compiled out of the shipped
         // binary.
@@ -408,7 +443,8 @@ pub fn check(text: &str) -> Result<Request, Refusal> {
             panic!("injected mongo panic");
         }
         let request = parse(text)?;
-        classify(&request)?;
+        let ctx = PiiCtx::of(&request, pii);
+        classify(&request, ctx.as_ref())?;
         Ok(request)
     })
     .unwrap_or_else(|detail| {
@@ -1639,13 +1675,278 @@ fn parse_ctor(p: &mut Parser, name: &str, depth: usize) -> Result<Bson, Refusal>
 // Classifier — the security boundary
 // ---------------------------------------------------------------------------
 
+/// Net A of the `[pii]` policy, threaded through the SAME walk as the
+/// allowlist so the two can never disagree about what a query contains.
+///
+/// The semantics is a flat, suffix-style match (mirroring the SQL net A's
+/// refusal of every unqualified name): the protected field NAMES of every
+/// collection the request reads — the one it names plus every
+/// `$lookup`/`$graphLookup`/`$unionWith` source — are one set, and any dotted
+/// path with a protected SEGMENT matches, at any depth. Attributing a field to
+/// a collection after a `$lookup` merged their documents is unprovable, and a
+/// parent path (`profile`) may carry a protected child (`profile.ssn`) — both
+/// are why the match is deliberately this wide (fail closed; a same-named
+/// field of another collection in scope is refused too, documented).
+struct PiiCtx {
+    /// Protected field names, lowercased (matching is case-insensitive like
+    /// the SQL rules — over-matching is the safe direction).
+    names: std::collections::BTreeSet<String>,
+    /// `mode = "mask"`: the projection relaxation applies, and net B redacts
+    /// instead of refusing.
+    mask: bool,
+}
+
+/// Where a document key sits. `Projection` is the ONE place mask mode relaxes
+/// net A: a protected name as a key with a literal `0`/`1`/`true`/`false`
+/// (find's projection, `$project`, and nested plain subdocuments of either)
+/// either excludes the field or lets it arrive under its OWN name — which net
+/// B then redacts. Everywhere else a protected name is refused in both modes.
+#[derive(Clone, Copy, PartialEq)]
+enum Pos {
+    Strict,
+    Projection,
+}
+
+impl PiiCtx {
+    fn of(request: &Request, pii: &crate::validator::PiiRules) -> Option<PiiCtx> {
+        if pii.is_empty() {
+            return None;
+        }
+        let mut collections = std::collections::BTreeSet::new();
+        collections.insert(request.collection.to_lowercase());
+        if let Op::Aggregate { pipeline } = &request.op {
+            for stage in pipeline {
+                collect_collections(stage, &mut collections);
+            }
+        }
+        let names: std::collections::BTreeSet<String> = pii
+            .pairs()
+            .filter(|(table, _)| collections.contains(*table))
+            .map(|(_, column)| column.to_string())
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(PiiCtx {
+            names,
+            mask: pii.mode() == crate::validator::PiiMode::Mask,
+        })
+    }
+
+    /// The first protected segment of a dotted path, if any. Splitting on `.`
+    /// is what makes `profile.ssn`, `items.$.email` and a plain `email` all
+    /// answer the same question.
+    fn path_hit<'a>(&self, path: &'a str) -> Option<&'a str> {
+        path.split('.')
+            .find(|segment| self.names.contains(&segment.to_lowercase()))
+    }
+
+    /// A non-`$` document key. `value` decides the mask relaxation: only a
+    /// literal include/exclude marker is provable — `{email: "$name"}` would
+    /// CREATE a key net B then falsely judges, so it is refused up front.
+    fn check_field_key(&self, key: &str, value: &Bson, pos: Pos) -> Result<(), Refusal> {
+        if key.starts_with('$') {
+            return Ok(()); // an operator; `check_key` is its judge
+        }
+        let Some(field) = self.path_hit(key) else {
+            return Ok(());
+        };
+        if pos == Pos::Projection && self.mask && projection_literal(value) {
+            return Ok(());
+        }
+        self.refuse_field(field, "as a document key")
+    }
+
+    /// A string value that is a `"$field"` / `"$$variable.field"` reference.
+    /// The variable NAME (`$$ROOT`, `$$this`, a `let` binding) is not a field;
+    /// the path after it is. A bare `$$ROOT` passes — it moves the document
+    /// WITH its keys, which is exactly what net B sees.
+    fn check_ref(&self, value: &str) -> Result<(), Refusal> {
+        let Some(path) = value.strip_prefix('$') else {
+            return Ok(());
+        };
+        let path = match path.strip_prefix('$') {
+            Some(variable) => match variable.split_once('.') {
+                Some((_, rest)) => rest,
+                None => return Ok(()),
+            },
+            None => path,
+        };
+        match self.path_hit(path) {
+            Some(field) => self.refuse_field(field, "as a field reference"),
+            None => Ok(()),
+        }
+    }
+
+    /// A plain-string FIELD NAME position (`distinct`'s key, `$lookup`'s
+    /// `localField`/`foreignField`/`as`, ...). Reading one is an oracle,
+    /// creating one is a key net B would falsely judge — refused either way,
+    /// in both modes.
+    fn check_name(&self, path: &str, where_: &str) -> Result<(), Refusal> {
+        match self.path_hit(path) {
+            Some(field) => self.refuse_field(field, where_),
+            None => Ok(()),
+        }
+    }
+
+    /// The stage-specific plain-string name positions. A closed list next to
+    /// `STAGES` on purpose: a new stage with a name-position field must be
+    /// added here, and `$densify`/`$fill` — whose name positions generate
+    /// values — are refused wholesale via `PII_UNPROVABLE_KEYS` instead.
+    fn check_stage(&self, key: &str, value: &Bson) -> Result<(), Refusal> {
+        match key {
+            // `$unset` EXCLUDES the named fields — under mask that is the same
+            // promise a `{field: 0}` projection makes, so it is allowed; under
+            // deny naming the field is refused like everywhere else.
+            "$unset" => {
+                let paths: Vec<&str> = match value {
+                    Bson::String(path) => vec![path.as_str()],
+                    Bson::Array(items) => items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Bson::String(path) => Some(path.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for path in paths {
+                    if let Some(field) = self.path_hit(path) {
+                        if !self.mask {
+                            return self.refuse_field(field, "in $unset");
+                        }
+                    }
+                }
+                Ok(())
+            }
+            // `$count` creates a column with that name; `$unwind`'s
+            // `includeArrayIndex` creates a field. A protected spelling there
+            // would collide with what net B scans for.
+            "$count" => match value {
+                Bson::String(name) => self.check_name(name, "as the $count field name"),
+                _ => Ok(()),
+            },
+            "$unwind" => match value {
+                Bson::Document(doc) => match doc.get("includeArrayIndex") {
+                    Some(Bson::String(name)) => {
+                        self.check_name(name, "as $unwind's includeArrayIndex")
+                    }
+                    _ => Ok(()),
+                },
+                // The string form is a `"$path"` reference, judged by
+                // `check_ref` like every other string value.
+                _ => Ok(()),
+            },
+            "$lookup" | "$graphLookup" => {
+                let Bson::Document(doc) = value else {
+                    return Ok(());
+                };
+                for field in [
+                    "localField",
+                    "foreignField",
+                    "as",
+                    "connectFromField",
+                    "connectToField",
+                    "depthField",
+                ] {
+                    if let Some(Bson::String(path)) = doc.get(field) {
+                        self.check_name(path, &format!("as {key}'s {field}"))?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn refuse_field<T>(&self, field: &str, where_: &str) -> Result<T, Refusal> {
+        refuse(
+            PII_COLUMN,
+            format!(
+                "nyet: field '{field}' ({where_}) is protected by this connection's \
+                 PII policy"
+            ),
+            self.hint(),
+        )
+    }
+
+    fn hint(&self) -> String {
+        let relaxation = match self.mask {
+            true => {
+                "a plain `{field: 0}`/`{field: 1}` projection of it is the one \
+                     exception — the field then arrives as [REDACTED]. Anywhere else"
+            }
+            false => {
+                "there is no override and no way to read it through nyet; naming it \
+                      anywhere"
+            }
+        };
+        format!(
+            "this connection's [pii] policy protects that field name at every depth, in \
+             every collection the query reads; {relaxation} — a filter, a sort, an \
+             expression, a $lookup key — is refused, because even a comparison leaks. \
+             Query other fields, or ask the config owner to change the policy"
+        )
+    }
+}
+
+/// The collections a pipeline reads besides the root one — the same
+/// `from`/`coll` spellings `check_collection_source` polices, gathered
+/// recursively so nested pipelines (`$lookup.pipeline`, `$facet`, `$unionWith`)
+/// contribute too. Over-collection is harmless: a stray key that merely looks
+/// like `$lookup` inside an expression only ADDS protected names (fail closed).
+fn collect_collections(value: &Bson, out: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Bson::Document(doc) => {
+            for (key, inner) in doc {
+                if is_listed(NAMESPACE_STAGES, key) {
+                    match inner {
+                        Bson::String(name) => {
+                            out.insert(name.to_lowercase());
+                        }
+                        Bson::Document(spec) => {
+                            for field in ["from", "coll"] {
+                                if let Some(Bson::String(name)) = spec.get(field) {
+                                    out.insert(name.to_lowercase());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                collect_collections(inner, out);
+            }
+        }
+        Bson::Array(items) => {
+            for item in items {
+                collect_collections(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A projection value that provably only includes or excludes the field it
+/// names: `0`, `1`, `true`, `false`. Anything else (an expression, a string, a
+/// subdocument that is not itself plain) computes — no mask exemption.
+fn projection_literal(value: &Bson) -> bool {
+    match value {
+        Bson::Boolean(_) => true,
+        Bson::Int32(n) => *n == 0 || *n == 1,
+        Bson::Int64(n) => *n == 0 || *n == 1,
+        Bson::Double(n) => *n == 0.0 || *n == 1.0,
+        _ => false,
+    }
+}
+
 /// Walk everything the parser produced and refuse any `$`-key that is not on an
 /// allowlist. This is the layer that has to be complete, so it is deliberately
 /// dumb: ONE recursive walk, no shape-specific shortcuts, no "this branch
-/// cannot contain an operator" assumptions.
+/// cannot contain an operator" assumptions. The `[pii]` net A rides on the SAME
+/// walk (a second walk would be a second place to forget a branch).
 /// Private, like `parse`: `check` is the only way in, so "every layer-1 entry
 /// goes through `catching_panics`" is enforced by the compiler, not by habit.
-fn classify(request: &Request) -> Result<(), Refusal> {
+fn classify(request: &Request, pii: Option<&PiiCtx>) -> Result<(), Refusal> {
     match &request.op {
         Op::Find {
             filter,
@@ -1653,18 +1954,23 @@ fn classify(request: &Request) -> Result<(), Refusal> {
             sort,
             ..
         } => {
-            walk_doc(filter, 0)?;
+            walk_doc(filter, 0, pii, Pos::Strict)?;
             if let Some(p) = projection {
-                walk_doc(p, 0)?;
+                walk_doc(p, 0, pii, Pos::Projection)?;
             }
             if let Some(s) = sort {
-                walk_doc(s, 0)?;
+                walk_doc(s, 0, pii, Pos::Strict)?;
             }
             Ok(())
         }
-        Op::Aggregate { pipeline } => walk_pipeline(pipeline, 0),
-        Op::Count { filter } => walk_doc(filter, 0),
-        Op::Distinct { filter, .. } => walk_doc(filter, 0),
+        Op::Aggregate { pipeline } => walk_pipeline(pipeline, 0, pii),
+        Op::Count { filter } => walk_doc(filter, 0, pii, Pos::Strict),
+        Op::Distinct { key, filter } => {
+            if let Some(ctx) = pii {
+                ctx.check_name(key, "as the distinct field")?;
+            }
+            walk_doc(filter, 0, pii, Pos::Strict)
+        }
     }
 }
 
@@ -1674,7 +1980,7 @@ fn classify(request: &Request) -> Result<(), Refusal> {
 /// accept them only as the final top-level stage today; nyet does not rely on
 /// that, because the rule that protects the data must not be the server's
 /// grammar.
-fn walk_pipeline(pipeline: &[Bson], depth: usize) -> Result<(), Refusal> {
+fn walk_pipeline(pipeline: &[Bson], depth: usize, pii: Option<&PiiCtx>) -> Result<(), Refusal> {
     if depth > MAX_DEPTH {
         return too_deep();
     }
@@ -1699,20 +2005,39 @@ fn walk_pipeline(pipeline: &[Bson], depth: usize) -> Result<(), Refusal> {
             );
         }
         for (key, value) in doc {
-            check_key(key, true)?;
-            walk_value_of(key, value, depth + 1)?;
+            check_key(key, true, pii)?;
+            let pos = match key.as_str() {
+                "$project" => Pos::Projection,
+                _ => Pos::Strict,
+            };
+            if let Some(ctx) = pii {
+                ctx.check_stage(key, value)?;
+            }
+            walk_value_of(key, value, depth + 1, pii, pos)?;
         }
     }
     Ok(())
 }
 
-fn walk_doc(doc: &Document, depth: usize) -> Result<(), Refusal> {
+fn walk_doc(doc: &Document, depth: usize, pii: Option<&PiiCtx>, pos: Pos) -> Result<(), Refusal> {
     if depth > MAX_DEPTH {
         return too_deep();
     }
     for (key, value) in doc {
-        check_key(key, false)?;
-        walk_value_of(key, value, depth + 1)?;
+        check_key(key, false, pii)?;
+        if let Some(ctx) = pii {
+            ctx.check_field_key(key, value, pos)?;
+        }
+        // The projection relaxation survives only through PLAIN subdocuments
+        // (`{profile: {ssn: 1}}` is the nested spelling of `{"profile.ssn":
+        // 1}`); under a `$`-operator the value computes, so it is strict.
+        let next = match pos {
+            Pos::Projection if !key.starts_with('$') && matches!(value, Bson::Document(_)) => {
+                Pos::Projection
+            }
+            _ => Pos::Strict,
+        };
+        walk_value_of(key, value, depth + 1, pii, next)?;
     }
     Ok(())
 }
@@ -1785,14 +2110,24 @@ fn check_collection_source(stage: &str, value: &Bson) -> Result<(), Refusal> {
 /// (every value is a pipeline). Missing them would not be a hole (the union
 /// allowlist covers stage names too) but it would make legitimate stages read
 /// as stray operators; getting them right is what makes the message honest.
-fn walk_value_of(key: &str, value: &Bson, depth: usize) -> Result<(), Refusal> {
+fn walk_value_of(
+    key: &str,
+    value: &Bson,
+    depth: usize,
+    pii: Option<&PiiCtx>,
+    pos: Pos,
+) -> Result<(), Refusal> {
     check_collection_source(key, value)?;
     if key == "$facet" {
         if let Bson::Document(facets) = value {
             for (name, sub) in facets {
                 // A branch NAME is a document key like any other: without this
                 // a `$`-prefixed one travelled to the server unclassified.
-                check_key(name, false)?;
+                check_key(name, false, pii)?;
+                if let Some(ctx) = pii {
+                    // A branch name is a key net B will see in the output.
+                    ctx.check_name(name, "as a $facet branch name")?;
+                }
                 let Bson::Array(pipeline) = sub else {
                     return refuse(
                         PARSE_FAILED,
@@ -1801,31 +2136,37 @@ fn walk_value_of(key: &str, value: &Bson, depth: usize) -> Result<(), Refusal> {
                          { $facet: { byStatus: [{ $group: {...} }] } }",
                     );
                 };
-                walk_pipeline(pipeline, depth + 1)?;
+                walk_pipeline(pipeline, depth + 1, pii)?;
             }
             return Ok(());
         }
     }
     if key == "pipeline" {
         if let Bson::Array(pipeline) = value {
-            return walk_pipeline(pipeline, depth + 1);
+            return walk_pipeline(pipeline, depth + 1, pii);
         }
     }
-    walk_value(value, depth)
+    walk_value(value, depth, pii, pos)
 }
 
-fn walk_value(value: &Bson, depth: usize) -> Result<(), Refusal> {
+fn walk_value(value: &Bson, depth: usize, pii: Option<&PiiCtx>, pos: Pos) -> Result<(), Refusal> {
     if depth > MAX_DEPTH {
         return too_deep();
     }
     match value {
-        Bson::Document(doc) => walk_doc(doc, depth),
+        Bson::Document(doc) => walk_doc(doc, depth, pii, pos),
         Bson::Array(items) => {
             for item in items {
-                walk_value(item, depth + 1)?;
+                walk_value(item, depth + 1, pii, pos)?;
             }
             Ok(())
         }
+        // `"$field"` references are strings; without a policy strings are data
+        // and stay uninspected (they are, after all, the agent's filter values).
+        Bson::String(text) => match pii {
+            Some(ctx) => ctx.check_ref(text),
+            None => Ok(()),
+        },
         _ => Ok(()),
     }
 }
@@ -1839,10 +2180,27 @@ fn too_deep<T>() -> Result<T, Refusal> {
 }
 
 /// The single gate every `$`-key passes through. A key that does not start with
-/// `$` is a field name and needs no permission.
-fn check_key(key: &str, stage_position: bool) -> Result<(), Refusal> {
+/// `$` is a field name and needs no permission (net A judges those separately,
+/// with the VALUE in hand — see `PiiCtx::check_field_key`).
+fn check_key(key: &str, stage_position: bool, pii: Option<&PiiCtx>) -> Result<(), Refusal> {
     if !key.starts_with('$') {
         return Ok(());
+    }
+    if pii.is_some() && is_listed(PII_UNPROVABLE_KEYS, key) {
+        return refuse(
+            PII_UNPROVABLE,
+            format!(
+                "nyet: '{key}' is refused on a connection with a [pii] policy — it moves \
+                 field values around without naming the field, so nyet cannot prove a \
+                 protected one stays protected"
+            ),
+            format!(
+                "the policy holds because a value cannot travel without its name; these \
+                 operators break that and are refused wholesale here: {}. Rewrite the \
+                 query without them, or use a connection without a [pii] section",
+                PII_UNPROVABLE_KEYS.join(", ")
+            ),
+        );
     }
     if is_listed(WRITE_KEYS, key) {
         return refuse(
@@ -2191,6 +2549,116 @@ fn align(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Net B: the result scan
+// ---------------------------------------------------------------------------
+
+/// Net B for MongoDB. There is no column provenance to ask the driver for, but
+/// a document RESULT is self-describing: every value arrives under its field
+/// name, at every depth. So net B is a scan — a protected key anywhere in the
+/// rows refuses the whole answer (deny) or redacts the value in place (mask,
+/// returning the matched key names for the `PII_MASKED` warning). It holds
+/// because net A refused every query that could move a value under a foreign
+/// name (any mention of the field, plus `PII_UNPROVABLE_KEYS`).
+///
+/// `text` is re-parsed only to learn the collections in scope — the same
+/// pure walk `check_with_pii` did, so the two nets cannot disagree. The
+/// relaxed-extjson wrapper keys (`$oid`, `$date`, ...) can never collide with
+/// a rule: rule components are identifier-only and `$` is not an identifier
+/// character.
+pub fn scan_reply(
+    text: &str,
+    pii: &crate::validator::PiiRules,
+    columns: &[String],
+    rows: &mut [Vec<serde_json::Value>],
+) -> Result<Vec<String>, Refusal> {
+    crate::validator::catching_panics(|| {
+        let request = parse(text)?;
+        let Some(ctx) = PiiCtx::of(&request, pii) else {
+            return Ok(Vec::new());
+        };
+        let mut masked = std::collections::BTreeSet::new();
+        // The top-level keys of the documents live in `columns`, not in the
+        // cells — except for `count`/`distinct`, whose one column is nyet's own
+        // label (`count`, `value`) and not a document key; judging it would
+        // punish a rule that happens to share its spelling.
+        if !matches!(request.op, Op::Count { .. } | Op::Distinct { .. }) {
+            for (i, column) in columns.iter().enumerate() {
+                let Some(field) = ctx.path_hit(column) else {
+                    continue;
+                };
+                if !ctx.mask {
+                    return scan_refuse(field);
+                }
+                for row in rows.iter_mut() {
+                    if let Some(cell) = row.get_mut(i) {
+                        *cell = serde_json::Value::String(crate::output::REDACTED.to_string());
+                    }
+                }
+                masked.insert(column.clone());
+            }
+        }
+        for row in rows.iter_mut() {
+            for cell in row.iter_mut() {
+                scan_value(cell, &ctx, &mut masked)?;
+            }
+        }
+        Ok(masked.into_iter().collect())
+    })
+    .unwrap_or_else(|detail| {
+        refuse(
+            INTERNAL_ERROR,
+            format!("nyet: internal error while scanning the result: {detail}"),
+            crate::validator::INTERNAL_ERROR_HINT,
+        )
+    })
+}
+
+fn scan_value(
+    value: &mut serde_json::Value,
+    ctx: &PiiCtx,
+    masked: &mut std::collections::BTreeSet<String>,
+) -> Result<(), Refusal> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, inner) in map.iter_mut() {
+                match ctx.path_hit(key) {
+                    Some(field) if !ctx.mask => return scan_refuse(field),
+                    Some(_) => {
+                        masked.insert(key.clone());
+                        // The whole value goes, NULL and subdocuments included:
+                        // presence, type and shape are data too.
+                        *inner = serde_json::Value::String(crate::output::REDACTED.to_string());
+                    }
+                    None => scan_value(inner, ctx, masked)?,
+                }
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scan_value(item, ctx, masked)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn scan_refuse<T>(field: &str) -> Result<T, Refusal> {
+    refuse(
+        PII_COLUMN,
+        format!(
+            "nyet: the result carries a field '{field}' protected by this connection's \
+             PII policy, so the whole answer was withheld"
+        ),
+        "the documents hold the protected field even though the query never named it \
+         (mode = \"deny\" refuses the result, not just the mention); project the fields \
+         you actually need — {other: 1, fields: 1} — or ask the config owner for \
+         mode = \"mask\"",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2264,6 +2732,92 @@ mod tests {
         assert_eq!(WRITE_OPERATION, DenyReason::WriteOperation.as_str());
         assert_eq!(DENIED_FUNCTION, DenyReason::DeniedFunction.as_str());
         assert_eq!(INTERNAL_ERROR, DenyReason::InternalError.as_str());
+        assert_eq!(PII_COLUMN, DenyReason::PiiColumn.as_str());
+        assert_eq!(PII_UNPROVABLE, DenyReason::PiiUnprovable.as_str());
+    }
+
+    fn rules(list: &[&str], mode: crate::validator::PiiMode) -> crate::validator::PiiRules {
+        let owned: Vec<String> = list.iter().map(|r| r.to_string()).collect();
+        crate::validator::PiiRules::parse(&owned, mode).unwrap()
+    }
+
+    /// Net B, mask: a protected key is redacted wherever it sits — a top-level
+    /// column, a nested document, a document inside an array — and the matched
+    /// names come back for the PII_MASKED warning. NULL goes too.
+    #[test]
+    fn pii_scan_redacts_at_every_depth_under_mask() {
+        let pii = rules(&["users.email"], crate::validator::PiiMode::Mask);
+        let columns = vec![
+            "_id".to_string(),
+            "email".to_string(),
+            "profile".to_string(),
+        ];
+        let mut rows = vec![vec![
+            serde_json::json!(1),
+            serde_json::Value::Null,
+            serde_json::json!({"name": "n", "email": "x@y.z",
+                               "contacts": [{"email": "a@b.c", "kind": "work"}]}),
+        ]];
+        let masked = scan_reply("db.users.find({})", &pii, &columns, &mut rows).unwrap();
+        assert_eq!(masked, vec!["email".to_string()]);
+        assert_eq!(rows[0][1], serde_json::json!("[REDACTED]"));
+        assert_eq!(
+            rows[0][2],
+            serde_json::json!({"name": "n", "email": "[REDACTED]",
+                               "contacts": [{"email": "[REDACTED]", "kind": "work"}]})
+        );
+        assert_eq!(rows[0][0], serde_json::json!(1), "untouched column changed");
+    }
+
+    /// Net B, deny: the same result refuses as a whole — even though the query
+    /// (`find({})`) never NAMED the field, the documents carry it.
+    #[test]
+    fn pii_scan_refuses_the_whole_answer_under_deny() {
+        let pii = rules(&["users.email"], crate::validator::PiiMode::Deny);
+        let columns = vec!["_id".to_string(), "profile".to_string()];
+        let mut rows = vec![vec![
+            serde_json::json!(1),
+            serde_json::json!({"email": "x@y.z"}),
+        ]];
+        let r = scan_reply("db.users.find({})", &pii, &columns, &mut rows).unwrap_err();
+        assert_eq!(r.reason, PII_COLUMN);
+    }
+
+    /// The `count`/`value` column of countDocuments/distinct is nyet's own
+    /// label, not a document key: a rule that happens to share the spelling
+    /// must not judge it. (The VALUES are still scanned — a distinct over
+    /// subdocuments can carry protected keys.)
+    #[test]
+    fn pii_scan_skips_nyets_own_column_labels() {
+        let pii = rules(&["users.value"], crate::validator::PiiMode::Deny);
+        let columns = vec!["value".to_string()];
+        let mut rows = vec![vec![serde_json::json!("ok")]];
+        scan_reply("db.users.distinct(\"city\")", &pii, &columns, &mut rows).unwrap();
+        // ...but a protected key INSIDE a distinct value still refuses.
+        let pii = rules(&["users.ssn"], crate::validator::PiiMode::Deny);
+        let mut rows = vec![vec![serde_json::json!({"ssn": "123"})]];
+        let r = scan_reply("db.users.distinct(\"profile\")", &pii, &columns, &mut rows);
+        assert_eq!(r.unwrap_err().reason, PII_COLUMN);
+    }
+
+    /// Rules follow the collections the query READS: a `users.email` rule does
+    /// not touch a query over `orders` — until a `$lookup` pulls `users` in.
+    #[test]
+    fn pii_scope_is_the_collections_the_query_reads() {
+        let pii = rules(&["users.email"], crate::validator::PiiMode::Deny);
+        check_with_pii("db.orders.find({email: \"x\"})", &pii).unwrap();
+        let joined = "db.orders.aggregate([{$lookup: {from: \"users\", localField: \"b\", \
+                      foreignField: \"_id\", as: \"who\"}}, {$sort: {email: 1}}])";
+        assert_eq!(check_with_pii(joined, &pii).unwrap_err().reason, PII_COLUMN);
+        // Net B follows the same scope.
+        let columns = vec!["email".to_string()];
+        let mut rows = vec![vec![serde_json::json!("x@y.z")]];
+        scan_reply("db.orders.find({})", &pii, &columns, &mut rows).unwrap();
+        assert_eq!(
+            rows[0][0],
+            serde_json::json!("x@y.z"),
+            "out-of-scope column touched"
+        );
     }
 
     /// MongoDB layer 1 is a boundary like the SQL one, so a panic in it is a bug
@@ -2304,6 +2858,10 @@ mod tests {
             let name = file.file_name().unwrap().to_string_lossy().into_owned();
             let text = std::fs::read_to_string(&file).unwrap();
             let mut cases: Vec<(usize, String, String, Option<String>)> = Vec::new();
+            // File-wide `pii:` / `pii_mode:` headers before the first case turn
+            // the whole file into a net-A corpus (same format as the SQL one).
+            let mut pii_rules: Vec<String> = Vec::new();
+            let mut pii_mode = crate::validator::PiiMode::Deny;
             for (idx, raw) in text.lines().enumerate() {
                 let line = raw.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -2312,6 +2870,16 @@ mod tests {
                 if let Some(q) = line.strip_prefix("- query: ") {
                     cases.push((idx + 1, q.to_string(), String::new(), None));
                     continue;
+                }
+                if cases.is_empty() {
+                    if let Some(p) = line.strip_prefix("pii: ") {
+                        pii_rules = p.split(',').map(|r| r.trim().to_string()).collect();
+                        continue;
+                    }
+                    if let Some(m) = line.strip_prefix("pii_mode: ") {
+                        pii_mode = crate::validator::PiiMode::parse(m).unwrap();
+                        continue;
+                    }
                 }
                 let case = cases
                     .last_mut()
@@ -2324,10 +2892,11 @@ mod tests {
                     panic!("{name}:{}: unrecognized corpus line: {raw}", idx + 1);
                 }
             }
+            let pii = crate::validator::PiiRules::parse(&pii_rules, pii_mode).unwrap();
             for (line, query, verdict, reason) in cases {
                 total += 1;
                 let at = format!("{name}:{line} {query:?}");
-                match check(&query) {
+                match check_with_pii(&query, &pii) {
                     Ok(_) => {
                         assert_eq!(verdict, "allow", "{at}: got allow");
                         assert!(reason.is_none(), "{at}: reason on an allow case");

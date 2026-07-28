@@ -3319,9 +3319,12 @@ fn mongo_config_promises_it_cannot_keep_are_exit_3() {
     let tmp = tempfile::tempdir().unwrap();
     let base = mongo_config(tmp.path());
     for (name, extra) in [
+        // A [pii] rule deeper than `collection.field`: the protection is by
+        // field name at any depth, so a path-shaped rule would promise a
+        // precision that is not there (a plain 2-segment rule is valid now).
         (
             "pii",
-            "[connections.mongo.pii]\ncolumns = [\"users.email\"]\n",
+            "[connections.mongo.pii]\ncolumns = [\"users.profile.ssn\"]\n",
         ),
         (
             "guardrail",
