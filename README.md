@@ -236,6 +236,13 @@ accepted and why everything else is refused. Result documents map to JSON as
 `tls=true` in the url (a `mongodb+srv://` url turns it on by default); without
 it a query carries the `INSECURE_TRANSPORT` warning. Certificates are verified
 against the bundled Mozilla roots; point `tlsCAFile=` at a private CA if needed.
+**Handshake:** nyet declares MongoDB's stable API (v1, not strict — the commands
+outside it that `doctor` needs still work), which makes the driver open with
+`hello` rather than the legacy `isMaster`. Some deployments sit behind a proxy
+that answers `hello` and hangs up on the legacy name, and the failure is a bare
+`unexpected end of file` that names nothing. A server older than 5.0 does not
+understand `apiVersion` at all — nyet recognises it by its wire version and
+reconnects once without it, so only those pay the extra round trip.
 
 **Be honest about what MongoDB does NOT get (UX-7).** The SQL engines have three
 layers; MongoDB has two, and nyet says so rather than implying otherwise:

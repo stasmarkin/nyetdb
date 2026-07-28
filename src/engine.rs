@@ -13,7 +13,7 @@ use crate::output::{
 use crate::validator::Origin;
 use futures_util::TryStreamExt;
 use mongodb::bson::{Bson, Document};
-use mongodb::options::{ClientOptions, ServerAddress, Tls};
+use mongodb::options::{ClientOptions, ServerAddress, ServerApi, ServerApiVersion, Tls};
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlRow, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgRow, PgSslMode};
@@ -3549,24 +3549,38 @@ impl Mongo {
             // forbids. Documented in the README.
             opts.tls = Some(Tls::Disabled);
         }
-        let client = mongodb::Client::with_options(opts).map_err(|_| EngineError::Connect {
-            message: "the MongoDB client could not be built from this connection's `url`"
-                .to_string(),
-            hint: "check the url's options; over an ssh tunnel nyet forces a direct \
-                   connection to the forwarded port, so replicaSet/loadBalanced options \
-                   are not usable there"
-                .to_string(),
-        })?;
+        // Declaring the stable API is what makes the driver open the handshake
+        // with `hello` instead of the legacy `isMaster` (see `hello_command` in
+        // the driver), and some deployments sit behind a proxy that answers
+        // `hello` and hangs up on the legacy name — a bare "unexpected end of
+        // file" that names nothing. Declaring it first (rather than falling
+        // back to it) is what keeps that case cheap: the fallback would have to
+        // wait out the whole server-selection timeout before it could tell a
+        // hang-up from a slow server. The price is paid by pre-5.0 servers
+        // instead, which reject every command carrying `apiVersion` — they are
+        // recognised below by their wire version and reconnected without it.
+        let plain_opts = opts.clone();
+        opts.server_api = Some(ServerApi::builder().version(ServerApiVersion::V1).build());
+        let mut client = build_mongo_client(opts)?;
         // The driver connects LAZILY, so the handshake would otherwise happen
         // inside the first command — under the QUERY deadline, which makes an
         // unreachable host answer TIMEOUT (exit 8) instead of
-        // CONNECTION_FAILED (exit 6). One `ping` under the CONNECT deadline
+        // CONNECTION_FAILED (exit 6). One `hello` under the CONNECT deadline
         // buys the same split the other engines get from their handshake: a
         // dead host, a refused TLS handshake and a wrong password are all exit
         // 6, and only a slow QUERY is exit 8. It costs the round trip those
-        // engines already pay at connect.
-        let ping = mongodb::bson::doc! { "ping": 1 };
-        match tokio::time::timeout(deadline, client.database(&database).run_command(ping)).await {
+        // engines already pay at connect, and its reply carries the wire
+        // version that decides the retry below.
+        let mut probed = mongo_hello(&client, &database, deadline).await;
+        // A server too old for `apiVersion` gets ONE reconnect without it —
+        // otherwise every command it receives fails to parse. Both signals are
+        // cheap: an old server ANSWERS (with a low wire version) or rejects the
+        // unknown `hello` outright, so neither costs the server-selection wait.
+        if refuses_stable_api(&probed) {
+            client = build_mongo_client(plain_opts)?;
+            probed = mongo_hello(&client, &database, deadline).await;
+        }
+        match probed {
             Err(_elapsed) => {
                 return Err(EngineError::Connect {
                     message: "the connection to the MongoDB server did not complete in time"
@@ -3585,6 +3599,54 @@ impl Mongo {
             Ok(Ok(_)) => {}
         }
         Ok((client, database))
+    }
+}
+
+fn build_mongo_client(opts: ClientOptions) -> Result<mongodb::Client, EngineError> {
+    mongodb::Client::with_options(opts).map_err(|_| EngineError::Connect {
+        message: "the MongoDB client could not be built from this connection's `url`".to_string(),
+        hint: "check the url's options; over an ssh tunnel nyet forces a direct \
+               connection to the forwarded port, so replicaSet/loadBalanced options \
+               are not usable there"
+            .to_string(),
+    })
+}
+
+/// The wire version MongoDB 5.0 speaks — the first release that understands
+/// `apiVersion`. Anything below rejects every command that carries it.
+const STABLE_API_WIRE_VERSION: i64 = 13;
+
+async fn mongo_hello(
+    client: &mongodb::Client,
+    database: &str,
+    deadline: Duration,
+) -> Result<mongodb::error::Result<Document>, tokio::time::error::Elapsed> {
+    let hello = mongodb::bson::doc! { "hello": 1 };
+    tokio::time::timeout(deadline, client.database(database).run_command(hello)).await
+}
+
+/// Is this server too old for the stable API? Decides ONE extra connect attempt
+/// (see `open`), never what an error means to the caller. A server that answers
+/// names its wire version; one that predates `hello` (pre-4.4.2) fails the probe
+/// with CommandNotFound instead, and both mean the same thing here. A timeout or
+/// any other error is left alone — the caller reports it as it stands.
+fn refuses_stable_api(
+    probed: &Result<mongodb::error::Result<Document>, tokio::time::error::Elapsed>,
+) -> bool {
+    match probed {
+        Ok(Ok(reply)) => {
+            let wire = reply
+                .get_i32("maxWireVersion")
+                .map(i64::from)
+                .or_else(|_| reply.get_i64("maxWireVersion"))
+                .unwrap_or(STABLE_API_WIRE_VERSION);
+            wire < STABLE_API_WIRE_VERSION
+        }
+        Ok(Err(e)) => matches!(
+            &*e.kind,
+            mongodb::error::ErrorKind::Command(c) if c.code == 59
+        ),
+        Err(_elapsed) => false,
     }
 }
 
@@ -4468,6 +4530,28 @@ mod tests {
     /// `require` would silently discard a verification the user asked for.
     /// Everything below `require` (including `allow`, which is WEAKER than
     /// `prefer` despite sorting after `disable`) stays plaintext.
+    /// The retry that keeps pre-5.0 MongoDB working: a server whose wire
+    /// version is below 13 rejects every command carrying `apiVersion`, so it
+    /// must be reconnected without the stable API — and a server at or above it
+    /// must NOT be, or the extra connect would be paid on every query. A reply
+    /// with no wire version at all is treated as new enough: guessing "old"
+    /// there would make the retry the default path.
+    #[test]
+    fn only_a_pre_stable_api_wire_version_asks_for_a_second_connect() {
+        let probed = |wire: Option<i32>| {
+            let mut reply = Document::new();
+            if let Some(w) = wire {
+                reply.insert("maxWireVersion", w);
+            }
+            Ok(Ok(reply))
+        };
+        assert!(refuses_stable_api(&probed(Some(9)))); // MongoDB 4.4
+        assert!(refuses_stable_api(&probed(Some(12)))); // 4.9 dev builds
+        assert!(!refuses_stable_api(&probed(Some(13)))); // 5.0, the first with apiVersion
+        assert!(!refuses_stable_api(&probed(Some(25)))); // 8.0
+        assert!(!refuses_stable_api(&probed(None)));
+    }
+
     #[test]
     fn host_override_rewrites_sslmode_for_the_tunnel_leg() {
         let tunnel = Some(("127.0.0.1".to_string(), 61234));
