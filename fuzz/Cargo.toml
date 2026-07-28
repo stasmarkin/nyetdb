@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+serde_json = "1"
 
 [dependencies.nyetdb]
 path = ".."
@@ -23,6 +24,13 @@ bench = false
 [[bin]]
 name = "mongo_check"
 path = "fuzz_targets/mongo_check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mongo_pii"
+path = "fuzz_targets/mongo_pii.rs"
 test = false
 doc = false
 bench = false

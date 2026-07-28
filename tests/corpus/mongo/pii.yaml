@@ -79,6 +79,28 @@ pii: users.email, users.ssn
   verdict: deny
   reason: PII_UNPROVABLE
 
+# --- consuming the whole document into a keyless scalar (found in review):
+#     $bsonSize is the LENGTH of a protected value, a bare $$ROOT can be sized
+#     or grouped after a stage drops the protected key, so both are refused ---
+- query: db.users.aggregate([{$project: {_id: 0, name: 0}}, {$project: {n: {$bsonSize: "$$ROOT"}, _id: 0}}])
+  verdict: deny
+  reason: PII_UNPROVABLE
+- query: db.users.aggregate([{$group: {_id: "$$ROOT"}}, {$count: "n"}])
+  verdict: deny
+  reason: PII_UNPROVABLE
+- query: db.users.aggregate([{$project: {sz: {$bsonSize: "$profile"}}}])
+  verdict: deny
+  reason: PII_UNPROVABLE
+- query: db.users.aggregate([{$group: {_id: "$city", docs: {$push: "$$CURRENT"}}}])
+  verdict: deny
+  reason: PII_UNPROVABLE
+
+# --- a protected name as a key inside a value literally named `pipeline`
+#     (which walk_value_of reroutes into the pipeline walk) is still judged ---
+- query: db.users.countDocuments({pipeline: [{email: "a@b.c"}]})
+  verdict: deny
+  reason: PII_COLUMN
+
 # --- the policy follows every collection the query reads ---
 - query: db.orders.aggregate([{$lookup: {from: "users", localField: "buyer", foreignField: "_id", as: "who"}}, {$match: {"who.email": {$exists: true}}}])
   verdict: deny
@@ -103,6 +125,6 @@ pii: users.email, users.ssn
 # a filter VALUE that merely contains the word is data, not a mention
 - query: db.users.find({note: "email me later"})
   verdict: allow
-# $$ROOT alone moves the document WITH its keys — net B's scan sees them
-- query: db.users.aggregate([{$group: {_id: "$city", docs: {$push: "$$ROOT"}}}])
+# naming the fields explicitly is the way to reshape without the whole document
+- query: db.users.aggregate([{$group: {_id: "$city", names: {$push: "$name"}}}])
   verdict: allow

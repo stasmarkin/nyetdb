@@ -199,12 +199,15 @@ cannot tell which result column is which) — list the columns instead.
 On a MongoDB connection the same policy protects the field NAME at every depth
 of every document: naming it anywhere in the query — a filter, a sort, a
 `"$field"` reference, `distinct`, a `$lookup` key — is refused, and a result
-that carries the field (even nested, even when the query never named it) is
-refused under `"deny"` or comes back as `[REDACTED]` under `"mask"`. The one
-`"mask"` relaxation is a plain projection: `{email: 1}` (it arrives redacted) or
-`{email: 0}`/`$unset` (it is excluded). Under `"deny"`, project the fields you
-need explicitly (`{name: 1, city: 1}`) so the protected field never enters the
-result.
+of THAT collection that carries the field (even nested, even when the query
+never named it) is refused under `"deny"` or comes back as `[REDACTED]` under
+`"mask"`. The one `"mask"` relaxation is a plain projection: `{email: 1}` (it
+arrives redacted) or `{email: 0}`/`$unset` (it is excluded). Under `"deny"`,
+project the fields you need explicitly (`{name: 1, city: 1}`) so the protected
+field never enters the result. The policy is keyed on the collection NAME, so a
+rule on `users` does not follow the same data into a view or a copy collection
+under a different name — the config owner has to name each one; do not assume a
+field is safe just because a related collection protects it.
 
 There is no flag, header or retry shape that lifts this: the policy belongs to
 whoever owns the config file. If a task genuinely needs the protected data, say

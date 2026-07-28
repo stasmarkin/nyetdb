@@ -3660,10 +3660,14 @@ impl Engine for Mongo {
         fetch_limit: u64,
         _guardrail: &Guardrail,
     ) -> Result<QueryOutcome, EngineError> {
-        // Layer 1 again, on the very text the cli classified. `mongo::check` is
-        // pure and deterministic, so this cannot disagree with the cli's own
-        // verdict — it is here so that what EXECUTES is what was CLASSIFIED,
-        // with no second representation in between to drift.
+        // Layer 1 again, on the very text the cli classified. `mongo::check`
+        // is pure and deterministic, so the ALLOWLIST verdict cannot disagree
+        // with the cli's — it is here so that what EXECUTES is what was
+        // CLASSIFIED, with no second representation in between to drift. It is
+        // deliberately the policy-less `check`: both PII nets live in the cli
+        // wrapper (net A in `validate_mongo`, net B in `Db::execute`), so a
+        // NEW caller of this engine gets the allowlist for free but must bring
+        // the PII nets itself — there is no compile-time signal for that.
         let request = crate::mongo::check(sql).map_err(|r| EngineError::Db {
             message: format!("nyet refused this query on re-validation: {}", r.message),
             hint: r.hint,

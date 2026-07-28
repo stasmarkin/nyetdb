@@ -378,6 +378,21 @@ fn validate_mongodb(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
                     ),
                 });
             }
+            // The SQL identifier charset allows `$` (Postgres does), but a
+            // MongoDB rule with one would collide with the relaxed-extJSON
+            // wrapper keys ($oid, $date, ...) net B scans past — a rule
+            // `users.$oid` would judge every ObjectId in every result.
+            if rule.contains('$') {
+                return Err(ConfigError::PiiRuleInvalid {
+                    alias: alias.to_string(),
+                    message: format!(
+                        "\"{rule}\": '$' is not valid in a MongoDB rule — MongoDB field \
+                         names cannot start with '$', and nyet's own JSON spelling of \
+                         ObjectId/Date values uses '$'-prefixed keys the rule would \
+                         collide with"
+                    ),
+                });
+            }
         }
     }
     if conn.ssh.is_none() {
@@ -1264,12 +1279,29 @@ mod tests {
     fn mongodb_refuses_the_promises_it_cannot_keep() {
         let base = "[connections.m]\nengine = \"mongodb\"\n\
                     url = \"mongodb://u@h:27017/app\"\nallowed_dirs = [\"~\"]\n";
-        // Two-segment rules are accepted now (PII-M1).
-        parse(
-            &format!("{base}[connections.m.pii]\ncolumns = [\"users.email\"]\n"),
+        // Two-segment rules are accepted now (PII-M1), and — same as SQL — an
+        // empty `columns` (or an empty section) is NO policy rather than an
+        // error: pinned, because this flipped from the old hard error and a
+        // silent behavior change must at least be a stated one.
+        for pii in [
+            "[connections.m.pii]\ncolumns = [\"users.email\"]\n",
+            "[connections.m.pii]\ncolumns = []\n",
+        ] {
+            parse(&format!("{base}{pii}"), &env_of(&[])).unwrap();
+        }
+        // A '$' in a rule would collide with the extended-JSON wrapper keys
+        // net B scans past ($oid, $date, ...).
+        match parse(
+            &format!("{base}[connections.m.pii]\ncolumns = [\"users.$oid\"]\n"),
             &env_of(&[]),
         )
-        .unwrap();
+        .unwrap_err()
+        {
+            ConfigError::PiiRuleInvalid { message, .. } => {
+                assert!(message.contains('$'), "{message}")
+            }
+            other => panic!("expected PiiRuleInvalid, got {other:?}"),
+        }
         // A deeper path is a hard error, not a silently widened rule.
         match parse(
             &format!("{base}[connections.m.pii]\ncolumns = [\"users.profile.ssn\"]\n"),

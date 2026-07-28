@@ -68,12 +68,18 @@ file it privately as above.
   computed names (`$objectToArray`, `$getField`, ...) — are refused wholesale,
   but the completeness of *that list* is **not proven**, and MongoDB adds
   operators every release (the allowlist refuses new ones by default, which is
-  the real backstop). A parent-path count (`countDocuments({profile: {$exists:
-  true}})`) still leaks the *presence* of a subdocument, one bit per query —
-  same accepted class as the SQL `WHERE` oracle above. MongoDB has no
-  field-level privileges, so unlike SQL there is **no server-side twin** of the
-  policy: the honest boundary is a view minus the protected fields with a role
-  scoped to it, and `nyet doctor` says so.
+  the real backstop). Two residual channels are the same **accepted class** as
+  the SQL `WHERE` oracle above and cannot be closed without a schema: a
+  parent-path count (`countDocuments({profile: {$exists: true}})`) leaks the
+  *presence* of a subdocument, and sorting/skip/limit on an unprotected PARENT
+  of a protected field (`sort({profile: 1})`) leaks the protected value's
+  *order* — neither returns the value, both leak a bit per query. The policy is
+  also keyed on the **collection name**: a view or copy collection over the
+  protected data under a different name is not covered unless it is named too
+  (as on the SQL side). And MongoDB has no field-level privileges, so unlike
+  SQL there is **no server-side twin** of the policy: the honest boundary is a
+  view that `$unset`s the protected fields with a role scoped to it, and `nyet
+  doctor` says so.
 
 - **A read that causes a side effect is only as complete as the denylist.** A
   `SELECT` can call a function that writes or reaches outside the database

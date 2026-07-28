@@ -662,7 +662,12 @@ server:
   every depth** of every document — `email` at the top level, inside
   `profile`, inside an array of subdocuments. A same-named field that is not
   personal data is refused too; that is the fail-closed price of having no
-  schema to tell them apart.
+  schema to tell them apart. The rule is keyed on the **collection name**: a
+  view or a copy collection that carries the same data under a different name
+  is **not** covered unless you name it too (the SQL side has the same caveat
+  for views). If a role can read both `users` and a view over it, protect the
+  view — or, better, scope the role to a view that already `$unset`s the
+  fields, which `nyet doctor` recommends.
 - **Net A refuses any query that names the field** — a filter key (even inside
   an equality literal: guessing is an oracle), a sort, a projection, a
   `"$field"` reference in a pipeline, `distinct`, a `$lookup`
@@ -679,8 +684,11 @@ server:
   fields you need (`{name: 1, city: 1}`) so the field never enters the result.
 - **A handful of operators is refused on a PII connection**
   (`PII_UNPROVABLE`): `$objectToArray`, `$arrayToObject`, `$getField`,
-  `$setField`, `$unsetField`, `$densify`, `$fill`. They move values around
-  without naming the field — the one thing the two nets cannot see.
+  `$setField`, `$unsetField`, `$bsonSize`, `$densify`, `$fill`, and a bare
+  whole-document variable (`$$ROOT`/`$$CURRENT`). They move a value — or a
+  document's size — around without naming the field, so a later pipeline stage
+  can size or group it after dropping the protected key. The one thing the two
+  nets cannot see, refused up front.
 - The server cannot enforce any of this: MongoDB has **no field-level
   privileges**, so unlike the SQL engines there is no `REVOKE` twin of the
   policy. `nyet doctor` reports that as a warning with the honest recipe — a

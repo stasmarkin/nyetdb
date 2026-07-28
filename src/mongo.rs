@@ -397,11 +397,14 @@ const NYET_OWNED: &[&str] = &["$comment", "$db", "$hint", "$maxTimeMS", "$readPr
 /// cannot travel without its name. These operators are exactly the ones that
 /// break that: `$objectToArray`/`$arrayToObject` convert field names to and
 /// from plain values, `$getField`/`$setField`/`$unsetField` reach a field
-/// through a computed name, and `$densify`/`$fill` take field names in
+/// through a computed name, `$bsonSize` consumes a whole document (a nameless
+/// subdocument included) into a byte count — the LENGTH of a protected value,
+/// found adversarially — and `$densify`/`$fill` take field names in
 /// plain-string positions nyet does not track (and generate values on them).
 /// Sorted — `is_listed` binary searches.
 const PII_UNPROVABLE_KEYS: &[&str] = &[
     "$arrayToObject",
+    "$bsonSize",
     "$densify",
     "$fill",
     "$getField",
@@ -1758,9 +1761,14 @@ impl PiiCtx {
     }
 
     /// A string value that is a `"$field"` / `"$$variable.field"` reference.
-    /// The variable NAME (`$$ROOT`, `$$this`, a `let` binding) is not a field;
-    /// the path after it is. A bare `$$ROOT` passes — it moves the document
-    /// WITH its keys, which is exactly what net B sees.
+    /// The variable NAME (`$$this`, a `let` binding) is not a field; the path
+    /// after it is. A bare whole-document variable (`$$ROOT`, `$$CURRENT`) is
+    /// refused: "the scan will see its keys" only holds when the document
+    /// REACHES the output, and a later stage can consume it into a keyless
+    /// scalar instead — `{$bsonSize: "$$ROOT"}` is the length of a protected
+    /// value, `{$group: {_id: "$$ROOT"}}` its cardinality (found
+    /// adversarially). Without taint-tracking through the pipeline nyet cannot
+    /// tell the two fates apart, so it does not try (fail closed).
     fn check_ref(&self, value: &str) -> Result<(), Refusal> {
         let Some(path) = value.strip_prefix('$') else {
             return Ok(());
@@ -1768,7 +1776,22 @@ impl PiiCtx {
         let path = match path.strip_prefix('$') {
             Some(variable) => match variable.split_once('.') {
                 Some((_, rest)) => rest,
-                None => return Ok(()),
+                None => {
+                    if matches!(variable, "ROOT" | "CURRENT") {
+                        return refuse(
+                            PII_UNPROVABLE,
+                            format!(
+                                "nyet: a bare '$${variable}' is refused on a connection with \
+                                 a [pii] policy — nyet cannot prove the whole document \
+                                 reaches the output with its field names intact"
+                            ),
+                            "name the fields you need instead of the whole document \
+                             (e.g. {$push: {name: \"$name\", city: \"$city\"}}), or use a \
+                             connection without a [pii] section",
+                        );
+                    }
+                    return Ok(());
+                }
             },
             None => path,
         };
@@ -2011,6 +2034,12 @@ fn walk_pipeline(pipeline: &[Bson], depth: usize, pii: Option<&PiiCtx>) -> Resul
                 _ => Pos::Strict,
             };
             if let Some(ctx) = pii {
+                // A real stage key is `$`-spelled and check_field_key waves it
+                // through — but this walk also receives IMPOSTORS: a document
+                // field literally named `pipeline` reroutes here (see
+                // walk_value_of), and without this line its plain keys were
+                // never judged, an equality-guessing oracle (found in review).
+                ctx.check_field_key(key, value, Pos::Strict)?;
                 ctx.check_stage(key, value)?;
             }
             walk_value_of(key, value, depth + 1, pii, pos)?;
@@ -2564,8 +2593,9 @@ fn align(
 /// `text` is re-parsed only to learn the collections in scope — the same
 /// pure walk `check_with_pii` did, so the two nets cannot disagree. The
 /// relaxed-extjson wrapper keys (`$oid`, `$date`, ...) can never collide with
-/// a rule: rule components are identifier-only and `$` is not an identifier
-/// character.
+/// a rule: `config::validate_mongodb` refuses a `$` anywhere in a MongoDB
+/// rule for exactly this reason (the SQL identifier charset alone would let
+/// `users.$oid` through).
 pub fn scan_reply(
     text: &str,
     pii: &crate::validator::PiiRules,
@@ -2600,7 +2630,7 @@ pub fn scan_reply(
         }
         for row in rows.iter_mut() {
             for cell in row.iter_mut() {
-                scan_value(cell, &ctx, &mut masked)?;
+                scan_value(cell, &ctx, &mut masked, 0)?;
             }
         }
         Ok(masked.into_iter().collect())
@@ -2618,7 +2648,23 @@ fn scan_value(
     value: &mut serde_json::Value,
     ctx: &PiiCtx,
     masked: &mut std::collections::BTreeSet<String>,
+    depth: usize,
 ) -> Result<(), Refusal> {
+    // The reply is bytes from the network, the same trust boundary as the
+    // query-side walks: a genuine mongod caps BSON nesting at 100, so only a
+    // hostile or broken server/proxy gets here — and it must get a refusal,
+    // not a stack overflow (an abort, which catching_panics cannot catch).
+    if depth > MAX_DEPTH {
+        return refuse(
+            PII_UNPROVABLE,
+            format!(
+                "nyet: the server's reply nests deeper than nyet's limit of {MAX_DEPTH} \
+                 levels, so the PII scan cannot prove it holds no protected field"
+            ),
+            "a genuine MongoDB server never produces this (its own BSON nesting cap is \
+             the same limit); whatever answered is not behaving like one",
+        );
+    }
     match value {
         serde_json::Value::Object(map) => {
             for (key, inner) in map.iter_mut() {
@@ -2630,14 +2676,14 @@ fn scan_value(
                         // presence, type and shape are data too.
                         *inner = serde_json::Value::String(crate::output::REDACTED.to_string());
                     }
-                    None => scan_value(inner, ctx, masked)?,
+                    None => scan_value(inner, ctx, masked, depth + 1)?,
                 }
             }
             Ok(())
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                scan_value(item, ctx, masked)?;
+                scan_value(item, ctx, masked, depth + 1)?;
             }
             Ok(())
         }
@@ -2695,6 +2741,9 @@ mod tests {
             ("NYET_OWNED", NYET_OWNED),
             ("EXT_JSON_KEYS", EXT_JSON_KEYS),
             ("NAMESPACE_STAGES", NAMESPACE_STAGES),
+            // The one list whose breakage fails OPEN: a missed binary_search
+            // here ALLOWS a mover on a [pii] connection (found in review).
+            ("PII_UNPROVABLE_KEYS", PII_UNPROVABLE_KEYS),
         ] {
             let mut sorted = list.to_vec();
             sorted.sort_unstable();
@@ -2739,6 +2788,63 @@ mod tests {
     fn rules(list: &[&str], mode: crate::validator::PiiMode) -> crate::validator::PiiRules {
         let owned: Vec<String> = list.iter().map(|r| r.to_string()).collect();
         crate::validator::PiiRules::parse(&owned, mode).unwrap()
+    }
+
+    /// Net A must refuse the whole-document consumers that reach a protected
+    /// LENGTH or CARDINALITY without ever naming the field (found in review):
+    /// `$bsonSize` over any document, and a bare `$$ROOT`/`$$CURRENT` that a
+    /// later stage can size or group after dropping the protected key.
+    #[test]
+    fn pii_refuses_whole_document_consumers_in_both_modes() {
+        for mode in [
+            crate::validator::PiiMode::Deny,
+            crate::validator::PiiMode::Mask,
+        ] {
+            let pii = rules(&["users.email"], mode);
+            for query in [
+                "db.users.aggregate([{$project: {_id: 0, name: 0}}, \
+                 {$project: {n: {$bsonSize: \"$$ROOT\"}, _id: 0}}])",
+                "db.users.aggregate([{$group: {_id: \"$$ROOT\"}}, {$count: \"n\"}])",
+                "db.users.aggregate([{$project: {sz: {$bsonSize: \"$profile\"}}}])",
+            ] {
+                assert_eq!(
+                    check_with_pii(query, &pii).unwrap_err().reason,
+                    PII_UNPROVABLE,
+                    "{mode:?}: {query}"
+                );
+            }
+        }
+    }
+
+    /// A protected name used as a KEY inside a value that is literally called
+    /// `pipeline` (which `walk_value_of` reroutes into the pipeline walk) must
+    /// still be judged — the walk used to judge nothing for a plain-named
+    /// stage key, an equality-guessing oracle (found in review).
+    #[test]
+    fn pii_judges_keys_inside_an_impostor_pipeline_field() {
+        let pii = rules(&["users.ssn"], crate::validator::PiiMode::Deny);
+        let r = check_with_pii(
+            "db.users.countDocuments({pipeline: [{ssn: \"123-45-6789\"}]})",
+            &pii,
+        )
+        .unwrap_err();
+        assert_eq!(r.reason, PII_COLUMN);
+    }
+
+    /// Net B walks bytes from the network, so a pathologically nested reply
+    /// must REFUSE (fail closed), never overflow the stack — the catching
+    /// wrapper cannot turn an abort into a refusal.
+    #[test]
+    fn pii_scan_refuses_a_reply_nested_past_the_limit() {
+        let pii = rules(&["users.email"], crate::validator::PiiMode::Deny);
+        let mut cell = serde_json::json!("leaf");
+        for _ in 0..MAX_DEPTH + 5 {
+            cell = serde_json::Value::Array(vec![cell]);
+        }
+        let columns = vec!["x".to_string()];
+        let mut rows = vec![vec![cell]];
+        let r = scan_reply("db.users.find({})", &pii, &columns, &mut rows).unwrap_err();
+        assert_eq!(r.reason, PII_UNPROVABLE);
     }
 
     /// Net B, mask: a protected key is redacted wherever it sits — a top-level

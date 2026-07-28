@@ -1291,11 +1291,15 @@ which is the point of the shape.
   `collection.field` (deeper paths are a config error — path precision would be
   a lie) and protects the field NAME at any depth of every collection the query
   reads. Net A rides the classifier's own walk (`mongo::PiiCtx`) and refuses
-  every mention — document keys, `"$field"` references, name-position strings
-  (`distinct`, `$lookup.localField`, ...) — plus the operators that move values
-  without naming fields (`PII_UNPROVABLE_KEYS`: `$objectToArray`,
-  `$arrayToObject`, `$getField`, `$setField`, `$unsetField`, `$densify`,
-  `$fill`). Net B (`mongo::scan_reply`, applied in the cli's `Db::execute`
+  every mention — document keys (including keys inside a value literally named
+  `pipeline`, which the walk reroutes), `"$field"` references, name-position
+  strings (`distinct`, `$lookup.localField`, ...) — plus the operators that
+  move a value or a document's size without naming fields
+  (`PII_UNPROVABLE_KEYS`: `$objectToArray`, `$arrayToObject`, `$getField`,
+  `$setField`, `$unsetField`, `$bsonSize`, `$densify`, `$fill`) and a bare
+  `$$ROOT`/`$$CURRENT` (a later stage can consume the whole document into a
+  keyless scalar — its size or cardinality — after dropping the protected
+  key, which net B would never see). Net B (`mongo::scan_reply`, applied in the cli's `Db::execute`
   where every row leaves the engine layer) scans the self-describing result
   documents recursively: a protected key at any depth refuses the answer
   (deny) or is redacted in place (mask). The pair holds because a value cannot

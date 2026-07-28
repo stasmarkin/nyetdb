@@ -936,14 +936,12 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // segments is protected — the same match nets A and B apply.
                 let pii = session.policy.pii();
                 if !pii.is_empty() {
-                    match is_mongo {
-                        true => output::mark_pii(&mut schema, pii.mode().as_str(), |t, c| {
-                            c.split('.').any(|segment| pii.protects(t, segment))
-                        }),
-                        false => output::mark_pii(&mut schema, pii.mode().as_str(), |t, c| {
-                            pii.protects(t, c)
-                        }),
-                    }
+                    output::mark_pii(&mut schema, pii.mode().as_str(), |t, c| match is_mongo {
+                        // MongoDB's rule protects a field NAME at any depth, so
+                        // a dotted path is marked when any segment is protected.
+                        true => c.split('.').any(|segment| pii.protects(t, segment)),
+                        false => pii.protects(t, c),
+                    })
                 }
 
                 // An explicit [table] that matched nothing: the catalog answered,
@@ -1426,13 +1424,17 @@ fn refusal_failure(r: validator::Refusal) -> Failure {
 
 /// A mongo-layer PII refusal in the validator's shape, so `PiiRefused` carries
 /// one type whatever the engine. The reasons share their spellings on purpose
-/// (pinned by a unit test in mongo.rs).
+/// (pinned by a unit test in mongo.rs). Anything that is NOT one of the two
+/// PII reasons — scan_reply re-parses the executed text, so in principle it
+/// can fail to parse what the cli just validated — is an internal
+/// inconsistency and must say so, not masquerade as "the result carried a
+/// protected field" and send the agent rewriting a fine query.
 fn mongo_pii_refusal(r: mongo::Refusal) -> validator::Refusal {
     validator::Refusal {
         reason: match r.reason {
+            mongo::PII_COLUMN => validator::DenyReason::PiiColumn,
             mongo::PII_UNPROVABLE => validator::DenyReason::PiiUnprovable,
-            mongo::INTERNAL_ERROR => validator::DenyReason::InternalError,
-            _ => validator::DenyReason::PiiColumn,
+            _ => validator::DenyReason::InternalError,
         },
         message: r.message,
         hint: r.hint,
