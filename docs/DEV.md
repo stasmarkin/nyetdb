@@ -3121,16 +3121,23 @@ table) and the generated pipeline in `.github/workflows/release.yml`.
 Regenerate the workflow after editing `[dist]` config: `dist init --yes` (writes
 config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
 
-> **`dist generate` overwrites `release.yml` — re-apply three hardenings after it
+> **`dist generate` overwrites `release.yml` — re-apply four hardenings after it
 > (Д8), dist does not emit them:** (1) pin every `uses:` to a full commit SHA
 > (dist writes floating `@v4` tags); (2) drop the workflow-level `permissions`
 > to `contents: read` and give only the `host` job `contents: write` (dist writes
 > `contents: write` at the workflow level, so every job — including the
 > unprivileged build jobs — would get write); (3) tighten the tag trigger to
 > `v[0-9]+.[0-9]+.[0-9]+*` (dist's default `**[0-9]+.[0-9]+.[0-9]+*` also matches
-> bare `0.0.1` / `releases/0.0.1` tags — require the `v` prefix). The release job
+> bare `0.0.1` / `releases/0.0.1` tags — require the `v` prefix); (4) because
+> `github-attestations = true` makes dist emit `id-token: write` +
+> `attestations: write` at the workflow level, hardening (2) strips them — put
+> them back as a job-level `permissions` block on `build-local-artifacts`
+> (`contents: read` + `id-token: write` + `attestations: write`), the only job
+> running the Attest step. The `actions/attest-build-provenance` step itself
+> survives regeneration but comes back on a floating tag, so pin it per (1).
+> The release job
 > is privileged (`contents: write` + `HOMEBREW_TAP_TOKEN`), so the current
-> `release.yml` already carries all three; a regenerate reverts them. dist 0.28
+> `release.yml` already carries all four; a regenerate reverts them. dist 0.28
 > has no option to emit SHA pins, per-job permissions or a custom tag regex, so
 > this is a manual post-step. Because the hand-edits make `release.yml` differ
 > from dist's own output, `[dist] allow-dirty = ["ci"]` is set in
