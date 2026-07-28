@@ -2704,6 +2704,22 @@ mod tests {
     }
 
     #[test]
+    fn executable_comment_line_boundary_cannot_hide_an_opener() {
+        // Security boundary: a `/*! ... */` executable comment is run by the
+        // MySQL server even though the SQL parser discards it, so the scanner
+        // must never mistake non-comment text for a `--` line comment and skip
+        // a later opener. A lone `-` is subtraction (i+1 is not `-`), and a `--`
+        // NOT followed by whitespace (`--x`) is not a comment in MySQL; in each
+        // case the later `/*! ... */` is REAL and must still be flagged.
+        for sql in [
+            "SELECT 2-  /*! SLEEP(5) */ 1",
+            "SELECT 1 --x /*! SLEEP(5) */",
+        ] {
+            assert!(has_mysql_executable_comment(sql), "must flag: {sql}");
+        }
+    }
+
+    #[test]
     fn denylist_matches_the_terminal_component_only() {
         let pg = Policy::postgres(&[], &[]);
         // Qualified targets: the real function is the terminal component.

@@ -33,6 +33,13 @@ test-fast:
 test: _docker
     cargo test
 
+# Mutation-tests the validator's security boundary (~12 min, no Docker).
+# Manual / pre-release only, NOT per-PR CI: it's heavy and needs a stable
+# baseline. Scoped to src/validator.rs, container tests skipped so it stays
+# Docker-free. Needs `cargo install cargo-mutants`.
+mutants:
+    cargo mutants --file src/validator.rs -j 6 -- --lib --bins --test cli -- {{ container_units }}
+
 # Pre-commit gate: format, lints, full tests, supply chain.
 check: _docker
     cargo fmt --check

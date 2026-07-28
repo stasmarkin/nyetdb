@@ -2991,6 +2991,12 @@ executed opener is caught by at least one pass — fail closed under every
 The acceptable cost is over-denial of a benign string that contains a backslash
 right before a `/*!` (both corpus attack cases are pinned in `mysql_deny.yaml`).
 
+**Mutation testing** (`just mutants`, ~12 min, manual/pre-release only, not in
+per-PR CI) runs `cargo-mutants` scoped to `src/validator.rs`. It found a
+coverage gap here: mutating the `--` line-comment guard survived the suite, so
+`executable_comment_line_boundary_cannot_hide_an_opener` now pins that boundary
+(`SELECT 2-  /*! … */`, `--x /*! … */` must still be flagged).
+
 Deliberately *not* included: `is_used_lock` / `is_free_lock` (pure reads).
 `SLEEP`/`BENCHMARK`/`GET_LOCK` being denied means the timeout integration tests
 use a heavy `information_schema` cross join instead. Add a new entry with a
