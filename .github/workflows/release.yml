@@ -113,6 +113,13 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
+    # Scoped here (not workflow-wide as dist generates by default) to keep least
+    # privilege: only this build job runs the Attest step. contents:read is kept
+    # for checkout; id-token/attestations are what attest-build-provenance needs.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
@@ -148,6 +155,14 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      # GitHub build-provenance attestation (sigstore) for the artifacts just
+      # built. Verify a downloaded release file with:
+      #   gh attestation verify <file> --repo stasmarkin/nyetdb
+      # Enabled via `github-attestations = true` in dist-workspace.toml.
+      - name: Attest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up

@@ -8,6 +8,12 @@ members = ["cargo:."]
 cargo-dist-version = "0.28.7"
 # CI backends to support
 ci = "github"
+# Emit GitHub build-provenance attestations (sigstore) for every release
+# artifact. dist adds an `actions/attest-build-provenance` step to the build
+# job; consumers verify with `gh attestation verify <file> --repo <owner/repo>`.
+# The generated permissions/step are hand-hardened in release.yml (scoped to the
+# build job, not workflow-wide) — see the Attest step there and docs/DEV.md.
+github-attestations = true
 # The installers to generate for each app
 installers = ["shell", "homebrew"]
 # The Homebrew tap to publish the formula to (repo NOT created/pushed here — a
