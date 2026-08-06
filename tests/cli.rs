@@ -224,6 +224,71 @@ fn schema_error_never_leaks_values() {
     assert!(!stderr(&out).contains("supersecret"), "{}", stderr(&out));
 }
 
+/// The config file is the map to the credentials, and the agent reads every
+/// byte nyet prints — so its location stays out of the output: the default
+/// path out of `--help`, the resolved path out of every config error and out
+/// of the loose-permissions warning. An agent that hits a config problem asks
+/// its human; it does not learn where to go looking (SECURITY.md).
+#[test]
+fn the_config_location_never_reaches_the_output() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let help = nyet(tmp.path()).arg("--help").output().unwrap();
+    let help = format!("{}{}", stdout(&help), stderr(&help));
+    for leak in [".config/nyet", "NYET_CONFIG", "config.toml"] {
+        assert!(!help.contains(leak), "--help leaks {leak}:\n{help}");
+    }
+
+    // Every config-error path: unreadable, unparseable, unknown alias.
+    let missing = tmp.path().join("nowhere/config.toml");
+    let broken = write_config(
+        tmp.path(),
+        "[connections.a]\nengine = \"sqlite\"\nrow_limit = 0\n",
+    );
+    let good = tmp.path().join("good.toml");
+    fs::write(&good, two_conn_config(tmp.path())).unwrap();
+    let cases: [(&Path, &[&str]); 3] = [
+        (&missing, &["list"]),
+        (&broken, &["list"]),
+        (&good, &["schema", "no-such-alias"]),
+    ];
+    for (cfg, args) in cases {
+        let out = nyet(tmp.path())
+            .args(args)
+            .arg("--config")
+            .arg(cfg)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{args:?}");
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        let dir = tmp.path().display().to_string();
+        assert!(
+            !text.contains(&dir),
+            "{args:?} leaks the config path:\n{text}"
+        );
+    }
+
+    // ...and the same for the warning a group/other-readable config earns.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&good, fs::Permissions::from_mode(0o644)).unwrap();
+        let out = nyet(tmp.path())
+            .arg("list")
+            .arg("--config")
+            .arg(&good)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let warning = stderr(&out);
+        assert!(warning.contains("chmod 600"), "no warning: {warning}");
+        assert!(
+            !warning.contains(&tmp.path().display().to_string()),
+            "the permissions warning leaks the config path: {warning}"
+        );
+    }
+}
+
 #[test]
 fn config_not_found_is_exit_3() {
     let tmp = tempfile::tempdir().unwrap();

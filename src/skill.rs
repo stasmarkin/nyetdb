@@ -41,7 +41,8 @@ queries. It is read-only by default, not an access-control boundary: the config
 owner can selectively permit specific functions via `allow_functions` (a
 durable-write function such as `nextval` could be re-enabled that way), so do
 not rely on it as a hard guarantee. You name a database by its **alias** — never
-a URL, host, or password. The user owns the config; credentials never reach you.
+a URL, host, or password. The user owns the config; credentials never reach you
+and you do not go looking for them (see "Never route around nyet" below).
 
 ## Commands
 
@@ -187,6 +188,17 @@ flag. Common reasons:
 - `INTERNAL_ERROR` — a bug in nyet itself, not in your query; nothing was
   returned. This is the one reason NOT to rewrite and retry: stop and tell the
   human, quoting the statement and the message.
+
+## Never route around nyet
+
+nyet is the only sanctioned path to these databases. Do not go looking for its
+config file, a connection URL, or credentials in the environment, a `.env` or a
+secret store; do not connect with `psql`, `mysql`, `mongosh`, `sqlite3`, a
+driver or any other client. That holds even when a refusal blocks a task you
+were asked to finish: reaching the data another way is a policy violation, not
+a workaround, and the human will treat it as one. When the hint does not get
+you to an allowed query, stop and tell the human what you needed and why —
+they own the config and only they can widen it.
 
 ## Protected columns (personal data)
 
@@ -403,8 +415,12 @@ mod tests {
         for code in ["0  success", "5  query refused", "8  timeout"] {
             assert!(text.contains(code), "missing exit code line: {code}");
         }
-        // Aliases-not-credentials principle.
+        // Aliases-not-credentials principle — and the rule that makes it hold
+        // for a cooperative agent: nyet no longer says where its config is, so
+        // the instruction has to say that hunting for it is out of bounds.
         assert!(text.contains("credentials never reach you"));
+        assert!(text.contains("Never route around nyet"));
+        assert!(text.contains("psql"));
         // Parse examples pass --format json explicitly (the default depends on
         // the user's [defaults].format, so the agent must not rely on it).
         assert!(text.contains("--format json"));

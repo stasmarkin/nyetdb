@@ -23,7 +23,7 @@ use std::time::Instant;
     about = "Read-only database access for AI agents. Your agent can look; for everything else — nyet."
 )]
 struct Cli {
-    /// Path to config file (default: $NYET_CONFIG, then ~/.config/nyet/config.toml)
+    /// Path to config file (the human who owns the setup knows where it lives)
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -727,8 +727,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
     };
     *route_format = format;
 
-    let cfg = config::parse(&text, &|name: &str| std::env::var(name))
-        .map_err(|e| config_failure(e, &path))?;
+    let cfg = config::parse(&text, &|name: &str| std::env::var(name)).map_err(config_failure)?;
 
     let cwd = std::env::current_dir()
         .and_then(|d| d.canonicalize())
@@ -772,7 +771,6 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             timeout,
         } => rows_command(
             &cfg,
-            &path,
             &cwd,
             &allowed,
             RowsRequest {
@@ -791,7 +789,6 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             timeout,
         } => rows_command(
             &cfg,
-            &path,
             &cwd,
             &allowed,
             RowsRequest {
@@ -810,7 +807,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // The same setup as query, minus the validator and the guardrail
             // (there is no agent SQL here, and a catalog read has nothing to
             // estimate).
-            let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
+            let (conn, mut session) = open_session(&cfg, &alias, &cwd, &allowed, None)?;
             let is_mongo = session.db.is_mongo();
             let engine = conn.engine.clone();
             let cwd_str = cwd.display().to_string();
@@ -952,7 +949,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // The `query` pipeline up to and including the validator, then the
             // PLAN instead of the execution. Nothing runs: the EXPLAIN is never
             // ANALYZE, so `nyet explain` cannot be a way to execute anything.
-            let (conn, mut session) = open_session(&cfg, &path, &alias, &cwd, &allowed, None)?;
+            let (conn, mut session) = open_session(&cfg, &alias, &cwd, &allowed, None)?;
             let is_mongo = session.db.is_mongo();
             let engine = conn.engine.clone();
             let raw_sql = query.clone();
@@ -975,8 +972,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // The verdict is informational here, but it is measured against this
                 // connection's own guardrail, so `explain` answers exactly what
                 // `query` would decide.
-                let guardrail =
-                    config::guardrail(&alias, conn).map_err(|e| config_failure(e, &path))?;
+                let guardrail = config::guardrail(&alias, conn).map_err(config_failure)?;
                 // `validate_mongo` answers `is_query = false` (the guardrail is
                 // `off` for MongoDB and there is nothing to estimate), but a
                 // MongoDB read DOES have a plan to show — one without a cost or
@@ -1103,14 +1099,14 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                     // A named connection is diagnosed regardless of directory
                     // scoping (the human owns the config and is testing it, quite
                     // possibly not yet in the project dir).
-                    let conn = lookup_alias(&cfg, &path, &alias)?;
+                    let conn = lookup_alias(&cfg, &alias)?;
                     let timeout_secs = cfg.timeout_secs(conn, None);
                     let (mut db, _policy) = build_engine(&alias, conn, timeout_secs)?;
                     audit_id = Some((alias.clone(), conn.engine.clone()));
                     // The policy is needed twice here: the engine asks the
                     // server about these very columns, and the redaction below
                     // keys on "has a policy at all".
-                    let pii = config::pii(&alias, conn).map_err(|e| config_failure(e, &path))?;
+                    let pii = config::pii(&alias, conn).map_err(config_failure)?;
                     let pii_pairs: Vec<(String, String)> = pii
                         .pairs()
                         .map(|(t, c)| (t.to_string(), c.to_string()))
@@ -1221,7 +1217,6 @@ struct RowsRequest {
 /// command is that no layer is skipped or repeated for it.
 fn rows_command(
     cfg: &config::Config,
-    path: &Path,
     cwd: &Path,
     allowed: &dyn Fn(&config::Connection) -> bool,
     req: RowsRequest,
@@ -1233,7 +1228,7 @@ fn rows_command(
         limit,
         timeout,
     } = req;
-    let (conn, mut session) = open_session(cfg, path, &alias, cwd, allowed, timeout)?;
+    let (conn, mut session) = open_session(cfg, &alias, cwd, allowed, timeout)?;
     // Audit identity, captured before the body borrows everything.
     let engine = conn.engine.clone();
     let cwd_str = cwd.display().to_string();
@@ -1273,7 +1268,7 @@ fn rows_command(
     // log is written before the result is released.
     let outcome = (|| -> Result<Emitted, Failure> {
         let started = Instant::now();
-        let mut attempt = run_attempt(path, &alias, conn, &mut session, &mut tunnel, &first, limit);
+        let mut attempt = run_attempt(&alias, conn, &mut session, &mut tunnel, &first, limit);
         // A refused attempt keeps no duration of its own (a `Failure` carries
         // none), so the wall time of this one is taken here — it is only ever
         // read on the fallback path below.
@@ -1297,7 +1292,7 @@ fn rows_command(
             {
                 session.db.set_query_timeout_ms(left);
                 executed = cheap.clone();
-                attempt = run_attempt(path, &alias, conn, &mut session, &mut tunnel, cheap, limit);
+                attempt = run_attempt(&alias, conn, &mut session, &mut tunnel, cheap, limit);
                 fell_back = true;
             }
         }
@@ -1499,7 +1494,6 @@ struct Attempt {
 /// `Failure`, and the caller decides whether that is the answer or — for
 /// `sample`'s cheap retry — grounds for one more pass.
 fn run_attempt(
-    path: &Path,
     alias: &str,
     conn: &config::Connection,
     session: &mut Session,
@@ -1520,7 +1514,7 @@ fn run_attempt(
     // run unguarded (documented). An EXPLAIN ANALYZE never gets here —
     // the validator refuses it (reason EXPLAIN_ANALYZE).
     let guardrail = match is_query {
-        true => config::guardrail(alias, conn).map_err(|e| config_failure(e, path))?,
+        true => config::guardrail(alias, conn).map_err(config_failure)?,
         false => guardrail::Guardrail::OFF,
     };
     // The tunnel is opened AFTER the validator (a refused query exits 5
@@ -2019,20 +2013,19 @@ impl Session {
 
 fn open_session<'a>(
     cfg: &'a config::Config,
-    path: &Path,
     alias: &str,
     cwd: &Path,
     allowed: &dyn Fn(&config::Connection) -> bool,
     timeout_flag: Option<u64>,
 ) -> Result<(&'a config::Connection, Session), Failure> {
-    let conn = lookup_alias(cfg, path, alias)?;
+    let conn = lookup_alias(cfg, alias)?;
     check_scope(alias, conn, cwd, allowed(conn))?;
     let timeout_secs = cfg.timeout_secs(conn, timeout_flag);
     let (mut db, policy) = build_engine(alias, conn, timeout_secs)?;
     // The PII policy is resolved here (once) and lives inside the validator
     // Policy: net A reads it during validation, and the cli reads it back for
     // net B and for the database-error redaction.
-    let pii = config::pii(alias, conn).map_err(|e| config_failure(e, path))?;
+    let pii = config::pii(alias, conn).map_err(config_failure)?;
     if !pii.is_empty() {
         db.resolve_column_origins();
     }
@@ -2075,17 +2068,13 @@ fn run_db<T>(
 /// alias -> connection, with the known-alias hint (CONFIG_INVALID, exit 3).
 fn lookup_alias<'a>(
     cfg: &'a config::Config,
-    path: &Path,
     alias: &str,
 ) -> Result<&'a config::Connection, Failure> {
     cfg.connections.get(alias).ok_or_else(|| {
         let known: Vec<&str> = cfg.connections.keys().map(String::as_str).collect();
         Failure::new(
             ErrorCode::ConfigInvalid,
-            format!(
-                "unknown connection alias '{alias}': not defined in {}",
-                path.display()
-            ),
+            format!("unknown connection alias '{alias}': not defined in the config"),
             if known.is_empty() {
                 "the config defines no connections; add a [connections.<alias>] section".to_string()
             } else {
@@ -2616,32 +2605,29 @@ fn resolve_format(flag: Option<Format>, cfg_default: Option<&str>) -> Result<For
     Ok(flag.unwrap_or(from_config))
 }
 
-fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
+fn config_failure(e: config::ConfigError) -> Failure {
     let (message, hint) = match e {
         config::ConfigError::Invalid(msg) => (
-            format!("config file {} is invalid: {msg}", path.display()),
+            format!("the config file is invalid: {msg}"),
             "fix the config file; see README for a full annotated example".to_string(),
         ),
         config::ConfigError::MissingEnvVar(name) => (
             format!(
-                "config file {} references ${{{name}}} but that environment variable is not set",
-                path.display()
+                "the config file references ${{{name}}} but that environment variable is not set"
             ),
             format!("export {name}=... before running nyet, or remove the reference"),
         ),
         config::ConfigError::NotUnicodeEnvVar(name) => (
             format!(
-                "config file {} references ${{{name}}} but that environment variable \
-                 is set to a value that is not valid UTF-8",
-                path.display()
+                "the config file references ${{{name}}} but that environment variable \
+                 is set to a value that is not valid UTF-8"
             ),
             format!("re-export {name} with a valid UTF-8 value, or remove the reference"),
         ),
         config::ConfigError::EnvVarInPolicy { alias, key, value } => (
             format!(
-                "config file {}: {key} value \"{value}\" for connection '{alias}' uses \
-                 ${{VAR}} substitution",
-                path.display()
+                "the config file: {key} value \"{value}\" for connection '{alias}' uses \
+                 ${{VAR}} substitution"
             ),
             format!(
                 "{key} must be a literal value; ${{VAR}} substitution is not allowed in \
@@ -2653,9 +2639,8 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
         ),
         config::ConfigError::InvalidAllowedDir { alias, dir } => (
             format!(
-                "config file {}: allowed_dirs entry \"{dir}\" for connection '{alias}' \
-                 is not a valid scoping path",
-                path.display()
+                "the config file: allowed_dirs entry \"{dir}\" for connection '{alias}' \
+                 is not a valid scoping path"
             ),
             "entries must be absolute or ~/relative; relative entries, \"~//...\" \
              and \"..\" components are rejected because they would widen the scope — \
@@ -2663,15 +2648,14 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
                 .to_string(),
         ),
         config::ConfigError::ZeroValue { key } => (
-            format!("config file {}: {key} is 0", path.display()),
+            format!("the config file: {key} is 0"),
             "row_limit and timeout_secs must be at least 1; to use the built-in \
              default, omit the key"
                 .to_string(),
         ),
         config::ConfigError::SshMissingField { alias, field } => (
             format!(
-                "config file {}: connection '{alias}' has an [ssh] section but no {field}",
-                path.display()
+                "the config file: connection '{alias}' has an [ssh] section but no {field}"
             ),
             format!(
                 "set {field} in [connections.{alias}.ssh]: host = \"[user@]bastion[:port]\", \
@@ -2680,8 +2664,7 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
         ),
         config::ConfigError::SshWithSqlite { alias } => (
             format!(
-                "config file {}: connection '{alias}' is engine = \"sqlite\" but has an [ssh] section",
-                path.display()
+                "the config file: connection '{alias}' is engine = \"sqlite\" but has an [ssh] section"
             ),
             "SSH tunnels forward a TCP port; SQLite is a local file, so ssh does not \
              apply — remove the [ssh] section, or use a server engine (postgres)"
@@ -2689,8 +2672,7 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
         ),
         config::ConfigError::GuardrailInvalid { alias, message } => (
             format!(
-                "config file {}: connection '{alias}' has an invalid [guardrail] section: {message}",
-                path.display()
+                "the config file: connection '{alias}' has an invalid [guardrail] section: {message}"
             ),
             format!(
                 "set [connections.{alias}.guardrail] mode to \"cost\", \"rows\" or \"off\" \
@@ -2699,7 +2681,7 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
             ),
         ),
         config::ConfigError::SshInvalid { alias, message } => (
-            format!("config file {}: connection '{alias}' has an invalid [ssh] value: {message}", path.display()),
+            format!("the config file: connection '{alias}' has an invalid [ssh] value: {message}"),
             "fix the [ssh] host/remote/control_persist; host is [user@]hostname[:port] and \
              remote is host:port with safe characters — values that could be read as ssh \
              options (a leading '-', or a ${VAR} that expands to one) are rejected"
@@ -2707,8 +2689,7 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
         ),
         config::ConfigError::PiiRuleInvalid { alias, message } => (
             format!(
-                "config file {}: connection '{alias}' has an invalid [pii] rule: {message}",
-                path.display()
+                "the config file: connection '{alias}' has an invalid [pii] rule: {message}"
             ),
             format!(
                 "each entry of [connections.{alias}.pii] columns names one column as \
@@ -2719,9 +2700,8 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
         ),
         config::ConfigError::MongoTunnelInvalid { alias, message } => (
             format!(
-                "config file {}: connection '{alias}' combines an [ssh] tunnel with a \
-                 MongoDB url nyet cannot keep inside it: {message}",
-                path.display()
+                "the config file: connection '{alias}' combines an [ssh] tunnel with a \
+                 MongoDB url nyet cannot keep inside it: {message}"
             ),
             format!(
                 "point `url` at ONE member through the tunnel — \
@@ -2734,8 +2714,7 @@ fn config_failure(e: config::ConfigError, path: &Path) -> Failure {
         ),
         config::ConfigError::AuditPathEnvVar { value } => (
             format!(
-                "config file {}: [audit] path \"{value}\" uses ${{VAR}} substitution",
-                path.display()
+                "the config file: [audit] path \"{value}\" uses ${{VAR}} substitution"
             ),
             "audit.path must be a literal value; ${VAR} substitution is not allowed because \
              the environment is controlled by the calling agent — it could otherwise redirect \
@@ -2775,21 +2754,26 @@ fn config_path(flag: Option<PathBuf>) -> Result<PathBuf, Failure> {
     }
 }
 
+/// The config's LOCATION never reaches the output — not the resolved path, not
+/// the default one. It is the map to the credentials, and the agent reads every
+/// error nyet prints: an agent that hits "config not found" should ask its human,
+/// not learn where to go looking (see SECURITY.md). The human owning the setup
+/// knows where the file is; the README says where it goes.
 fn read_config(path: &Path) -> Result<String, Failure> {
     std::fs::read_to_string(path).map_err(|e| {
         let (message, hint) = match e.kind() {
             std::io::ErrorKind::NotFound => (
-                format!("config file not found: {}", path.display()),
-                "create ~/.config/nyet/config.toml (see README for a full example) \
-                 or point --config / $NYET_CONFIG at an existing file"
+                "the config file does not exist".to_string(),
+                "ask the human who owns this setup to create a nyet config \
+                 (the nyet README has an annotated example)"
                     .to_string(),
             ),
             std::io::ErrorKind::InvalidData => (
-                format!("config file {} is not valid UTF-8", path.display()),
+                "the config file is not valid UTF-8".to_string(),
                 "re-save the file with UTF-8 encoding".to_string(),
             ),
             _ => (
-                format!("cannot read config file {}: {e}", path.display()),
+                format!("cannot read the config file: {e}"),
                 "check that the file is readable by the current user".to_string(),
             ),
         };
@@ -2807,7 +2791,10 @@ fn warn_loose_permissions(path: &Path, what: &str) {
         use std::os::unix::fs::MetadataExt;
         if let Ok(md) = std::fs::metadata(path) {
             if let Some(warning) = config::permissions_warning(md.mode(), what) {
-                let _ = writeln!(std::io::stderr(), "warning: {}: {warning}", path.display());
+                // `warning` already names the file ("the config file", "the
+                // audit log") — the path itself stays out: stderr is read by
+                // the agent too, and neither location is its business.
+                let _ = writeln!(std::io::stderr(), "warning: {warning}");
             }
         }
     }
