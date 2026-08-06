@@ -15,7 +15,7 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MongoDB.
 **In development.** What works today:
 
 - config: parsing, validation (unknown keys are hard errors), `${VAR}`
-  substitution, `password_env`, file permission warnings;
+  substitution, secrets outside the file (macOS Keychain), file permission warnings;
 - directory scoping (`allowed_dirs`) and `nyet list`;
 - `nyet schema` for all three engines: tables, views, columns, primary keys,
   unique constraints, indexes and foreign keys as structured JSON (see below);
@@ -120,7 +120,9 @@ log_responses = false                  # true also logs the result rows
 [connections.prod]
 engine = "postgres"                    # postgres | mysql | mariadb | sqlite | mongodb
 url = "postgres://nyet_ro@db.internal:5432/app"
-password_env = "PROD_DB_PASSWORD"      # NAME of an env var; no password in the file
+# Where the password lives. `{ keychain = "..." }` is the only source the
+# agent cannot read too — see "Where the password lives" below.
+password = { keychain = "prod-db" }
 # Directories this connection is reachable from (subdirectories included).
 # Empty or absent = denied everywhere (fail closed). "Everywhere" is an
 # explicit choice: allowed_dirs = ["~"].
@@ -158,14 +160,14 @@ reuse_forward = true                # optional; default true — keep the forwar
 [connections.analytics]
 engine = "mariadb"                     # or "mysql" — same driver/dialect
 url = "mysql://nyet_ro@db.internal:3306/shop"
-password_env = "ANALYTICS_DB_PASSWORD"
+password = { env = "ANALYTICS_DB_PASSWORD" }
 allowed_dirs = ["~/Workspace/shop"]
 
 [connections.events]
 engine = "mongodb"
 # The database name is part of the url and nyet never switches away from it.
 url = "mongodb://nyet_ro@mongo.internal:27017/events?tls=true"
-password_env = "EVENTS_DB_PASSWORD"
+password = { env = "EVENTS_DB_PASSWORD" }
 allowed_dirs = ["~/Workspace/app"]
 # NOTE: a guardrail mode other than "off" is a hard config error for MongoDB;
 # [connections.events.pii] works, with rules of exactly "collection.field" —
@@ -184,10 +186,11 @@ even a write that somehow slipped past the SQL validator fails in the
 database itself.
 
 PostgreSQL specifics: `url` is required (`postgres://user@host:port/dbname`);
-put the password in the env var named by `password_env`, never in the file or
-the url. If `password_env` is set but the variable is missing, that is a hard
-config error (exit 3). With no `password_env`, `nyet` connects without a
-password (local trust/peer auth). Every query runs in an explicit
+the password belongs in `password`, never in the url. A source that cannot
+deliver — a missing env var, a command that fails or prints nothing, a keychain
+item that is not there — is a hard config error (exit 3), never a silent empty
+password. With no `password` at all, `nyet` connects without one (local
+trust/peer auth). Every query runs in an explicit
 `BEGIN READ ONLY` transaction on a connection opened with
 `default_transaction_read_only=on` and a server-side `statement_timeout`, so a
 write that slipped past the validator is refused by the server (and a runaway
@@ -209,7 +212,7 @@ timeout variable — MySQL's `max_execution_time` in milliseconds vs MariaDB's
 `max_statement_time` in seconds — which nyet sets for you; the label only tells
 nyet which one to try first, so a mislabelled server is still capped, it just
 costs one extra round trip per connection). `url` is required
-(`mysql://user@host:port/dbname`); the password goes in `password_env`, never in
+(`mysql://user@host:port/dbname`); the password goes in `password`, never in
 the file or url. Every query runs inside an explicit `START TRANSACTION READ
 ONLY`, so a write that slipped past the validator is refused by the server, and
 a runaway query is cancelled server-side → exit 8. Result types map to JSON as:
@@ -231,7 +234,7 @@ channel). MariaDB's default `mysql_native_password` works with or without TLS.
 MongoDB specifics: `engine = "mongodb"`, and `url` is required *including the
 database name* (`mongodb://user@host:27017/dbname`) — nyet never picks a database
 and offers no way to switch to another one. The password goes in
-`password_env`. Queries are written in a **subset of the mongosh syntax**
+`password`. Queries are written in a **subset of the mongosh syntax**
 (`db.<collection>.find(...)`, `.aggregate([...])`, `.countDocuments(...)`,
 `.distinct(...)`) — see the "MongoDB" usage section below for exactly what is
 accepted and why everything else is refused. Result documents map to JSON as
@@ -283,6 +286,71 @@ layers; MongoDB has two, and nyet says so rather than implying otherwise:
   probe by RUNNING JavaScript, which is the one thing nyet promises never to
   send.
 
+### Where the password lives
+
+A connection's `password` (and `url`, if you want the whole address out of the
+file) is either written in the config or names where the value actually lives:
+
+```toml
+password = "hunter2"                              # in the config
+password = { keychain = "prod-db" }               # macOS Keychain, nyet only
+password = { env = "PROD_DB_PASSWORD" }           # an environment variable
+password = { command = "op read op://vault/db/pw" }   # stdout of a command
+url = { keychain = "prod-db-url" }                # not even the address in the file
+```
+
+The question these answer is not "is the password written down" but **"can the
+agent get it too"** — and the agent runs under your uid, so it reads whatever
+`nyet` reads. Only one thing changes that: something checking *who* is asking.
+
+| Source | Can the agent get it? |
+|---|---|
+| `{ keychain = "..." }` | **No** — macOS checks the caller's code signature. The agent's shell is not `nyet`, so it gets a keychain password prompt you have to answer. |
+| in the config, `{ env = ... }`, `{ command = ... }` | **Yes** — it reads the same file, the same variable, or runs the same command. |
+
+So `{ command = "op read ..." }` is convenient, not protective: an agent that
+finds the config reads that line and runs it itself, in the same session.
+
+**Setting up a keychain item (macOS):**
+
+```console
+$ nyet secret-set prod-db
+Secret (not echoed):
+stored "prod-db" in the login keychain, readable by this build of nyet only
+```
+
+`nyet` stores the item **itself** on purpose. The application that creates a
+keychain item is the one its ACL trusts, so an item made with `security` or
+Keychain Access would be readable by *those* — and by anything else running as
+you. For the same reason the value is read from stdin, never taken as an
+argument (argv shows up in `ps` and in your shell history); piping works too:
+`printf %s "$PW" | nyet secret-set prod-db`.
+
+The item trusts the **exact binary** that created it, and installing a new
+`nyet` builds a different one. After an update the next query fails with a
+clear message instead of a popup, and you hand the item over deliberately:
+
+```console
+$ nyet query prod "SELECT 1"
+{"v":1,"ok":false,"error":{"code":"CONFIG_INVALID","message":"the keychain item \"prod-db\" exists but is not readable by this build of nyet", ...}}
+$ nyet secret-set prod-db     # macOS asks for your keychain password here
+```
+
+That prompt is not friction to be engineered away — it *is* the boundary: an
+agent cannot answer it. Reads on the normal path never prompt at all (`nyet`
+disables keychain dialogs before asking), so an agent's query can never put a
+window on your screen for you to click through absent-mindedly.
+
+`nyet doctor` states which of these a connection uses, as a plain fact rather
+than a warning — an env var on a dev database is a deliberate choice, and only
+you know whether this password is worth keeping out of your agent's reach.
+
+**What this does not do.** The config file is yours to write, and so is the
+agent's: it can rewrite `url` to point at a database it controls and then let
+`nyet` hand over the real password to it. Keeping the *file* out of reach is a
+separate problem from keeping the *secret* out of reach, and only the second
+one is solved here. See [SECURITY.md](SECURITY.md).
+
 ### Recommended: a read-only MongoDB user (layer 3)
 
 **On MongoDB this is not optional advice.** There is no read-only session to
@@ -299,7 +367,7 @@ db.createUser({
 ```
 
 Then `url = "mongodb://nyet_ro@mongo.internal:27017/events?tls=true"` and
-`password_env = "NYET_RO_PASSWORD"`. With the `read` role the server refuses
+`password = { keychain = "nyet-ro" }`. With the `read` role the server refuses
 `$out`/`$merge` and every write command outright — nyet's layer 1 simply gets
 there first, without a round trip.
 
@@ -315,7 +383,7 @@ FLUSH PRIVILEGES;
 ```
 
 Then `url = "mysql://nyet_ro@db.internal:3306/app"` and
-`password_env = "NYET_RO_PASSWORD"`.
+`password = { keychain = "nyet-ro" }`.
 
 ### Recommended: a read-only PostgreSQL role (layer 3)
 
@@ -333,7 +401,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO nyet_ro;
 ```
 
 Then `url = "postgres://nyet_ro@db.internal:5432/app"` and
-`password_env = "NYET_RO_PASSWORD"`.
+`password = { keychain = "nyet-ro" }`.
 
 ### PII columns
 
@@ -722,7 +790,7 @@ When a query runs, `nyet` shells out to the **system `ssh`** to open a local
 port forward (`ssh -f -N -L 127.0.0.1:<random>:db.internal:5432 deploy@bastion.corp -p 22`),
 then connects the database engine to `127.0.0.1:<random>`. The `url`'s host and
 port are replaced by the tunnel; its user, database and query parameters are
-kept, and the password still comes from `password_env`. A free local port is
+kept, and the password still comes from this connection's `password`. A free local port is
 picked automatically.
 
 - **The forward is reused between runs — at most one per database.** Both the
@@ -1914,7 +1982,7 @@ Fields: `audit_v` (the record-schema version, independent of the envelope `v`),
 argument), `verdict` (`ok`/`refused`/`error`), `reason` (the
 NYET reason or the `error.code`), `exit_code`, `row_count`+`truncated` (query/sample),
 `duration_ms`, and `warnings` (the warning codes). **Never logged: passwords,
-`password_env` values, or the connection url** — only the alias and engine, so
+the password (or where it lives), or the connection url** — only the alias and engine, so
 an inline-password url can never leak into the log.
 
 Read it with `jq`, e.g. every write an agent attempted against `prod`:

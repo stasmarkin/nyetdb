@@ -38,6 +38,21 @@ file it privately as above.
   nags. The `nyet` layers (validator, session read-only, `[pii]`) are the fast,
   local, reviewable layer on top — not a replacement.
 
+- **The credentials can be kept out of the agent's reach; the config file
+  cannot.** `password = { keychain = "..." }` (macOS) stores the secret behind
+  an ACL the OS checks against the *caller's* code signature, so an agent that
+  finds the config still cannot read the password: `security`, a driver or its
+  own shell all get a keychain prompt only a human can answer. `{ env = ... }`
+  and `{ command = ... }` do **not** do this — any process of the same uid
+  reads the variable or runs the command — and `nyet doctor` says which of the
+  two a connection uses. What remains open is the file itself: it belongs to
+  the same user, so an agent can *rewrite* it — point `url` at a database it
+  controls, or add an `[ssh] remote` — and `nyet` will then hand the real
+  password to that endpoint. Closing this would mean binding each secret to its
+  target and protecting the config from writes; it is a **known and accepted**
+  limit of the current design, which assumes a cooperative-but-fallible agent
+  rather than one actively phishing for credentials.
+
 - **Directory scoping is a UX barrier, not a security boundary.** `allowed_dirs`
   guards against pointing an agent at the wrong database by accident. The current
   directory comes from the process and is controlled by the calling agent, so it

@@ -58,7 +58,7 @@ fn write_pg_config_with(dir: &Path, port: u16, extra: &str) -> std::path::PathBu
         format!(
             "[connections.pg]\nengine = \"postgres\"\n\
              url = \"postgres://postgres@127.0.0.1:{port}/postgres\"\n\
-             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n{extra}",
+             password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n{extra}",
             dir.display()
         ),
     )
@@ -799,7 +799,7 @@ fn postgres_doctor_end_to_end() {
             format!(
                 "[connections.pg]\nengine = \"postgres\"\n\
                  url = \"postgres://nyet_ro@127.0.0.1:{port}/postgres\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
                 tmp.path().display()
             ),
         )
@@ -822,7 +822,7 @@ fn postgres_doctor_end_to_end() {
             format!(
                 "[connections.pg]\nengine = \"postgres\"\n\
                  url = \"postgres://writer@127.0.0.1:{port}/postgres\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
                 tmp.path().display()
             ),
         )
@@ -841,7 +841,7 @@ fn postgres_doctor_end_to_end() {
             format!(
                 "[connections.pg]\nengine = \"postgres\"\n\
                  url = \"postgres://postgres@127.0.0.1:{port}/postgres?sslmode=require\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
                 tmp.path().display()
             ),
         )
@@ -930,7 +930,7 @@ fn postgres_schema_respects_role_privileges() {
             format!(
                 "[connections.pg]\nengine = \"postgres\"\n\
                  url = \"postgres://lowpriv@127.0.0.1:{port}/postgres\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
                 tmp.path().display()
             ),
         )
@@ -1462,7 +1462,7 @@ fn postgres_pii_mask_end_to_end() {
                 format!(
                     "[connections.pg]\nengine = \"postgres\"\n\
                      url = \"postgres://{user}@127.0.0.1:{port}/postgres\"\n\
-                     password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n\
+                     password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n\
                      [connections.pg.pii]\ncolumns = [\"users.email\"]\nmode = \"mask\"\n",
                     tmp.path().display()
                 ),

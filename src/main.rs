@@ -6,7 +6,8 @@
 // The modules live in the lib target (src/lib.rs) so the fuzz targets can link
 // against them; this binary is just their cli layer.
 use nyetdb::{
-    audit, config, engine, guardrail, mongo, output, resolver, sample, skill, tunnel, validator,
+    audit, config, engine, guardrail, mongo, output, resolver, sample, secret, skill, tunnel,
+    validator,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -171,6 +172,28 @@ enum Command {
         #[arg(long, value_enum)]
         format: Option<SetupFormat>,
     },
+
+    /// Store a secret in the macOS Keychain so that only nyet can read it
+    ///
+    /// The value is read from stdin (the terminal does not echo it) and stored
+    /// under the name a connection refers to:
+    ///
+    ///   password = { keychain = "prod-db" }
+    ///
+    /// nyet stores the item ITSELF on purpose: the application that creates a
+    /// keychain item is the one its ACL trusts, so an item made with
+    /// `security` or Keychain Access would be readable by those tools — and by
+    /// anything else running as you, the agent included.
+    ///
+    /// Run it again after installing a new nyet: the item trusts the exact
+    /// binary that created it, and a fresh build is a different one. macOS
+    /// asks for your keychain password when handing the item over, which is
+    /// the barrier an agent cannot pass.
+    #[command(verbatim_doc_comment)]
+    SecretSet {
+        /// Item name, as written in the connection's `{ keychain = "..." }`
+        item: String,
+    },
 }
 
 /// `agent-setup` emits Markdown by default (the SKILL.md a human redirects to a
@@ -301,6 +324,18 @@ impl Db {
     /// engine rather than handing mongosh text to sqlparser.
     fn is_mongo(&self) -> bool {
         matches!(self, Db::Mongo(_))
+    }
+
+    /// The connection url as it will actually be dialed — resolved, since it
+    /// may have come from a keychain item rather than the config text. SQLite
+    /// has none (it is a local file).
+    fn url(&self) -> &str {
+        match self {
+            Db::Sqlite(_) => "",
+            Db::Postgres(pg) => &pg.url,
+            Db::Mysql(my) => &my.url,
+            Db::Mongo(mg) => &mg.url,
+        }
     }
 
     /// The ONE way rows leave the engine layer — and therefore the one place
@@ -696,6 +731,11 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
     if let Command::AgentSetup { format } = &cli.command {
         let format = format.unwrap_or(SetupFormat::Markdown);
         return agent_setup(cli.config, format, route_format);
+    }
+    // Same reasoning: storing a secret is about the keychain, not about any
+    // connection, so it must work before (and independently of) a config.
+    if let Command::SecretSet { item } = &cli.command {
+        return secret_set(item);
     }
 
     let path = config_path(cli.config)?;
@@ -1122,9 +1162,10 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                         redact_diagnosis(&mut diagnosis);
                     }
                     let input = output::DoctorInput {
+                        secret: conn.password.as_ref().map(secret_fact),
                         engine: engine_kind(&conn.engine),
                         diagnosis,
-                        transport: doctor_transport(conn),
+                        transport: doctor_transport(conn, db.url()),
                         forward,
                         permissions,
                         pii_mode: (!pii.is_empty()).then(|| pii.mode().as_str()),
@@ -1181,6 +1222,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
         // Handled by the short-circuit at the top of run() (before the config
         // read), so this arm is dead — it exists only for match exhaustiveness.
         Command::AgentSetup { .. } => unreachable!("agent-setup is short-circuited above"),
+        Command::SecretSet { .. } => unreachable!("secret-set is short-circuited above"),
     }
 }
 
@@ -2029,13 +2071,14 @@ fn open_session<'a>(
     if !pii.is_empty() {
         db.resolve_column_origins();
     }
+    let insecure_transport = insecure_transport(conn, db.url());
     Ok((
         conn,
         Session {
             db,
             policy: policy.with_pii(pii),
             timeout_secs,
-            insecure_transport: insecure_transport(conn),
+            insecure_transport,
         },
     ))
 }
@@ -2163,10 +2206,11 @@ fn build_engine(
                      in the config",
                 ));
             };
-            let password = read_password_env(alias, conn)?;
+            let url = resolve_secret(alias, "url", url)?;
+            let password = read_password(alias, conn)?;
             Ok((
                 Db::Postgres(engine::Postgres {
-                    url: url.clone(),
+                    url,
                     password,
                     statement_timeout_ms: engine::Postgres::clamp_statement_timeout(
                         timeout_secs.saturating_mul(1000),
@@ -2202,10 +2246,11 @@ fn build_engine(
                      in the config",
                 ));
             };
-            let password = read_password_env(alias, conn)?;
+            let url = resolve_secret(alias, "url", url)?;
+            let password = read_password(alias, conn)?;
             Ok((
                 Db::Mysql(engine::Mysql {
-                    url: url.clone(),
+                    url,
                     password,
                     statement_timeout_ms: engine::Mysql::clamp_statement_timeout(
                         timeout_secs.saturating_mul(1000),
@@ -2238,10 +2283,16 @@ fn build_engine(
                      databases on its own)",
                 ));
             };
-            let password = read_password_env(alias, conn)?;
+            let url = resolve_secret(alias, "url", url)?;
+            // The `[ssh]` rules judge the url that will actually be dialed;
+            // config::parse could only check it when it was written literally.
+            if conn.ssh.is_some() {
+                config::mongo_tunnel(alias, Some(&url)).map_err(config_failure)?;
+            }
+            let password = read_password(alias, conn)?;
             Ok((
                 Db::Mongo(engine::Mongo {
-                    url: url.clone(),
+                    url,
                     password,
                     // One value for both halves of the bound: the server-side
                     // maxTimeMS and the in-process deadline that backstops it.
@@ -2394,6 +2445,9 @@ fn command_format_flag(command: &Command) -> Option<Format> {
         // agent-setup has its own format enum and sets its routing itself; the
         // value here is unused (it short-circuits run() before any error path).
         Command::AgentSetup { .. } => None,
+        // secret-set writes one line to stderr and no envelope; like
+        // agent-setup it never reaches the format-routed error paths.
+        Command::SecretSet { .. } => None,
     }
 }
 
@@ -2404,7 +2458,7 @@ fn default_format(command: &Command) -> Format {
         Command::Doctor { .. } => Format::Table,
         // Markdown default routes like a data format (stderr envelope);
         // agent_setup overrides this before any error path anyway.
-        Command::AgentSetup { .. } => Format::Table,
+        Command::AgentSetup { .. } | Command::SecretSet { .. } => Format::Table,
         _ => Format::Json,
     }
 }
@@ -2424,14 +2478,14 @@ fn engine_kind(engine: &str) -> output::EngineKind {
 /// The transport guarantee for doctor, from config + url only (no round-trip):
 /// an ssh tunnel encrypts the hop, a direct url at `require`+ enforces TLS,
 /// anything below that is not guaranteed encrypted, and SQLite has no transport.
-fn doctor_transport(conn: &config::Connection) -> output::Transport {
+fn doctor_transport(conn: &config::Connection, url: &str) -> output::Transport {
     if conn.engine == "sqlite" {
         return output::Transport::Na;
     }
     if conn.ssh.is_some() {
         return output::Transport::Tunnel;
     }
-    if insecure_transport(conn) {
+    if insecure_transport(conn, url) {
         output::Transport::InsecureDirect
     } else {
         output::Transport::TlsDirect
@@ -2507,9 +2561,8 @@ fn diagnose_connection(
 /// server connection whose url sslmode is below require gives no
 /// encryption/verification guarantee. Computed from config + url only (no
 /// server round-trip).
-fn insecure_transport(conn: &config::Connection) -> bool {
-    conn.ssh.is_none()
-        && engine::transport_below_require(&conn.engine, conn.url.as_deref().unwrap_or(""))
+fn insecure_transport(conn: &config::Connection, url: &str) -> bool {
+    conn.ssh.is_none() && engine::transport_below_require(&conn.engine, url)
 }
 
 /// Security signal (not a refusal), shared by query and schema: the transport
@@ -2548,28 +2601,185 @@ fn sampled_schema_warning(sampled: u32) -> output::Warning {
     }
 }
 
-/// Read the password for a server connection. `password_env` holds the NAME of
+/// Read the password for a server connection. The config holds WHERE it lives, never
 /// an env var; its value is read here and never printed. A named-but-unset var
 /// is a hard config error (like a missing `${VAR}`). Shared by the postgres and
 /// mysql/mariadb engines.
-fn read_password_env(alias: &str, conn: &config::Connection) -> Result<Option<String>, Failure> {
-    match &conn.password_env {
-        Some(var) => match std::env::var(var) {
-            Ok(v) => Ok(Some(v)),
-            Err(_) => Err(Failure::new(
-                ErrorCode::ConfigInvalid,
-                format!(
-                    "connection '{alias}' sets password_env = \"{var}\" but that environment \
-                     variable is not set"
-                ),
-                format!(
-                    "export {var}=... before running nyet, or remove password_env to connect \
-                     without a password"
-                ),
-            )),
-        },
+/// config -> doctor's view of where a password lives. The mapping is the
+/// threat model in one line: only a source that checks WHO is asking keeps the
+/// secret away from another process of this user.
+fn secret_fact(password: &config::Secret) -> output::SecretFact {
+    match password.source() {
+        config::Source::Config => output::SecretFact::InConfig,
+        config::Source::CallerVerified => output::SecretFact::CallerVerified,
+        config::Source::Unguarded => output::SecretFact::Unguarded,
+    }
+}
+
+/// `nyet secret-set <item>`: read the value from stdin and hand it to the
+/// keychain. Deliberately does NOT take the value as an argument — argv is
+/// visible in `ps` and lands in the shell history, which is the opposite of
+/// the point.
+fn secret_set(item: &str) -> Result<(), Failure> {
+    let value = read_secret_from_stdin()?;
+    if value.is_empty() {
+        return Err(Failure::new(
+            ErrorCode::ConfigInvalid,
+            "no value was given on stdin",
+            "run `nyet secret-set <item>` and type the secret, or pipe it in: \
+             `printf %s \"$PASSWORD\" | nyet secret-set <item>`",
+        ));
+    }
+    secret::store_in_keychain(item, &value).map_err(|e| match e {
+        secret::SecretError::KeychainUnsupported => Failure::new(
+            ErrorCode::NotImplemented,
+            "storing secrets in a keychain is macOS-only",
+            "on this platform a connection can use { env = \"VAR\" } or \
+             { command = \"...\" } — both readable by any process of this user, \
+             the agent included",
+        ),
+        secret::SecretError::KeychainNotOurs { item } => Failure::new(
+            ErrorCode::ConfigInvalid,
+            format!("the keychain refused to overwrite the item \"{item}\""),
+            "the item belongs to the binary that created it — macOS asks for your \
+             keychain password to hand it over, and that prompt has to be answered \
+             (Deny, or no answer, leaves the old item untouched)",
+        ),
+        other => Failure::new(
+            ErrorCode::Internal,
+            format!("the secret could not be stored: {other:?}"),
+            "check the item in Keychain Access and try again",
+        ),
+    })?;
+    let _ = writeln!(
+        io::stderr(),
+        "stored \"{item}\" in the login keychain, readable by this build of nyet only"
+    );
+    Ok(())
+}
+
+/// One line from stdin, without echoing it when stdin is a terminal. `stty` is
+/// the whole implementation on purpose: a crate for this would be a
+/// dependency, and the fallback (echo stays on) is honest rather than fatal.
+fn read_secret_from_stdin() -> Result<String, Failure> {
+    let interactive = std::io::IsTerminal::is_terminal(&io::stdin());
+    let hushed = interactive && stty(&["-echo"]);
+    if interactive {
+        let _ = write!(io::stderr(), "Secret (not echoed): ");
+        let _ = io::stderr().flush();
+    }
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line);
+    if hushed {
+        stty(&["echo"]);
+        let _ = writeln!(io::stderr());
+    }
+    read.map_err(|e| {
+        Failure::new(
+            ErrorCode::Internal,
+            format!("stdin could not be read: {e}"),
+            "pipe the value in instead: `printf %s \"$PASSWORD\" | nyet secret-set <item>`",
+        )
+    })?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+fn stty(args: &[&str]) -> bool {
+    std::process::Command::new("stty")
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn read_password(alias: &str, conn: &config::Connection) -> Result<Option<String>, Failure> {
+    match &conn.password {
+        Some(secret) => resolve_secret(alias, "password", secret).map(Some),
         None => Ok(None),
     }
+}
+
+/// One `config::Secret` -> its value, with every failure turned into advice
+/// aimed at the HUMAN who owns the config. The agent reads these too, so none
+/// of them names the config file or quotes the secret.
+fn resolve_secret(alias: &str, key: &str, secret: &config::Secret) -> Result<String, Failure> {
+    use secret::SecretError;
+    secret::resolve(secret).map_err(|e| {
+        let (message, hint) = match e {
+            SecretError::MissingEnvVar { var, not_unicode } => (
+                match not_unicode {
+                    true => format!(
+                        "connection '{alias}' reads its {key} from ${var}, but that \
+                         environment variable is not valid UTF-8"
+                    ),
+                    false => format!(
+                        "connection '{alias}' reads its {key} from ${var}, but that \
+                         environment variable is not set"
+                    ),
+                },
+                format!("export {var}=... before running nyet"),
+            ),
+            SecretError::CommandFailed { message } => (
+                format!(
+                    "the command providing the {key} of connection '{alias}' failed: {message}"
+                ),
+                "run that command yourself to see why it failed — nyet deliberately does not \
+                 pass its stderr through, because the agent reads nyet's output"
+                    .to_string(),
+            ),
+            SecretError::Empty { source } => (
+                format!(
+                    "the {source} providing the {key} of connection '{alias}' gave an empty value"
+                ),
+                "an empty secret would travel on as \"no password\" and fail three layers \
+                 later; store the real value, or drop the setting if this connection needs \
+                 no password"
+                    .to_string(),
+            ),
+            SecretError::KeychainUnsupported => (
+                format!(
+                    "connection '{alias}' takes its {key} from a keychain item, which \
+                         only exists on macOS"
+                ),
+                "on this platform use { env = \"VAR\" } or { command = \"...\" } — but note \
+                 that both are readable by any process of this user, the agent included"
+                    .to_string(),
+            ),
+            SecretError::KeychainNotFound { item } => (
+                format!(
+                    "connection '{alias}' takes its {key} from the keychain item \
+                         \"{item}\", which does not exist"
+                ),
+                format!("store it with `nyet secret-set {item}`"),
+            ),
+            // The measured symptom of an updated binary: the item is there,
+            // its ACL names the nyet that created it, and this one is a
+            // different build.
+            SecretError::KeychainNotOurs { item } => (
+                format!(
+                    "the keychain item \"{item}\" exists but is not readable by this \
+                         build of nyet"
+                ),
+                format!(
+                    "the item trusts the exact binary that created it, and installing nyet \
+                     builds a new one — run `nyet secret-set {item}` to hand it over (macOS \
+                     will ask for your keychain password, which is exactly the barrier an \
+                     agent cannot pass)"
+                ),
+            ),
+            SecretError::KeychainFailed { message } => (
+                format!(
+                    "the {key} of connection '{alias}' could not be read from the \
+                         keychain: {message}"
+                ),
+                "check the item in Keychain Access, or store it again with \
+                 `nyet secret-set <item>`"
+                    .to_string(),
+            ),
+        };
+        Failure::new(ErrorCode::ConfigInvalid, message, hint)
+    })
 }
 
 fn duplicate_columns(columns: &[String]) -> Vec<&str> {
@@ -2646,6 +2856,18 @@ fn config_failure(e: config::ConfigError) -> Failure {
              and \"..\" components are rejected because they would widen the scope — \
              write the resolved absolute path instead"
                 .to_string(),
+        ),
+        config::ConfigError::SecretNotOneSource { alias, key } => (
+            format!(
+                "the config file: {key} of connection '{alias}' must name exactly one place \
+                 the value comes from"
+            ),
+            format!(
+                "write {key} = \"...\" to keep it in the config, or exactly one of \
+                 {{ keychain = \"item\" }} (macOS; only nyet can read it), \
+                 {{ env = \"VAR\" }} or {{ command = \"...\" }} — the last two are readable \
+                 by any process of this user, the agent included"
+            ),
         ),
         config::ConfigError::ZeroValue { key } => (
             format!("the config file: {key} is 0"),

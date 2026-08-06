@@ -1981,6 +1981,7 @@ dependencies = [
  "futures-util",
  "mongodb",
  "proptest",
+ "security-framework",
  "serde",
  "serde_json",
  "sqlparser",

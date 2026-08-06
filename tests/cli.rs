@@ -47,7 +47,7 @@ allowed_dirs = ["{}"]
 [connections.prod]
 engine = "postgres"
 url = "postgres://nyet_ro@db/app"
-password_env = "TEST_DB_PASSWORD"
+password = {{ env = "TEST_DB_PASSWORD" }}
 allowed_dirs = ["/no/such/place"]
 "#,
         dir.display()
@@ -286,6 +286,96 @@ fn the_config_location_never_reaches_the_output() {
             !warning.contains(&tmp.path().display().to_string()),
             "the permissions warning leaks the config path: {warning}"
         );
+    }
+}
+
+/// A secret reference says WHERE the value lives, which is as much a security
+/// decision as `allowed_dirs`: exactly one source, spelled literally. A typo
+/// that silently picked the weaker source, or a `${VAR}` the agent controls,
+/// would quietly undo the whole point.
+#[test]
+fn a_secret_reference_names_exactly_one_literal_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let head = format!(
+        "[connections.a]\nengine = \"postgres\"\nurl = \"postgres://u@h/db\"\n\
+         allowed_dirs = [\"{}\"]\n",
+        tmp.path().display()
+    );
+    for bad in [
+        // Two sources: which one wins would be decided by a typo.
+        "password = { env = \"A\", command = \"echo b\" }",
+        // None at all.
+        "password = { }",
+        // A typo must not be read as "no reference, no password".
+        "password = { keychian = \"prod-db\" }",
+        // The environment is the agent's to set, so it must not choose the
+        // keychain item or the command that produces the secret.
+        "password = { keychain = \"${ITEM}\" }",
+        "password = { command = \"${GETTER}\" }",
+    ] {
+        let cfg = write_config(tmp.path(), &format!("{head}{bad}\n"));
+        let out = nyet(tmp.path())
+            .args(["query", "a", "SELECT 1"])
+            .arg("--config")
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .env("ITEM", "prod-db")
+            .env("GETTER", "printf hunter2")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{bad}: {}", stdout(&out));
+        let v = error_envelope(&out);
+        assert_eq!(v["error"]["code"], "CONFIG_INVALID", "{bad}");
+    }
+}
+
+/// The value itself is resolved for the connection actually in use, and a
+/// source that cannot deliver is a config error naming what to fix — never an
+/// empty password quietly handed to the driver.
+#[test]
+fn a_secret_is_resolved_at_connect_time_and_never_silently_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = |body: &str| {
+        format!(
+            "[connections.a]\nengine = \"postgres\"\n\
+             url = \"postgres://u@127.0.0.1:59999/db\"\nallowed_dirs = [\"{}\"]\n{body}\n",
+            tmp.path().display()
+        )
+    };
+    let run = |text: &str| {
+        let cfg = write_config(tmp.path(), text);
+        nyet(tmp.path())
+            .args(["query", "a", "SELECT 1"])
+            .arg("--config")
+            .arg(&cfg)
+            .current_dir(tmp.path())
+            .env("REAL_PW", "hunter2")
+            .output()
+            .unwrap()
+    };
+
+    // Resolved: the run gets as far as the (refused) TCP connection, which
+    // only happens once the password is in hand.
+    let out = run(&conn("password = { command = \"printf hunter2\" }"));
+    assert_eq!(out.status.code(), Some(6), "{}", stdout(&out));
+    // ...and the secret is not echoed on the way.
+    assert!(!stdout(&out).contains("hunter2"), "{}", stdout(&out));
+    assert!(!stderr(&out).contains("hunter2"), "{}", stderr(&out));
+
+    let out = run(&conn("password = { env = \"REAL_PW\" }"));
+    assert_eq!(out.status.code(), Some(6), "{}", stdout(&out));
+
+    // A helper that fails, prints nothing, or names a missing variable is a
+    // loud config error — an empty password would surface as a confusing auth
+    // failure three layers down instead.
+    for broken in [
+        "password = { command = \"exit 3\" }",
+        "password = { command = \"true\" }",
+        "password = { env = \"NYET_NO_SUCH_VAR_XYZ\" }",
+    ] {
+        let out = run(&conn(broken));
+        assert_eq!(out.status.code(), Some(3), "{broken}: {}", stdout(&out));
+        assert_eq!(error_envelope(&out)["error"]["code"], "CONFIG_INVALID");
     }
 }
 

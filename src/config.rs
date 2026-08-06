@@ -64,16 +64,102 @@ pub struct Defaults {
     pub format: Option<String>,
 }
 
-// url/password_env are validated now, used by server engines in step 4+.
+/// A value that is either written in the config or lives somewhere else.
+///
+/// The point is not "no secret in the file" but "the agent does not get the
+/// secret even after finding the file" — and it runs under the same uid, so
+/// only a source that checks WHO is asking draws a line. What separates the
+/// sources is that property, not the vendor:
+///
+/// - `keychain` — the OS checks the caller's code signature (macOS Keychain
+///   ACL). The agent's shell is not nyet, so it gets a password prompt.
+/// - `env` / `command` — unguarded: any process of this uid reads the same
+///   variable or runs the same command. Convenient, not a boundary.
+///
+/// Both `url` and `password` take one, so "keep only the password out of the
+/// file" and "keep the whole address out of it" are the same mechanism.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Secret {
+    /// Written in the config as plain text (`${VAR}` substitution still applies).
+    Literal(String),
+    Elsewhere(SecretRef),
+}
+
+/// Exactly one of these names where the value lives. `deny_unknown_fields`
+/// turns a typo into a config error instead of a silently ignored key.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRef {
+    /// Keychain item created by `nyet secret set` (macOS only).
+    pub keychain: Option<String>,
+    /// Name of an environment variable; the value is never printed.
+    pub env: Option<String>,
+    /// Shell command whose stdout is the secret.
+    pub command: Option<String>,
+}
+
+/// Where a secret comes from, and — the only thing that matters for the
+/// threat model — whether anything checks who is asking for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Written in the config, or resolved from it by `${VAR}` substitution.
+    Config,
+    /// The OS verifies the caller's code signature before handing it over.
+    CallerVerified,
+    /// Any process of this uid can read it just as easily as nyet.
+    Unguarded,
+}
+
+impl Secret {
+    /// The text, when it is written in the config. `None` means resolving it
+    /// costs IO (and may prompt), so the caller must do it deliberately and
+    /// only for the connection actually being used.
+    pub fn literal(&self) -> Option<&str> {
+        match self {
+            Secret::Literal(text) => Some(text),
+            Secret::Elsewhere(_) => None,
+        }
+    }
+
+    pub fn source(&self) -> Source {
+        match self {
+            Secret::Literal(_) => Source::Config,
+            Secret::Elsewhere(r) if r.keychain.is_some() => Source::CallerVerified,
+            Secret::Elsewhere(_) => Source::Unguarded,
+        }
+    }
+
+    /// Exactly one source, checked at parse time so the failure is a config
+    /// error (exit 3) and not a surprise at connect time.
+    fn validate(&self, alias: &str, key: &'static str) -> Result<(), ConfigError> {
+        let Secret::Elsewhere(r) = self else {
+            return Ok(());
+        };
+        let named = [&r.keychain, &r.env, &r.command]
+            .into_iter()
+            .filter(|v| v.is_some())
+            .count();
+        match named {
+            1 => Ok(()),
+            _ => Err(ConfigError::SecretNotOneSource {
+                alias: alias.to_string(),
+                key,
+            }),
+        }
+    }
+}
+
+// url/password are validated now, used by server engines in step 4+.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
     pub engine: String,
-    pub url: Option<String>,
+    pub url: Option<Secret>,
     pub path: Option<String>,
-    /// Name of the env variable holding the password; the value is never printed.
-    pub password_env: Option<String>,
+    /// Where the password lives; the value is never printed.
+    pub password: Option<Secret>,
     /// Empty or absent = denied everywhere (fail closed).
     #[serde(default)]
     pub allowed_dirs: Vec<String>,
@@ -162,6 +248,10 @@ pub enum ConfigError {
     /// `row_limit = 0` / `timeout_secs = 0`: zero would mean "no rows" /
     /// "every query times out" — never what anyone wants. Fail loud.
     ZeroValue { key: String },
+    /// `url`/`password` names no source, or more than one: the value has to
+    /// come from exactly one place, and guessing which would be a security
+    /// decision made by a typo.
+    SecretNotOneSource { alias: String, key: &'static str },
     /// A `[connections.X.ssh]` section is present but `host` or `remote` is
     /// missing/empty — both are required to open a tunnel. `field` is the name.
     SshMissingField { alias: String, field: &'static str },
@@ -238,6 +328,12 @@ pub fn parse(text: &str, env: EnvLookup) -> Result<Config, ConfigError> {
             conn.max_timeout_secs,
             &format!("connections.{alias}.max_timeout_secs"),
         )?;
+        if let Some(url) = &conn.url {
+            url.validate(alias, "url")?;
+        }
+        if let Some(password) = &conn.password {
+            password.validate(alias, "password")?;
+        }
         validate_ssh(alias, conn)?;
         validate_mongodb(alias, conn)?;
         guardrail(alias, conn)?;
@@ -398,7 +494,16 @@ fn validate_mongodb(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
     if conn.ssh.is_none() {
         return Ok(());
     }
-    let url = conn.url.as_deref().unwrap_or_default().to_ascii_lowercase();
+    // A url that lives outside the config cannot be judged here; the cli calls
+    // mongo_tunnel again on the resolved value before it dials.
+    mongo_tunnel(alias, conn.url.as_ref().and_then(Secret::literal))
+}
+
+/// The `[ssh]` + MongoDB-url rules, split out because a url that comes from a
+/// keychain item or a command is only known at connect time — the same check
+/// then has to run there, on the value that will actually be dialed.
+pub fn mongo_tunnel(alias: &str, url: Option<&str>) -> Result<(), ConfigError> {
+    let url = url.unwrap_or_default().to_ascii_lowercase();
     let bad = |message: &str| {
         Err(ConfigError::MongoTunnelInvalid {
             alias: alias.to_string(),
@@ -535,6 +640,19 @@ fn reject_env_vars_in_policy(value: &toml::Value) -> Result<(), ConfigError> {
             }
             Ok(())
         };
+        // A secret REFERENCE says where the value lives, which is as much a
+        // security decision as allowed_dirs: substitution there would let the
+        // agent point nyet at a keychain item or a command of its choosing.
+        // The literal spelling (`url = "postgres://u:${PW}@h/db"`) is
+        // untouched — that one is the value, not the source.
+        for key in ["url", "password"] {
+            let Some(reference) = conn.get(key).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            for source in reference.values().filter_map(toml::Value::as_str) {
+                literal(if key == "url" { "url" } else { "password" }, source)?;
+            }
+        }
         if let Some(dirs) = conn.get("allowed_dirs").and_then(toml::Value::as_array) {
             for dir in dirs.iter().filter_map(toml::Value::as_str) {
                 literal("allowed_dirs", dir)?;
@@ -730,7 +848,7 @@ mod tests {
         [connections.prod]
         engine = "postgres"
         url = "postgres://nyet_ro@db.internal:5432/app"
-        password_env = "PROD_DB_PASSWORD"
+        password = { env = "PROD_DB_PASSWORD" }
         allowed_dirs = ["~/Workspace/app"]
         row_limit = 500
         timeout_secs = 10
@@ -757,8 +875,9 @@ mod tests {
         assert_eq!(cfg.connections.len(), 2);
         let prod = &cfg.connections["prod"];
         assert_eq!(prod.engine, "postgres");
-        // password_env holds the variable *name*, never its value.
-        assert_eq!(prod.password_env.as_deref(), Some("PROD_DB_PASSWORD"));
+        // The reference holds the variable *name*, never its value.
+        assert_eq!(prod.password.as_ref().unwrap().source(), Source::Unguarded);
+        assert!(prod.password.as_ref().unwrap().literal().is_none());
         assert_eq!(
             prod.validator.as_ref().unwrap().allow_functions,
             Some(vec!["pg_sleep".to_string()])
@@ -802,7 +921,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            cfg.connections["a"].url.as_deref(),
+            cfg.connections["a"].url.as_ref().and_then(Secret::literal),
             Some("postgres://u:s3cret@h/db")
         );
     }
@@ -997,7 +1116,10 @@ mod tests {
             &env_of(&[]),
         )
         .unwrap();
-        assert_eq!(cfg.connections["a"].url.as_deref(), Some("${not closed"));
+        assert_eq!(
+            cfg.connections["a"].url.as_ref().and_then(Secret::literal),
+            Some("${not closed")
+        );
     }
 
     #[test]

@@ -70,7 +70,7 @@ fn write_mysql_config_with(dir: &Path, port: u16, extra: &str) -> std::path::Pat
         format!(
             "[connections.my]\nengine = \"mariadb\"\n\
              url = \"mysql://app@127.0.0.1:{port}/test\"\n\
-             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n{extra}",
+             password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n{extra}",
             dir.display()
         ),
     )
@@ -369,7 +369,7 @@ fn mysql_schema_end_to_end() {
             format!(
                 "[connections.my]\nengine = \"mariadb\"\n\
                  url = \"mysql://partial@127.0.0.1:{port}/test\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
                 tmp.path().display()
             ),
         )
@@ -492,7 +492,7 @@ fn mysql_doctor_end_to_end() {
             format!(
                 "[connections.my]\nengine = \"mariadb\"\n\
                  url = \"mysql://ro@127.0.0.1:{port}/test\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
                 tmp.path().display()
             ),
         )
@@ -528,7 +528,7 @@ fn mysql_doctor_end_to_end() {
             format!(
                 "[connections.my]\nengine = \"mariadb\"\n\
                  url = \"mysql://nodrop@127.0.0.1:{port}/test\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
                 tmp.path().display()
             ),
         )
@@ -656,7 +656,7 @@ fn mysql8_functional_index_key_part_is_not_dropped() {
             format!(
                 "[connections.my]\nengine = \"mysql\"\n\
                  url = \"mysql://partial@127.0.0.1:{port}/test?ssl-mode=REQUIRED\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
                 tmp.path().display()
             ),
         )
@@ -822,7 +822,7 @@ fn mysql_guardrail_and_explain_end_to_end() {
             format!(
                 "[connections.my]\nengine = \"mariadb\"\n\
                  url = \"mysql://viewer@127.0.0.1:{port}/test\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
                 tmp.path().display()
             ),
         )
@@ -1125,7 +1125,7 @@ fn mysql_pii_mask_end_to_end() {
                 format!(
                     "[connections.my]\nengine = \"mariadb\"\n\
                      url = \"mysql://{user}@127.0.0.1:{port}/test\"\n\
-                     password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n\
+                     password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n\
                      [connections.my.pii]\ncolumns = [\"users.email\"]\nmode = \"mask\"\n",
                     tmp.path().display()
                 ),
@@ -1166,7 +1166,7 @@ fn mysql_pii_mask_end_to_end() {
             format!(
                 "[connections.my]\nengine = \"mariadb\"\n\
                  url = \"mysql://pii_none@127.0.0.1:{port}/test\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n\
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n\
                  [connections.my.pii]\ncolumns = ['\"users\".\"we`ird\"']\n",
                 tmp.path().display()
             ),
@@ -1194,7 +1194,7 @@ fn mysql_pii_mask_end_to_end() {
             format!(
                 "[connections.my]\nengine = \"mariadb\"\n\
                  url = \"mysql://pii_none@127.0.0.1:{port}/test\"\n\
-                 password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n\
+                 password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n\
                  [connections.my.pii]\ncolumns = [\"users.nosuchcolumn\"]\n",
                 tmp.path().display()
             ),

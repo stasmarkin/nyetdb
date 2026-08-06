@@ -179,7 +179,7 @@ fn write_config(dir: &Path, name: &str, ssh_port: u16, pg_name: &str, extra: &st
         format!(
             "[connections.pg]\nengine = \"postgres\"\n\
              url = \"postgres://postgres@db.placeholder:5432/postgres\"\n\
-             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n\
+             password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n\
              [connections.pg.ssh]\n\
              host = \"nyet@127.0.0.1:{ssh_port}\"\n\
              remote = \"{pg_name}:5432\"\n\

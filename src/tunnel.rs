@@ -84,7 +84,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Keep only the env vars `ssh` legitimately needs; everything else — notably
-/// the DB password from `password_env`, which nyet holds in its own env — is
+/// the DB password nyet resolved for this connection, which it holds in memory — is
 /// dropped so the ssh subprocess (and any ProxyCommand helper it spawns, or any
 /// local reader of /proc/PID/environ) never sees it. ssh needs no DB password.
 fn keep_env_key(key: &str) -> bool {
@@ -1013,7 +1013,7 @@ mod tests {
         for keep in ["HOME", "PATH", "SSH_AUTH_SOCK", "USER", "LANG", "LC_ALL"] {
             assert!(keep_env_key(keep), "{keep} should be kept");
         }
-        // The DB password (from password_env) and anything else must be dropped.
+        // The DB password nyet resolved and anything else must be dropped.
         for drop in [
             "PROD_DB_PASSWORD",
             "NYET_PG_TEST_PW",

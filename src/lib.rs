@@ -15,6 +15,7 @@ pub mod mongo;
 pub mod output;
 pub mod resolver;
 pub mod sample;
+pub mod secret;
 pub mod skill;
 pub mod tunnel;
 pub mod validator;

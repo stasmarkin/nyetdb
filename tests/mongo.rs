@@ -194,7 +194,7 @@ fn write_config_as(dir: &Path, port: u16, user: &str) -> std::path::PathBuf {
         format!(
             "[connections.mg]\nengine = \"mongodb\"\n\
              url = \"mongodb://{user}@127.0.0.1:{port}/test\"\n\
-             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n",
+             password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n",
             dir.display()
         ),
     )
@@ -222,7 +222,7 @@ fn write_config(dir: &Path, port: u16, extra: &str) -> std::path::PathBuf {
         format!(
             "[connections.mg]\nengine = \"mongodb\"\n\
              url = \"mongodb://app@127.0.0.1:{port}/test\"\n\
-             password_env = \"{PW_ENV}\"\nallowed_dirs = [\"{}\"]\n{extra}",
+             password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n{extra}",
             dir.display()
         ),
     )

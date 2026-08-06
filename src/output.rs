@@ -1040,6 +1040,25 @@ pub struct DoctorInput {
     /// Whether the connection has a `[pii]` policy at all, and in which mode —
     /// config, so the cli computes it (the engine only reports privileges).
     pub pii_mode: Option<&'static str>,
+    /// Where this connection's password comes from, when it has one. Reported
+    /// as a plain fact, never a warning: an env var on a dev database is a
+    /// deliberate choice, not a defect.
+    pub secret: Option<SecretFact>,
+}
+
+/// What stands between the stored password and any other process running as
+/// this user. Named after the property that matters, not after the vendor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretFact {
+    /// Written in the config file itself.
+    InConfig,
+    /// macOS Keychain: the OS checks the caller's code signature, so nyet can
+    /// read it and another process of the same user cannot (without the human
+    /// answering a keychain prompt).
+    CallerVerified,
+    /// An env var or a command: whatever nyet can read this way, so can any
+    /// other process of this user — the agent included.
+    Unguarded,
 }
 
 fn ok_check(name: &'static str, message: impl Into<String>) -> DoctorCheck {
@@ -1105,6 +1124,7 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
     // connection without `[pii]` is pure noise in the common case (UX-4).
     .chain(input.forward.as_ref().map(ssh_forward_check))
     .chain(input.pii_mode.map(|mode| pii_columns_check(input, mode)))
+    .chain(input.secret.map(secret_source_check))
     .chain([permissions_check(&input.permissions)])
     .collect()
 }
@@ -1578,6 +1598,32 @@ fn not_superuser_check(input: &DoctorInput) -> DoctorCheck {
                  hand, and prefer an account with only the SELECT grants the agent needs",
             ),
         },
+    }
+}
+
+/// A statement of fact, deliberately never a warning (UX-7 honesty without
+/// nagging): only the human knows whether this database's password is worth
+/// keeping out of reach of their own agent.
+fn secret_source_check(secret: SecretFact) -> DoctorCheck {
+    match secret {
+        SecretFact::CallerVerified => ok_check(
+            "secret_source",
+            "the password comes from the keychain, which hands it to nyet and to no other \
+             process of this user without asking you first",
+        ),
+        SecretFact::Unguarded => na_check(
+            "secret_source",
+            "the password comes from an environment variable or a command, so any process \
+             running as you can read it just as easily — the agent included; on macOS \
+             `nyet secret-set <item>` plus password = { keychain = \"<item>\" } keeps it \
+             out of their reach",
+        ),
+        SecretFact::InConfig => na_check(
+            "secret_source",
+            "the password is written in the config file, so anything that can read the \
+             file has it — the agent included; on macOS `nyet secret-set <item>` plus \
+             password = { keychain = \"<item>\" } keeps it out of their reach",
+        ),
     }
 }
 
@@ -2381,6 +2427,7 @@ mod tests {
     #[test]
     fn doctor_checks_cover_all_statuses_with_hints() {
         let input = DoctorInput {
+            secret: None,
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
@@ -2430,6 +2477,7 @@ mod tests {
     #[test]
     fn doctor_ssh_forward_is_visible_and_killable() {
         let input = |forward| DoctorInput {
+            secret: None,
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
@@ -2495,6 +2543,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let input = |engine, pii_mode, pii| DoctorInput {
+            secret: None,
             pii_mode,
             engine,
             diagnosis: Diagnosis {
@@ -2574,6 +2623,7 @@ mod tests {
     #[test]
     fn doctor_read_only_role_ok_when_the_probe_is_blocked() {
         let input = DoctorInput {
+            secret: None,
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
@@ -2615,6 +2665,7 @@ mod tests {
     fn doctor_blocked_headline_does_not_over_promise_on_ddl_only() {
         let blocked = |ddl_only: bool| {
             let input = DoctorInput {
+                secret: None,
                 pii_mode: None,
                 engine: EngineKind::Postgres,
                 diagnosis: Diagnosis {
@@ -2653,6 +2704,7 @@ mod tests {
     #[test]
     fn doctor_unknown_is_warn_never_a_false_ok() {
         let input = DoctorInput {
+            secret: None,
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
@@ -2688,6 +2740,7 @@ mod tests {
     #[test]
     fn doctor_reports_orphan_probe_table_and_unresolved_grants() {
         let input = DoctorInput {
+            secret: None,
             pii_mode: None,
             engine: EngineKind::Mysql,
             diagnosis: Diagnosis {
@@ -2724,6 +2777,7 @@ mod tests {
     #[test]
     fn doctor_sqlite_is_honest_about_na() {
         let input = DoctorInput {
+            secret: None,
             pii_mode: None,
             engine: EngineKind::Sqlite,
             diagnosis: Diagnosis {
@@ -2749,6 +2803,7 @@ mod tests {
     #[test]
     fn doctor_connect_failure_is_a_fail_check_not_an_error() {
         let input = DoctorInput {
+            secret: None,
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
@@ -2854,6 +2909,7 @@ mod tests {
     #[test]
     fn doctor_mongo_reads_layer_3_from_the_grants_and_never_guesses() {
         let grants = |g: Grants| DoctorInput {
+            secret: None,
             // MongoDB rejects a `[pii]` section at config parse.
             pii_mode: None,
             engine: EngineKind::Mongo,
@@ -2935,6 +2991,7 @@ mod tests {
     #[test]
     fn doctor_server_side_js_is_mongodb_only_and_admits_it_cannot_check() {
         let with = |engine, js| DoctorInput {
+            secret: None,
             pii_mode: None,
             engine,
             diagnosis: Diagnosis {
@@ -2985,6 +3042,7 @@ mod tests {
     #[test]
     fn doctor_mongo_without_a_connection_never_reads_as_ok() {
         let input = DoctorInput {
+            secret: None,
             pii_mode: None,
             engine: EngineKind::Mongo,
             diagnosis: Diagnosis {

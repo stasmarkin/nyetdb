@@ -407,7 +407,7 @@ ssh) and *before* the engine connects. The split follows Д1/Д2:
   through). `valid_label` rejects a leading `-` and anything outside
   `[A-Za-z0-9._-]`.
 - **ssh env is sanitized (SECURITY).** nyet holds the DB password (from
-  `password_env`) in its own environment; `ssh` must not inherit it (a
+  the connection's `password`) in its own environment; `ssh` must not inherit it (a
   ProxyCommand helper or a local `/proc/PID/environ` reader would see it).
   `ssh_command()` does `env_clear()` + an allowlist (`keep_env_key`: HOME, USER,
   LOGNAME, PATH, SSH_AUTH_SOCK, SSH_CONNECTION, TERM, LANG, LC_*), used for the
@@ -3531,7 +3531,7 @@ prints the error envelope (failure). The audit point is *after* the session is
 open (engine resolved) but does not require a connect: a validator refusal is
 logged though nothing reached the database ("what the agent tried"). Config
 errors *before* the session (unknown alias, directory denied, unsupported
-engine, missing `password_env`) are **not** logged — there is no engine to name
+engine, an unresolvable `password`) are **not** logged — there is no engine to name
 and no database interaction; behavior there is byte-for-byte as before.
 `list`, `agent-setup` and `doctor` with no alias never contact a database and
 are not logged (Д9 — nothing extra on the cold-start path).

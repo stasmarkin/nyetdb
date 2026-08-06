@@ -951,7 +951,7 @@ async fn sqlite_fks(
 pub struct Postgres {
     /// The `url` from the config (no password embedded by convention).
     pub url: String,
-    /// Read from `password_env` by the cli; never logged/printed.
+    /// Resolved from the connection's `password` by the cli; never logged/printed.
     pub password: Option<String>,
     /// Server-side statement_timeout, from the effective per-query timeout.
     pub statement_timeout_ms: u64,
@@ -1036,8 +1036,8 @@ impl Postgres {
         // Never echo the url on a parse error: it may embed credentials.
         let opts: PgConnectOptions = self.url.parse().map_err(|_| EngineError::Connect {
             message: "the `url` for this connection is not a valid PostgreSQL URL".to_string(),
-            hint: "use the form postgres://user@host:port/dbname; put the password in the \
-                   env var named by password_env, not in the url"
+            hint: "use the form postgres://user@host:port/dbname; keep the password in \
+                   this connection's `password`, not in the url"
                 .to_string(),
         })?;
         // Layer 2: the SERVER enforces read-only and the timeout, independent
@@ -1051,7 +1051,7 @@ impl Postgres {
             .application_name("nyet");
         let opts = match &self.password {
             Some(pw) => opts.password(pw),
-            // No password_env: try trust/peer auth (local dev). An auth
+            // No password configured: try trust/peer auth (local dev). An auth
             // failure surfaces as CONNECTION_FAILED with a hint below.
             None => opts,
         };
@@ -1086,8 +1086,8 @@ impl Postgres {
     async fn connect_plain(&self) -> Result<sqlx::PgConnection, EngineError> {
         let opts: PgConnectOptions = self.url.parse().map_err(|_| EngineError::Connect {
             message: "the `url` for this connection is not a valid PostgreSQL URL".to_string(),
-            hint: "use the form postgres://user@host:port/dbname; put the password in the \
-                   env var named by password_env, not in the url"
+            hint: "use the form postgres://user@host:port/dbname; keep the password in \
+                   this connection's `password`, not in the url"
                 .to_string(),
         })?;
         let opts = opts
@@ -2020,8 +2020,8 @@ fn pg_connect_error(e: sqlx::Error) -> EngineError {
         hint: if is_tls_error(&e) {
             tls_hint()
         } else {
-            "check the host/port in `url` and the credentials; set password_env to the \
-             env var holding the password for this connection"
+            "check the host/port in `url` and the credentials; set `password` on this \
+             connection to where the password lives"
                 .to_string()
         },
     }
@@ -2133,7 +2133,7 @@ fn pg_error(e: sqlx::Error) -> EngineError {
 pub struct Mysql {
     /// The `url` from the config (no password embedded by convention).
     pub url: String,
-    /// Read from `password_env` by the cli; never logged/printed.
+    /// Resolved from the connection's `password` by the cli; never logged/printed.
     pub password: Option<String>,
     /// The per-query wall budget in ms (MySQL `max_execution_time`; the MariaDB
     /// `max_statement_time` is the same budget in seconds).
@@ -2260,7 +2260,7 @@ impl Mysql {
         let opts: MySqlConnectOptions = self.url.parse().map_err(|_| EngineError::Connect {
             message: "the `url` for this connection is not a valid MySQL URL".to_string(),
             hint: "use the form mysql://user@host:port/dbname; put the password in the \
-                   env var named by password_env, not in the url"
+                   this connection's `password`, not in the url"
                 .to_string(),
         })?;
         let opts = match &self.password {
@@ -2294,7 +2294,7 @@ impl Mysql {
         let opts: MySqlConnectOptions = self.url.parse().map_err(|_| EngineError::Connect {
             message: "the `url` for this connection is not a valid MySQL URL".to_string(),
             hint: "use the form mysql://user@host:port/dbname; put the password in the \
-                   env var named by password_env, not in the url"
+                   this connection's `password`, not in the url"
                 .to_string(),
         })?;
         let opts = match &self.password {
@@ -3362,8 +3362,8 @@ fn mysql_connect_error(e: sqlx::Error) -> EngineError {
         hint: if is_tls_error(&e) {
             tls_hint()
         } else {
-            "check the host/port in `url` and the credentials; set password_env to the \
-             env var holding the password for this connection"
+            "check the host/port in `url` and the credentials; set `password` on this \
+             connection to where the password lives"
                 .to_string()
         },
     }
@@ -3465,7 +3465,7 @@ fn hex(bytes: &[u8]) -> String {
 pub struct Mongo {
     /// The `url` from the config (no password embedded by convention).
     pub url: String,
-    /// Read from `password_env` by the cli; never logged/printed.
+    /// Resolved from the connection's `password` by the cli; never logged/printed.
     pub password: Option<String>,
     /// The effective per-query wall budget in ms: sent to the server as
     /// `maxTimeMS` AND used as the in-process deadline, so a runaway query is
@@ -3493,7 +3493,7 @@ impl Mongo {
         let invalid_url = |message: &str| EngineError::Connect {
             message: message.to_string(),
             hint: "use the form mongodb://user@host:27017/dbname; put the password in the \
-                   env var named by password_env, not in the url"
+                   this connection's `password`, not in the url"
                 .to_string(),
         };
         let parsed = tokio::time::timeout(deadline, ClientOptions::parse(&self.url)).await;
@@ -3531,10 +3531,11 @@ impl Mongo {
         if let Some(password) = &self.password {
             let Some(credential) = opts.credential.as_mut() else {
                 return Err(EngineError::Connect {
-                    message: "password_env is set for this connection but its `url` names no user"
+                    message: "a password is configured for this connection but its `url` \
+                              names no user"
                         .to_string(),
-                    hint: "put the user in the url (mongodb://<user>@host:27017/dbname) and the \
-                           password in the env var named by password_env"
+                    hint: "put the user in the url (mongodb://<user>@host:27017/dbname) and \
+                           leave the password to this connection's `password`"
                         .to_string(),
                 });
             };
@@ -4121,8 +4122,8 @@ fn mongo_error(e: mongodb::error::Error) -> EngineError {
                 "authentication against MongoDB failed: {}",
                 trim_server_message(&message)
             ),
-            hint: "check the user in `url`, the password in the env var named by \
-                   password_env, and the authSource the user belongs to"
+            hint: "check the user in `url`, the password this connection's `password` \
+                   resolves to, and the authSource the user belongs to"
                 .to_string(),
         },
         ErrorKind::Io(e) => EngineError::Connect {
