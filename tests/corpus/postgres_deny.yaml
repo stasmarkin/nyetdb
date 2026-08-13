@@ -282,6 +282,110 @@
   verdict: deny
   reason: DENIED_FUNCTION
 
+# --- W7 audit (August 2026): reads with side effects that layer 2 does NOT
+# stop. Every one of these was measured running inside `BEGIN READ ONLY` on
+# postgres:16-alpine — the same test the nextval/setval entries above earn
+# their place with. Most are stopped by a read-only role, which nyet can only
+# recommend; txid_current is not stopped by one at all.
+
+# XID assignment: burns a cluster-global transaction id per call (measured:
+# three calls advanced xmax by three, three plain SELECTs by none), which is
+# the nextval class one scope wider — and the only entry here that a read-only
+# role does not stop.
+- query: SELECT txid_current()
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_current_xact_id()
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# Cluster-level WAL / backup state: written, not undone by ROLLBACK, and
+# pg_backup_start leaves the cluster in backup mode until someone stops it.
+- query: SELECT pg_create_restore_point('x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_switch_wal()
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_rotate_logfile()
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_backup_start('label')
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# Replication slots pin WAL: a slot created through a "read" can fill the
+# server's disk, and dropping one breaks a live replica.
+- query: SELECT pg_create_physical_replication_slot('s')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_create_logical_replication_slot('s', 'pgoutput')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_drop_replication_slot('s')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_replication_slot_advance('s', '0/0')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# get_changes CONSUMES from the slot (durable advance); peek_changes does not
+# and stays allowed.
+- query: SELECT pg_logical_slot_get_changes('s', NULL, NULL)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_replication_origin_create('o')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_replication_origin_drop('o')
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# Statistics resets: irreversible for everyone on the server (prefix-matched).
+- query: SELECT pg_stat_reset()
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_stat_reset_shared('bgwriter')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_stat_reset_single_table_counters(1)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_stat_statements_reset()
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# Index maintenance writes to the index, right through a read-only transaction.
+- query: SELECT brin_summarize_new_values('idx')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT gin_clean_pending_list('idx')
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# DDL and messaging wearing a function's clothes.
+- query: SELECT pg_import_system_collations('pg_catalog')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT pg_notify('chan', 'payload')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# `SET` wearing a function's clothes: the statement form is TXN_CONTROL, so
+# the wrapper cannot stay allowed (it sets statement_timeout for the session).
+- query: SELECT set_config('statement_timeout', '0', false)
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# The reading halves of those families stay allowed — a denylist that swallows
+# introspection would push people to allow_functions the whole family back.
+- query: SELECT pg_current_xact_id_if_assigned()
+  verdict: allow
+- query: SELECT pg_logical_slot_peek_changes('s', NULL, NULL)
+  verdict: allow
+- query: SELECT pg_relation_size('t')
+  verdict: allow
+- query: SELECT currval('s')
+  verdict: allow
+
 # --- unparseable -> fail closed ---
 - query: this is not sql at all
   verdict: deny

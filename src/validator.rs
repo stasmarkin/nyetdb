@@ -517,6 +517,80 @@ const POSTGRES_DENIED_FUNCTIONS: &[&str] = &[
     // non-transactional WAL message: survives ROLLBACK, so it mutates durably
     // through a read-only transaction (same class as nextval/setval).
     "pg_logical_emit_message",
+    // --- W7 audit, August 2026 ---------------------------------------------
+    // Every name below was MEASURED against postgres:16-alpine the way the
+    // nextval/setval entries were: run inside `BEGIN READ ONLY`, which is what
+    // layer 2 gives us. All of them ran. Most are stopped by layer 3 (a
+    // non-superuser role gets "permission denied"), but layer 3 is a
+    // RECOMMENDATION nyet nags about, not something it can assume — which is
+    // exactly why the validator exists as the local layer.
+    //
+    // XID assignment is the sharp one: it is the only family here that also
+    // survives layer 3. Measured under the read-only role: three
+    // `txid_current()` calls advanced the cluster's xmax by three, while three
+    // plain SELECTs advanced it by none. A read-only tool that burns global
+    // transaction ids moves the cluster towards wraparound — the nextval class,
+    // one scope wider. (The `*_if_assigned` variants only report, and stay
+    // allowed.)
+    "txid_current",
+    "pg_current_xact_id",
+    // Cluster-level WAL and backup state. None of it is a read, none of it is
+    // undone by ROLLBACK: a restore point and a WAL switch are written, and
+    // pg_backup_start leaves the cluster IN backup mode until someone stops it.
+    "pg_create_restore_point",
+    "pg_switch_wal",
+    "pg_switch_xlog", // pre-10 spelling, still reachable on old servers
+    "pg_rotate_logfile",
+    "pg_backup_start",
+    "pg_backup_stop",
+    "pg_start_backup", // pre-15 spelling
+    "pg_stop_backup",
+    // Replication slots are durable objects that PIN WAL: an agent that
+    // creates one can fill the server's disk without writing a single row, and
+    // one that drops (or advances) another one breaks a live replica. The
+    // `get_changes` pair CONSUMES from the slot, which advances it durably;
+    // `peek_changes` does not and stays allowed.
+    "pg_create_physical_replication_slot",
+    "pg_create_logical_replication_slot",
+    "pg_copy_physical_replication_slot",
+    "pg_copy_logical_replication_slot",
+    "pg_drop_replication_slot",
+    "pg_replication_slot_advance",
+    "pg_logical_slot_get_changes",
+    "pg_logical_slot_get_binary_changes",
+    // Replication origins: same story, durable catalog objects plus session
+    // state. The `*_progress` readers are not here.
+    "pg_replication_origin_create",
+    "pg_replication_origin_drop",
+    "pg_replication_origin_advance",
+    "pg_replication_origin_session_setup",
+    "pg_replication_origin_session_reset",
+    "pg_replication_origin_xact_setup",
+    "pg_replication_origin_xact_reset",
+    // Statistics resets are irreversible for everyone using the server, and
+    // the extension's own reset is spelled differently enough to need naming
+    // (the rest are covered by the pg_stat_reset prefix below).
+    "pg_stat_statements_reset",
+    // Creates catalog objects (collations) — DDL wearing a function's clothes.
+    "pg_import_system_collations",
+    // Index maintenance: these WRITE to the index, and measured, they do it
+    // right through `BEGIN READ ONLY`. Only index ownership stops them.
+    "brin_summarize_new_values",
+    "brin_summarize_range",
+    "brin_desummarize_range",
+    "gin_clean_pending_list",
+    // NOTIFY through a function call. The statement form is refused already;
+    // this one delivers the same message to every listener once the read-only
+    // transaction commits, and a read has no business sending one.
+    "pg_notify",
+    // `SET` wearing a function's clothes: the statement form is refused as
+    // TXN_CONTROL, so the wrapper cannot stay allowed. Measured: under the
+    // read-only role it sets statement_timeout to 0 for the session. That does
+    // NOT rescue the running query (the timer is already armed — measured too),
+    // so today it only survives as long as the process; with the planned
+    // connection daemon the session outlives the call and it becomes a real
+    // way to disarm the timeout nyet configured.
+    "set_config",
     "lo_import", // reads a server file into a large object
     "lo_export", // writes a large object to a server file
     // Advisory-lock family (all 11 pg_catalog names). Taking a lock is not a
@@ -579,7 +653,11 @@ const POSTGRES_DENIED_FUNCTIONS: &[&str] = &[
 /// - `dblink*` — outbound connections / remote SQL (extension).
 /// - `pg_read_*` — pg_read_file, pg_read_binary_file: arbitrary server-file read.
 /// - `pg_ls_*` — pg_ls_dir, pg_ls_logdir, pg_ls_waldir, ...: server-dir listing.
-const POSTGRES_DENIED_PREFIXES: &[&str] = &["dblink", "pg_read_", "pg_ls_"];
+/// - `pg_stat_reset*` — every member throws away statistics for everyone on
+///   the server, irreversibly, and not one of them is a read (W7, measured:
+///   they all run inside `BEGIN READ ONLY`). Unlike the rest of `pg_stat_*`,
+///   which is pure introspection, the reset half has no legitimate agent use.
+const POSTGRES_DENIED_PREFIXES: &[&str] = &["dblink", "pg_read_", "pg_ls_", "pg_stat_reset"];
 
 /// Built-in MySQL/MariaDB denylist (rationale in docs/DEV.md): functions that
 /// act OUTSIDE the read-only transaction (filesystem, connection-tie-up DoS,

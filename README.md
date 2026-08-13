@@ -1903,6 +1903,36 @@ lists (per engine; rationale in [docs/DEV.md](docs/DEV.md)):
   the enumerated names (including `pg_sleep`, the `*_to_xml` and the advisory
   family) are.
 
+  An audit in August 2026 added the families below. Each was measured inside
+  `BEGIN READ ONLY` on a live server — the same test `nextval`/`setval` earn
+  their place with — and each one ran:
+
+  - **`txid_current` / `pg_current_xact_id`** — assign a cluster-global
+    transaction id. Measured: three calls advanced the cluster's `xmax` by
+    three, three plain `SELECT`s by none. This is the only family here that a
+    read-only *role* does not stop either. (`*_if_assigned` only reports, and
+    stays allowed.)
+  - **WAL and backup state** — `pg_create_restore_point`, `pg_switch_wal`
+    (`pg_switch_xlog`), `pg_rotate_logfile`, `pg_backup_start`/`pg_backup_stop`
+    (`pg_start_backup`/`pg_stop_backup`): written, not undone by `ROLLBACK`, and
+    `pg_backup_start` leaves the cluster *in backup mode* until someone stops it.
+  - **Replication slots and origins** — a slot created through a "read" pins WAL
+    and can fill the server's disk without writing a row; dropping or advancing
+    one breaks a live replica. `pg_logical_slot_get_changes` consumes from the
+    slot (a durable advance); `..._peek_changes` does not and stays allowed.
+  - **`pg_stat_reset*`** (prefix) and `pg_stat_statements_reset` — throw away
+    statistics for everyone on the server, irreversibly. The rest of
+    `pg_stat_*` is introspection and stays allowed.
+  - **Index maintenance** — `brin_summarize_new_values`,
+    `brin_desummarize_range`, `gin_clean_pending_list`: they write to the index
+    through a read-only transaction.
+  - **`pg_import_system_collations`** (creates catalog objects), **`pg_notify`**
+    (delivers a message to every listener once the read-only transaction
+    commits) and **`set_config`** — the last one is `SET` wearing a function's
+    clothes, and the statement form is already refused as `TXN_CONTROL`.
+    Measured: it sets `statement_timeout = 0` for the session, but does **not**
+    rescue the running query (the timer is already armed).
+
 Matching is case-insensitive and is done on the **terminal** name component, so
 qualified targets (`pg_catalog.pg_sleep`, `main.load_extension`) and table-valued
 calls (`SELECT * FROM dblink(...)`) are caught, but a column or table merely
