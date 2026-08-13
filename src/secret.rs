@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 /// Both halves of the Keychain item name. The service is constant so every
 /// item nyet owns is greppable in Keychain Access; the account is the name
 /// written in the config (`password = { keychain = "prod-db" }`).
+// Scoped to the platform that has a keychain: everywhere else this would be
+// dead code, and CI treats a clippy warning as an error.
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "nyet";
 
 /// How long a `{ command = ... }` may take. Long enough for a biometric

@@ -1262,21 +1262,43 @@ mod tests {
         assert!(!is_private_dir(&tmp), "a missing dir is not private");
     }
 
+    /// "Released, therefore still free" is inherently racy — it is the very
+    /// TOCTOU the real forward lives with (see `free_local_port`). Inside one
+    /// test binary the race is not hypothetical: every test that binds port 0
+    /// competes for the same ephemeral range and the kernel hands them out in
+    /// order, so a port released here is a prime candidate for the next
+    /// bind(0). Retrying keeps the assertion honest — a genuinely broken probe
+    /// fails every attempt, a lost race does not fail the build.
+    fn eventually(what: &str, mut attempt: impl FnMut() -> bool) {
+        for _ in 0..20 {
+            if attempt() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("{what}: failed 20 times running — a real failure, not a lost race");
+    }
+
     #[test]
     fn port_is_free_detects_a_listener() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        // Occupied while the listener lives, free once it is dropped: this is
-        // the "is the forward still there" probe, and it sends nothing.
-        assert!(!port_is_free(port));
-        drop(listener);
-        assert!(port_is_free(port));
+        eventually("a released port reads as free", || {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            // Occupied while the listener lives, free once it is dropped: this
+            // is the "is the forward still there" probe, and it sends nothing.
+            // The occupied half cannot race, so it stays a hard assertion.
+            assert!(!port_is_free(port), "a live listener must read as occupied");
+            drop(listener);
+            port_is_free(port)
+        });
     }
 
     #[test]
     fn free_local_port_returns_a_usable_port() {
-        let port = free_local_port().unwrap();
-        assert_ne!(port, 0);
-        TcpListener::bind(("127.0.0.1", port)).expect("port should be free after release");
+        eventually("the reserved port is bindable afterwards", || {
+            let port = free_local_port().unwrap();
+            assert_ne!(port, 0);
+            TcpListener::bind(("127.0.0.1", port)).is_ok()
+        });
     }
 }
