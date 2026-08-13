@@ -443,9 +443,39 @@ read-only), `pg_import_system_collations`, `pg_notify` и `set_config` (это `
 станет реальным вектором, когда появится connection daemon (v0.5): сессия
 переживёт вызов.
 
-Осталось в W7: MySQL/MariaDB и SQLite тем же методом, расхождения парсера
-(вложенные комментарии, dollar-quoting, омоглифы, `;` в литерале),
-многооператорность, провенанс PII через UNION/оконные функции, аудит и туннель.
+**Второй проход (август 2026): MySQL/MariaDB и SQLite.** На `mysql:8.4`
+замерено: `asynchronous_connection_failover_add_source(...)` выполняется внутри
+`START TRANSACTION READ ONLY` и оставляет строку в
+`mysql.replication_asynchronous_connection_failover` — durable запись в
+системную таблицу из «чтения»; останавливают только права
+(SUPER/REPLICATION_SLAVE_ADMIN). Закрыто вместе с семейством failover, а по
+классу (плагин в стоковом сервере не загружен, замерить нельзя — помечено в
+коде честно) — `group_replication_*` (переключение primary!), `keyring_*`
+(хранит и ОТДАЁТ ключи), `version_tokens_*`, `flush_rewrite_rules`,
+`audit_api_message_emit_udf`, `service_*_locks`, `masking_dictionary_*`.
+
+**Находка на SQLite, которую денилист не лечит:** движок встроен в процесс, а
+guardrail'а на SQLite нет (сервер не публикует оценок), поэтому запрос ест
+память самого `nyet`. Замерено: `randomblob(1e9)` → 994 МБ, а рекурсивный CTE с
+удвоением строки → **4.35 ГБ за 4 секунды**, вообще без «опасных» функций.
+Денить `randomblob`/`zeroblob` бессмысленно — CTE-форма и проще, и мощнее.
+Собственные лимиты SQLite тоже не помогают: `hard_heap_limit` в этой сборке не
+скомпилирован (читается как 0), `soft_heap_limit` ограничивает кэш страниц, а
+не строки (при 256 МБ тот же запрос дал 4.13 ГБ). Записано в SECURITY.md как
+принятое ограничение с рецептом снаружи (ulimit/cgroup/контейнер).
+
+Проверено и НЕ подтвердилось: MariaDB сама отбивает `NEXTVAL`/`SETVAL` внутри
+READ ONLY («Cannot execute statement in a READ ONLY transaction») — в отличие от
+PostgreSQL, где именно поэтому `nextval` в денилисте; оптимизаторные хинты
+(`/*+ MAX_EXECUTION_TIME(...) */`, попытка поднять серверный лимит времени) и
+executable-комментарии `/*! */` отбиваются как EXECUTABLE_COMMENT; `INTO
+OUTFILE`/`DUMPFILE`, `DO`, `HANDLER`, `LOCK IN SHARE MODE` не парсятся →
+fail-closed; в SQLite `sqlite_dbpage`, `sqlite_dbstat`, `sqlite_stmt` и `fsdir`
+в сборку sqlx не включены и недостижимы (денить нечего).
+
+Осталось в W7: расхождения парсера с сервером (вложенные комментарии,
+dollar-quoting, омоглифы, `;` в литерале), многооператорность, провенанс PII
+через UNION/оконные функции, аудит и туннель.
 
 ### W8 — Redis
 

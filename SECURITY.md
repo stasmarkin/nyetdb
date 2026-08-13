@@ -96,6 +96,25 @@ file it privately as above.
   view that `$unset`s the protected fields with a role scoped to it, and `nyet
   doctor` says so.
 
+- **On SQLite a query can exhaust the machine's memory, and nothing in `nyet`
+  stops it.** SQLite is *in-process*, so the allocation happens inside `nyet`
+  itself rather than on a server someone else operates — and SQLite publishes
+  no plan estimate, so this is the one engine with no guardrail to refuse an
+  expensive query. Measured (August 2026): `SELECT length(randomblob(1e9))`
+  reached 994 MB RSS in 6.9 s, and a recursive CTE that doubles a string —
+  `WITH RECURSIVE c(x) AS (SELECT 'aaaaaaaa' UNION ALL SELECT x||x FROM c WHERE
+  length(x) < 4e8) SELECT max(length(x)) FROM c` — reached **4.35 GB in 4 s**
+  using nothing but ordinary SQL. `row_limit` does not help (it is one row) and
+  the default timeout is far too generous to matter. Denylisting `randomblob` /
+  `zeroblob` would be theatre: the CTE form is both cheaper to write and
+  bigger. SQLite's own heap limits were tried and do not close it either —
+  `PRAGMA hard_heap_limit` is not compiled into this build (it reads back 0) and
+  `soft_heap_limit` bounds the page cache, not string and blob allocations (set
+  to 256 MB, the same query still reached 4.13 GB). The honest containment is
+  outside `nyet`: run the agent under a memory limit (`ulimit -v`, a cgroup, a
+  container). Server engines do not share this: there the memory is the
+  database server's problem, and the guardrail refuses the plan first.
+
 - **A read that causes a side effect is only as complete as the denylist.** A
   `SELECT` can call a function that writes or reaches outside the database
   (`setval`, `lo_export`, `pg_read_file`, `dblink`, `query_to_xml`, a volatile

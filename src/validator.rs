@@ -683,6 +683,63 @@ const MYSQL_DENIED_FUNCTIONS: &[&str] = &[
     "master_gtid_wait", // MariaDB: blocks until a GTID position is reached
     "wait_for_executed_gtid_set",
     "wait_until_sql_thread_after_gtids",
+    // --- W7 audit, August 2026 ---------------------------------------------
+    // Replication-topology UDFs that ship with the server. MEASURED on
+    // mysql:8.4: `asynchronous_connection_failover_add_source(...)` ran inside
+    // `START TRANSACTION READ ONLY` and left a row behind in
+    // `mysql.replication_asynchronous_connection_failover` — a durable catalog
+    // write through a read-only tool, the class layer 2 cannot see. A
+    // privileged role is what stops it (SUPER / REPLICATION_SLAVE_ADMIN), and
+    // layer 3 is a recommendation nyet can only nag about.
+    "asynchronous_connection_failover_add_source",
+    "asynchronous_connection_failover_delete_source",
+    "asynchronous_connection_failover_add_managed",
+    "asynchronous_connection_failover_delete_managed",
+    "asynchronous_connection_failover_reset",
+    // The rest of this block could NOT be measured here: each needs a plugin
+    // or component that mysql:8.4 does not load by default, so the call fails
+    // with "FUNCTION does not exist" rather than proving anything. They are
+    // denied on class, which is what fail-closed means — where the plugin IS
+    // installed, none of them is a read and none writes through a table, so
+    // the read-only transaction would not stop them either.
+    //
+    // Group Replication: these change cluster TOPOLOGY — electing a primary or
+    // switching the mode, from something that calls itself a read.
+    "group_replication_set_as_primary",
+    "group_replication_switch_to_single_primary_mode",
+    "group_replication_switch_to_multi_primary_mode",
+    "group_replication_set_write_concurrency",
+    "group_replication_disable_member_action",
+    "group_replication_enable_member_action",
+    "group_replication_reset_member_actions",
+    // Keyring: stores, generates and removes encryption keys — and the fetch
+    // half hands the key material itself to the caller.
+    "keyring_key_store",
+    "keyring_key_remove",
+    "keyring_key_generate",
+    "keyring_key_fetch",
+    "keyring_key_type_fetch",
+    "keyring_key_length_fetch",
+    // Version tokens: server-wide state, plus two blocking lock calls.
+    "version_tokens_set",
+    "version_tokens_edit",
+    "version_tokens_delete",
+    "version_tokens_lock_shared",
+    "version_tokens_lock_exclusive",
+    // Rewriter plugin: reloads the statement-rewrite rules for everyone.
+    "flush_rewrite_rules",
+    // Writes an entry into the server's audit log — a read-only tool has no
+    // business forging audit records.
+    "audit_api_message_emit_udf",
+    // Locking service UDFs: the GET_LOCK class under a different name.
+    "service_get_read_locks",
+    "service_get_write_locks",
+    "service_release_locks",
+    // Data-masking dictionaries: server-wide state that decides what other
+    // sessions see masked.
+    "masking_dictionary_term_add",
+    "masking_dictionary_term_remove",
+    "masking_dictionary_remove",
 ];
 
 impl Policy {

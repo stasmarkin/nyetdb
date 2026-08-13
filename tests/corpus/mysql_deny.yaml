@@ -209,3 +209,61 @@
 - query: SELECT * FROM
   verdict: deny
   reason: PARSE_FAILED
+
+# --- W7 audit (August 2026): replication/plugin UDFs that act outside the
+# read-only transaction. `asynchronous_connection_failover_add_source` was
+# MEASURED on mysql:8.4 running inside `START TRANSACTION READ ONLY`, leaving a
+# row in mysql.replication_asynchronous_connection_failover. The rest need a
+# plugin the stock server does not load, so they are denied on class.
+- query: SELECT asynchronous_connection_failover_add_source('c','h',3306,'n',80)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT asynchronous_connection_failover_delete_source('c','h',3306,'n')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT group_replication_set_as_primary('uuid')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT group_replication_switch_to_multi_primary_mode()
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT keyring_key_store('k','AES','secret')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT keyring_key_fetch('k')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT version_tokens_set('t=1')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT flush_rewrite_rules()
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT audit_api_message_emit_udf('c','s','m')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT service_get_write_locks('ns','l',100)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT masking_dictionary_term_add('d','t')
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# Optimizer hints and executable comments are refused as EXECUTABLE_COMMENT —
+# checked here because a hint is exactly how one would raise the server-side
+# time cap nyet sets (`MAX_EXECUTION_TIME`), and `/*! */` is how MySQL runs
+# text other parsers skip.
+- query: SELECT /*+ MAX_EXECUTION_TIME(600000) */ * FROM t
+  verdict: deny
+  reason: EXECUTABLE_COMMENT
+- query: SELECT 1 /*!50000 , SLEEP(5) */
+  verdict: deny
+  reason: EXECUTABLE_COMMENT
+
+# The reading halves stay allowed: an agent still needs ordinary session
+# introspection, and a denylist that swallows it invites allow_functions.
+- query: SELECT UUID_SHORT()
+  verdict: allow
+- query: SELECT IS_FREE_LOCK('l')
+  verdict: allow
+
