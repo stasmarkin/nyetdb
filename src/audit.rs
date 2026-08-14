@@ -141,6 +141,20 @@ pub fn append(path: &Path, log_line: &str) -> std::io::Result<()> {
         opts.mode(0o600);
     }
     let mut file = opts.open(path)?;
+    // The trail has to be an actual file. A path aimed at /dev/null — directly
+    // or through a symlink dropped in place — accepts every line, keeps none,
+    // and lets the query answer normally: an audit log silently turned off,
+    // which is the exact opposite of the fail-closed promise (UX-8). Refusing
+    // here withholds the result instead, exactly as an unwritable log does.
+    // Checked on the OPEN handle, so swapping the path afterwards cannot fool
+    // the check.
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the audit log path is not a regular file — a device, fifo or socket \
+             accepts writes without keeping them",
+        ));
+    }
     // Blocks until the lock is free; released on unlock (and on drop as a
     // backstop). All nyet writers take it, so it fully serializes appends.
     file.lock()?;
@@ -349,6 +363,31 @@ mod tests {
             ..base()
         };
         assert!(line(&event).contains(r#""response":{"tables":[{"name":"users"}]}"#));
+    }
+
+    /// W7: a trail that goes to /dev/null is worse than no trail — the query
+    /// answers, the log stays empty, and nothing says so. Fail closed instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_sink_that_keeps_nothing_is_refused_rather_than_written_to() {
+        let err = append(Path::new("/dev/null"), "line").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+
+        // ...and the same through a symlink, which is how it would actually
+        // arrive: an agent replacing the configured path.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("audit.jsonl");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        let err = append(&link, "line").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+
+        // A symlink to a REAL file still works: the rule is about what the
+        // path keeps, not about symlinks being suspicious.
+        let real = dir.path().join("real.jsonl");
+        let link2 = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&real, &link2).unwrap();
+        append(&link2, "kept").unwrap();
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "kept\n");
     }
 
     #[test]

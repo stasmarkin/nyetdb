@@ -151,7 +151,15 @@ file it privately as above.
   to parse rather than being folded, and a zero-width character is stripped by
   normalization, with the *normalized* text being what actually runs.
 
-- **The audit log and SSH tunnel have agent-reachable edges.** The default audit
+- **The audit log and SSH tunnel have agent-reachable edges.** A trail that
+  cannot be written is refused (the query's result is withheld, exit 1), and
+  since August 2026 a path that *accepts writes without keeping them* —
+  `/dev/null`, a device, a fifo, reached directly or through a symlink an agent
+  dropped in place — is refused the same way rather than silently swallowing
+  the record. The forward registry is worth the same caution as the audit path:
+  it lives under the user's own runtime dir, so it proves ownership against
+  accident, not against a process of this uid that sets out to forge an entry.
+  The default audit
   path resolves from agent-controlled `XDG_DATA_HOME`/`HOME`, so an
   agent-resistant trail needs an explicit literal `[audit] path` plus the
   read-only role — and even then the log file's own path, permissions and
