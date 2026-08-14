@@ -194,11 +194,16 @@ name the stand depends on. Things worth knowing:
   flips it to `yes` and reloads sshd (`pkill -HUP sshd.pam` via `container.exec`,
   not `kill -HUP $(pgrep ...)` — a drifted process name then just no-ops instead
   of hard-failing). As reloading the config is not instant, the test **gates on a
-  fresh throwaway `-L` forward actually reaching Postgres** (a Postgres
-  `SSLRequest` gets a byte back) before the real `nyet` run, and additionally
-  retries the `nyet` pass with backoff — so the config-reload window cannot flake
-  CI. Gating on forwarding *before* nyet's first run also avoids nyet creating a
-  persistent `ControlMaster` under the old (forwarding-denied) policy.
+  fresh throwaway `-L` forward actually reaching the server** (`wait_for_forwarding`
+  + the engine's own one-byte probe: a Postgres `SSLRequest`, ClickHouse's
+  `GET /ping`, an inline Redis `PING`) before the real `nyet` run, and
+  additionally retries the `nyet` pass with backoff — so the config-reload window
+  cannot flake CI. The probe has to be the engine's, not a bare connect: a
+  forward the bastion refuses still looks like an open port locally (the ssh
+  client binds it and only then fails the channel), so only a byte from the real
+  server settles it. Gating on forwarding *before* nyet's first run also avoids
+  nyet creating a persistent `ControlMaster` under the old (forwarding-denied)
+  policy.
 - The stand sets a short `XDG_RUNTIME_DIR` so the run happens in **master
   mode**; without it the deep temp `HOME` pushes the `ControlPath` past the
   unix-socket limit (`control_path_too_long`) and the whole master path is
@@ -209,6 +214,32 @@ name the stand depends on. Things worth knowing:
   outside, a killed master rebuilt, and `reuse_forward = false` leaving nothing
   behind. Standalone mode (child-owned forward, killed on drop) is now only
   exercised by unit tests (`ssh_args` with `ControlPath=none`).
+
+`ssh_tunnel_reaches_clickhouse_and_redis` shares that stand (one bastion, one
+network, both databases) for the two engines that do **not** reach their server
+through sqlx: ClickHouse rewrites the url by hand in `Clickhouse::endpoint`, and
+Redis through `url::Url::set_host`/`set_port` in `Redis::dialed_url`. Both arms
+were exhaustively matched in `Db::set_host_override` — the match cannot forget an
+engine — and neither had ever been *executed*. Each case reads one row through
+the forward and asserts the password reaches neither stdout, stderr nor the ssh
+child's environment. The url in each config names a **placeholder host**, so a
+rewrite that failed to apply cannot fall back to something real: deleting either
+arm of `set_host_override` fails this test with `CONNECTION_FAILED` (verified by
+doing it).
+
+**TLS survives the tunnel rewrite in both, and that is now measured rather than
+asserted in a comment.** PostgreSQL and MySQL have to *rewrite* their `sslmode`
+for the loopback leg (`verify-full` → `verify-ca`: the hostname check cannot pass
+against 127.0.0.1). ClickHouse and Redis decide TLS from the url **scheme**
+(`https://`, `rediss://`), which the rewrite does not touch — so there is nothing
+to downgrade, and the claim that this is "one fewer thing to get subtly wrong"
+holds. The proof is two unit tests next to the engines
+(`host_override_swaps_host_port_and_keeps_the_tls_decision`,
+`the_dialed_url_swaps_host_port_and_keeps_user_password_db_and_tls`), which also
+pin what else rides along: user, password, database/db-number, and that a url
+with no explicit port does not leak the scheme's default (8443) into the local
+forward's port. A CA inside the container stand would measure the same fact for
+an order of magnitude more setup.
 
 `ssh_tunnel_failure_is_exit_6` needs no Docker: it points `host` at a closed
 local port and asserts the `CONNECTION_FAILED` (exit 6) envelope. The pure ssh

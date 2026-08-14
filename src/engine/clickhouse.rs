@@ -1174,3 +1174,66 @@ impl Clickhouse {
         Some(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine(url: &str, host_override: Option<(String, u16)>) -> Clickhouse {
+        Clickhouse {
+            url: url.to_string(),
+            password: None,
+            statement_timeout_ms: 5_000,
+            query_timeout_ms: 5_000,
+            host_override,
+            connect_timeout_ms: None,
+        }
+    }
+
+    /// The tunnel's local end replaces host and port and NOTHING else — and the
+    /// half worth pinning is **TLS**, which this engine decides from the scheme
+    /// rather than from a parameter. PostgreSQL and MySQL both have to rewrite
+    /// their `sslmode` for the loopback leg (the hostname check cannot pass
+    /// against 127.0.0.1); here there is nothing to rewrite, so an `https://`
+    /// url must still be TLS after the override. That claim was written down as
+    /// "one fewer thing to get subtly wrong" and never measured — this is the
+    /// measurement, and a future rebuild of the url that reassembled the scheme
+    /// from the (now plaintext) tunnel hop would fail here.
+    #[test]
+    fn host_override_swaps_host_port_and_keeps_the_tls_decision() {
+        let tunnel = Some(("127.0.0.1".to_string(), 61234));
+        let e = engine("https://ro:pw@ch.internal:9440/analytics", tunnel.clone());
+        let ep = e.endpoint().unwrap();
+        assert!(
+            ep.tls,
+            "the tunnel must not downgrade https:// to plaintext"
+        );
+        assert_eq!(ep.authority, "127.0.0.1:61234");
+        assert_eq!(ep.user, "ro");
+        assert_eq!(ep.password.as_deref(), Some("pw"));
+        assert_eq!(ep.database, "analytics");
+
+        // ...and it does not UPGRADE the other way either: http stays http.
+        let ep = engine("http://ro@ch.internal:8123/analytics", tunnel.clone())
+            .endpoint()
+            .unwrap();
+        assert!(!ep.tls);
+        assert_eq!(ep.authority, "127.0.0.1:61234");
+
+        // A url with no port at all: the scheme's default is what the DIRECT
+        // leg uses, and the override replaces it wholesale rather than mixing
+        // the two (8443 must not survive as the port of the local forward).
+        let ep = engine("https://ch.internal/analytics", tunnel)
+            .endpoint()
+            .unwrap();
+        assert_eq!(ep.authority, "127.0.0.1:61234");
+        assert_eq!(ep.user, "default");
+
+        // None -> unchanged, defaults included.
+        let ep = engine("https://ch.internal/analytics", None)
+            .endpoint()
+            .unwrap();
+        assert_eq!(ep.authority, "ch.internal:8443");
+        assert!(ep.tls);
+    }
+}

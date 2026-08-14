@@ -818,6 +818,46 @@ mod tests {
         assert_eq!(rows[0][0], serde_json::json!(["1-0", ["f", "v"]]));
     }
 
+    /// The tunnel's local end replaces host and port and nothing else: the
+    /// user, the password, the database number and the `rediss://` scheme —
+    /// which is this engine's whole TLS decision — ride along. `set_host` /
+    /// `set_port` are what make that true, and they are only true for a url the
+    /// crate parses as having an authority; a `redis://` one does.
+    #[test]
+    fn the_dialed_url_swaps_host_port_and_keeps_user_password_db_and_tls() {
+        let engine = |url: &str, host_override| Redis {
+            url: url.to_string(),
+            password: None,
+            query_timeout_ms: 5_000,
+            host_override,
+            connect_timeout_ms: None,
+            denied: BTreeSet::new(),
+            allowed: BTreeSet::new(),
+        };
+        let tunnel = Some(("127.0.0.1".to_string(), 61234));
+        assert_eq!(
+            engine("rediss://ro:pw@redis.internal:6380/3", tunnel.clone())
+                .dialed_url()
+                .unwrap(),
+            "rediss://ro:pw@127.0.0.1:61234/3"
+        );
+        // No port and no database in the url: the override still only touches
+        // the authority, and adds nothing the url did not say.
+        assert_eq!(
+            engine("redis://redis.internal", tunnel)
+                .dialed_url()
+                .unwrap(),
+            "redis://127.0.0.1:61234"
+        );
+        // None -> the url is dialed verbatim.
+        assert_eq!(
+            engine("rediss://ro@redis.internal:6380/3", None)
+                .dialed_url()
+                .unwrap(),
+            "rediss://ro@redis.internal:6380/3"
+        );
+    }
+
     #[test]
     fn acl_rules_decide_layer_three_and_an_unreadable_rule_is_not_a_pass() {
         assert!(matches!(
