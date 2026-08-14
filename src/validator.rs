@@ -1045,6 +1045,22 @@ pub(crate) const INTERNAL_ERROR_HINT: &str =
      closed) — please report it with the statement that triggered it";
 
 /// Classify one query under the engine's policy (which carries the dialect).
+/// How deep an expression may nest. Chosen for the cost of REFUSING, not for
+/// the depth itself: see `parse_bounded`.
+const NESTING_LIMIT: usize = 20;
+
+/// Parse with an explicit recursion cap, so a deeply nested expression is a
+/// prompt parse error instead of an unbounded stall.
+fn parse_bounded<D: sqlparser::dialect::Dialect>(
+    dialect: &D,
+    sql: &str,
+) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
+    Parser::new(dialect)
+        .with_recursion_limit(NESTING_LIMIT)
+        .try_with_sql(sql)?
+        .parse_statements()
+}
+
 pub fn validate(sql: &str, policy: &Policy) -> Verdict {
     catching_panics(|| classify(sql, policy)).unwrap_or_else(|detail| internal_error_deny(&detail))
 }
@@ -1090,13 +1106,36 @@ fn classify(sql: &str, policy: &Policy) -> Verdict {
              statement as plain SQL so nyet can see everything it will execute",
         );
     }
+    // Nesting depth is capped WELL below sqlparser's default of 50, because the
+    // cost of hitting the cap is exponential IN THE CAP, not in the query
+    // (measured on sqlparser 0.62 with `SELECT cast(cast(...)) as text)`:
+    // limit 18 -> 0.15 s, 20 -> 0.56 s, 22 -> 2.2 s, 24 -> 8.7 s, and the
+    // default 50 never finished). A ~700-byte query would otherwise hang the
+    // validator forever — before any database is involved, so no statement
+    // timeout applies. Exceeding the cap is an ordinary parse error, which
+    // fails closed like every other one.
     let parsed = match policy.dialect {
-        Dialect::Sqlite => Parser::parse_sql(&SQLiteDialect {}, &sql),
-        Dialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, &sql),
-        Dialect::Mysql => Parser::parse_sql(&MySqlDialect {}, &sql),
+        Dialect::Sqlite => parse_bounded(&SQLiteDialect {}, &sql),
+        Dialect::Postgres => parse_bounded(&PostgreSqlDialect {}, &sql),
+        Dialect::Mysql => parse_bounded(&MySqlDialect {}, &sql),
     };
     let statements = match parsed {
         Ok(s) => s,
+        // The parser error names the offending token — it comes from the
+        // caller's own query, so echoing it back is safe and actionable.
+        // Hitting the nesting cap is not a syntax error, and telling an agent
+        // to "fix the syntax" would send it rewriting a perfectly valid query.
+        Err(e) if e.to_string().contains("recursion limit") => {
+            return deny(
+                DenyReason::ParseFailed,
+                format!(
+                    "the query nests expressions more than {NESTING_LIMIT} levels deep, \
+                     which nyet refuses to parse"
+                ),
+                "the SQL is not wrong, just too deeply nested: flatten it — lift inner \
+                 subqueries into a WITH, or split the work across two queries",
+            )
+        }
         // The parser error names the offending token — it comes from the
         // caller's own query, so echoing it back is safe and actionable.
         Err(e) => {
@@ -2541,6 +2580,55 @@ mod tests {
             }
         }
         cases
+    }
+
+    /// W7 (found by the fuzzer): sqlparser's cost of REFUSING a too-deep
+    /// expression is exponential in the recursion limit, not in the query —
+    /// measured on 0.62: limit 18 -> 0.15 s, 20 -> 0.56 s, 22 -> 2.2 s,
+    /// 24 -> 8.7 s, and the default 50 never finished. So ~700 bytes of
+    /// `cast(cast(...))` hung the validator forever, before any database was
+    /// involved and therefore beyond the reach of every timeout nyet sets.
+    /// The cap keeps the refusal prompt; this test keeps the cap honest.
+    #[test]
+    fn a_deeply_nested_expression_is_refused_promptly_not_chewed_on() {
+        let sql = format!("SELECT {}1{}", "cast(".repeat(500), " as text)".repeat(500));
+        let started = std::time::Instant::now();
+        let verdict = validate(&sql, &Policy::sqlite(&[], &[]));
+        let elapsed = started.elapsed();
+        match verdict {
+            Verdict::Deny { reason, hint, .. } => {
+                assert_eq!(reason, DenyReason::ParseFailed);
+                // Not "fix your syntax": the SQL is valid, just too deep.
+                assert!(hint.contains("too deeply nested"), "{hint}");
+            }
+            Verdict::Allow { .. } => panic!("a 500-deep expression must not be allowed"),
+        }
+        // Generous enough for a debug build under a loaded CI box, and still
+        // orders of magnitude below the unbounded behaviour it guards against.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "refusing took {elapsed:?} — the nesting cap is not holding"
+        );
+    }
+
+    /// The flip side: the cap must not refuse SQL people actually write.
+    #[test]
+    fn ordinary_nesting_stays_under_the_cap() {
+        for sql in [
+            "SELECT (SELECT (SELECT (SELECT (SELECT 1))))",
+            "SELECT CASE WHEN 1=1 THEN CASE WHEN 2=2 THEN CASE WHEN 3=3 THEN 'x' END END END",
+            "SELECT coalesce(coalesce(coalesce(coalesce(1,2),3),4),5)",
+            "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE id IN (SELECT 1))",
+            "WITH a AS (SELECT 1), b AS (SELECT * FROM a) SELECT * FROM b",
+        ] {
+            assert!(
+                matches!(
+                    validate(sql, &Policy::sqlite(&[], &[])),
+                    Verdict::Allow { .. }
+                ),
+                "must stay allowed: {sql}"
+            );
+        }
     }
 
     #[test]

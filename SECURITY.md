@@ -127,6 +127,16 @@ file it privately as above.
   escape syntax, Unicode homoglyphs, identifier folding, a `;` inside a literal,
   multi-statement smuggling, a `SET`/`RESET` the validator did not recognise as
   transaction control) is the root class of validator bypasses.
+  Fuzzing found one thing worth naming here, in August 2026: the SQL parser
+  could be made to stall indefinitely by an expression nested a few dozen levels
+  deep (~700 bytes). That is a denial of service on `nyet` itself, reached
+  *before* any database is involved, so none of the query timeouts applied. It
+  is fixed by capping nesting depth well below the parser's own default — the
+  cost of refusing is exponential in that cap, not in the query — and an
+  over-deep query is now a prompt `PARSE_FAILED` that says the SQL is too deeply
+  nested rather than blaming its syntax. Ordinary nesting (chained CTEs, several
+  levels of subquery, nested CASE) is unaffected.
+
   Differential testing against a live read-only server and fuzzing are built
   **specifically** to hunt this down — but there is no 100% guarantee, which is
   why layer 3 (the read-only database role) matters.

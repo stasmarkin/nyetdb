@@ -410,3 +410,11 @@
   verdict: deny
   reason: PARSE_FAILED
 
+# --- W7 (found by the fuzzer): a too-deep expression is refused, and refused
+# PROMPTLY. sqlparser's cost of hitting its recursion cap is exponential in the
+# cap itself, so the default 50 turned ~700 bytes of nesting into an unbounded
+# stall — before any database, and so past every timeout nyet sets.
+- query: SELECT cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(cast(1 as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text) as text)
+  verdict: deny
+  reason: PARSE_FAILED
+
