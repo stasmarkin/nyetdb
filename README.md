@@ -662,7 +662,13 @@ an honest `na`: there are no roles, so nothing can be hidden below nyet.
   PostgreSQL and MySQL/MariaDB the driver reports a view column's origin as *the
   view*, not the base table. So a view over a protected table is **not** covered
   by a rule on that table — list the view's own columns too
-  (`columns = ["users.email", "v_users.contact"]`). **This holds for computed
+  (`columns = ["users.email", "v_users.contact"]`). On PostgreSQL you do not
+  have to discover these by accident: `nyet doctor <alias>` has a **`pii_views`**
+  check that walks `pg_depend` and names every view (and materialized view)
+  which reads a protected column *and* which this role may select from —
+  warning with the list, or confirming there are none. It reports what the role
+  can actually reach, so revoking `SELECT` on the view settles it as surely as
+  naming the view in the policy does. **This holds for computed
   columns on every engine, SQLite included**: an expression carries no
   provenance at all, so while SQLite blocks `SELECT contact FROM v_users`, it
   does not block `SELECT contact || '' FROM v_users` or the row-count oracle

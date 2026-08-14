@@ -2530,6 +2530,7 @@ fn diagnose_connection(
         Err(f) => {
             return Ok((
                 output::Diagnosis {
+                    pii_views: None,
                     connect: output::ConnectFact::Failed {
                         message: f.message,
                         hint: f.hint,
@@ -3037,6 +3038,7 @@ mod tests {
     #[test]
     fn redact_diagnosis_hides_probe_detail_but_not_the_connect_reason() {
         let mut d = output::Diagnosis {
+            pii_views: None,
             pii: Vec::new(),
             connect: output::ConnectFact::Failed {
                 message: "password authentication failed for user \"nyet_ro\"".to_string(),
@@ -3053,6 +3055,7 @@ mod tests {
         }
         // The probe DOES run a statement against real data, so its detail goes.
         let mut d = output::Diagnosis {
+            pii_views: None,
             pii: Vec::new(),
             connect: output::ConnectFact::Ok { via_tunnel: false },
             server: Some(output::ServerFacts {

@@ -999,6 +999,13 @@ pub struct Diagnosis {
     /// One entry per configured PII rule; empty when the connection has no
     /// `[pii]` policy (or the engine has no privileges to ask about).
     pub pii: Vec<PiiAccess>,
+    /// Views (and materialized views) that read a protected column and that
+    /// THIS role may select from. A `[pii]` rule is keyed to a relation name,
+    /// so a view over the protected table is a legitimate way around it — the
+    /// policy simply does not apply to a name it was not given. Empty means
+    /// "asked and found none"; `None` means the question was not asked (an
+    /// engine or a server version that cannot answer it).
+    pub pii_views: Option<Vec<String>>,
 }
 
 /// Transport guarantee, computed by the cli from the connection config alone.
@@ -1125,6 +1132,12 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
     .chain(input.forward.as_ref().map(ssh_forward_check))
     .chain(input.pii_mode.map(|mode| pii_columns_check(input, mode)))
     .chain(input.secret.map(secret_source_check))
+    .chain(
+        input
+            .pii_mode
+            .and(input.diagnosis.pii_views.as_ref())
+            .map(|views| pii_views_check(views)),
+    )
     .chain([permissions_check(&input.permissions)])
     .collect()
 }
@@ -1625,6 +1638,30 @@ fn secret_source_check(secret: SecretFact) -> DoctorCheck {
              password = { keychain = \"<item>\" } keeps it out of their reach",
         ),
     }
+}
+
+/// A `[pii]` rule names one relation, so a view over the protected table is not
+/// covered by it — and unlike the oracle channels, this one hands over the
+/// value itself. nyet cannot fix that for the human (widening the policy to
+/// every dependent view would be nyet deciding what their data model means),
+/// but it can refuse to let them find out the hard way.
+fn pii_views_check(views: &[String]) -> DoctorCheck {
+    if views.is_empty() {
+        return ok_check(
+            "pii_views",
+            "no view this role can read exposes a protected column",
+        );
+    }
+    warn_check(
+        "pii_views",
+        format!(
+            "the [pii] policy is keyed to the table it names, so these views over a \
+             protected column are NOT covered and this role can read them: {}",
+            views.join(", ")
+        ),
+        "name each view in [pii] columns as well (\"<view>.<column>\"), or revoke this \
+         role's SELECT on it — a rule on the table does not follow the data into a view",
+    )
 }
 
 fn permissions_check(permissions: &Permissions) -> DoctorCheck {
@@ -2431,6 +2468,7 @@ mod tests {
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
+                pii_views: None,
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
@@ -2481,6 +2519,7 @@ mod tests {
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
+                pii_views: None,
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: true },
                 server: None,
@@ -2547,6 +2586,7 @@ mod tests {
             pii_mode,
             engine,
             diagnosis: Diagnosis {
+                pii_views: None,
                 pii,
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
@@ -2627,6 +2667,7 @@ mod tests {
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
+                pii_views: None,
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
@@ -2669,6 +2710,7 @@ mod tests {
                 pii_mode: None,
                 engine: EngineKind::Postgres,
                 diagnosis: Diagnosis {
+                    pii_views: None,
                     pii: Vec::new(),
                     connect: ConnectFact::Ok { via_tunnel: false },
                     server: Some(ServerFacts {
@@ -2708,6 +2750,7 @@ mod tests {
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
+                pii_views: None,
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
@@ -2744,6 +2787,7 @@ mod tests {
             pii_mode: None,
             engine: EngineKind::Mysql,
             diagnosis: Diagnosis {
+                pii_views: None,
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
@@ -2781,6 +2825,7 @@ mod tests {
             pii_mode: None,
             engine: EngineKind::Sqlite,
             diagnosis: Diagnosis {
+                pii_views: None,
                 pii: Vec::new(),
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: None,
@@ -2807,6 +2852,7 @@ mod tests {
             pii_mode: None,
             engine: EngineKind::Postgres,
             diagnosis: Diagnosis {
+                pii_views: None,
                 pii: Vec::new(),
                 connect: ConnectFact::Failed {
                     message: "cannot connect".into(),
@@ -2914,6 +2960,7 @@ mod tests {
             pii_mode: None,
             engine: EngineKind::Mongo,
             diagnosis: Diagnosis {
+                pii_views: None,
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     js: Some(JsFact::Disabled),
@@ -2995,6 +3042,7 @@ mod tests {
             pii_mode: None,
             engine,
             diagnosis: Diagnosis {
+                pii_views: None,
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     js,
@@ -3046,6 +3094,7 @@ mod tests {
             pii_mode: None,
             engine: EngineKind::Mongo,
             diagnosis: Diagnosis {
+                pii_views: None,
                 connect: ConnectFact::Failed {
                     message: "no server could be selected".into(),
                     hint: "check the host/port".into(),

@@ -1327,6 +1327,9 @@ fn postgres_pii_mask_end_to_end() {
                 // makes the database enforce it too.
                 format!("CREATE ROLE pii_all LOGIN PASSWORD '{PW}'"),
                 "GRANT SELECT ON users TO pii_all".to_string(),
+                // The view over the protected column, readable by this role —
+                // the gap the pii_views check exists to name (W7).
+                "GRANT SELECT ON v_users TO pii_all".to_string(),
                 format!("CREATE ROLE pii_none LOGIN PASSWORD '{PW}'"),
                 "GRANT SELECT (id) ON users TO pii_none".to_string(),
             ] {
@@ -1497,6 +1500,49 @@ fn postgres_pii_mask_end_to_end() {
             check["message"].as_str().unwrap().contains("cannot read"),
             "{check}"
         );
+
+        // W7: a [pii] rule is keyed to the table it names, so a VIEW over the
+        // protected column is a way around it — and one the human is unlikely
+        // to think of. doctor names such views instead of letting them find out
+        // the hard way. The check walks pg_depend rather than
+        // information_schema.view_column_usage, which only reports tables owned
+        // by an enabled role and would hand the recommended read-only role a
+        // false all-clear.
+        let doctor_views = |user: &str| {
+            let cfg = tmp.path().join(format!("views-{user}.toml"));
+            std::fs::write(
+                &cfg,
+                format!(
+                    "[connections.pg]\nengine = \"postgres\"\n\
+                     url = \"postgres://{user}@127.0.0.1:{port}/postgres\"\n\
+                     password = {{ env = \"{PW_ENV}\" }}\nallowed_dirs = [\"{}\"]\n\
+                     [connections.pg.pii]\ncolumns = [\"users.email\"]\n",
+                    tmp.path().display()
+                ),
+            )
+            .unwrap();
+            let out = run(tmp.path(), &cfg, &["doctor", "pg", "--format", "json"]);
+            assert_eq!(out.status.code(), Some(0), "{user}: {}", stderr(&out));
+            let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+            v["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "pii_views")
+                .unwrap_or_else(|| panic!("{user}: no pii_views check: {v}"))
+                .clone()
+        };
+        // v_users selects the protected column and pii_all may read it -> named.
+        let check = doctor_views("pii_all");
+        assert_eq!(check["status"], "warn", "{check}");
+        assert!(
+            check["message"].as_str().unwrap().contains("v_users"),
+            "{check}"
+        );
+        // pii_none has no SELECT on the view, so there is nothing to warn about:
+        // the check reports what THIS role can actually reach, not every view.
+        let check = doctor_views("pii_none");
+        assert_eq!(check["status"], "ok", "{check}");
 
         container.rm().await.unwrap();
     });

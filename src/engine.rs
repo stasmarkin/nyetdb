@@ -683,6 +683,7 @@ impl Engine for Sqlite {
                 // literally (SQLite has no socket, so behavior is unchanged).
                 drop(conn);
                 Diagnosis {
+                    pii_views: None,
                     connect: ConnectFact::Ok { via_tunnel: false },
                     server: None,
                     // No roles, no column privileges: nothing to ask the file.
@@ -692,6 +693,7 @@ impl Engine for Sqlite {
             Err(e) => {
                 let (message, hint) = error_parts(e);
                 Diagnosis {
+                    pii_views: None,
                     connect: ConnectFact::Failed { message, hint },
                     server: None,
                     pii: Vec::new(),
@@ -1305,6 +1307,7 @@ impl Engine for Postgres {
             Err(e) => {
                 let (message, hint) = error_parts(e);
                 return Diagnosis {
+                    pii_views: None,
                     connect: ConnectFact::Failed { message, hint },
                     server: None,
                     pii: Vec::new(),
@@ -1324,6 +1327,16 @@ impl Engine for Postgres {
             Ok(facts) => facts,
             // Never a false "cannot read it" (UX-1): unverified is unverified.
             Err(_elapsed) => unverified_pii(pii),
+        };
+        // A [pii] rule is keyed to the relation it names, so a view over the
+        // protected table is a legitimate way around it. Ask before the write
+        // probe, for the same reason pii_access is asked first.
+        let pii_views = match pii.is_empty() {
+            true => None,
+            false => tokio::time::timeout(deadline, pg_pii_views(&mut conn, pii))
+                .await
+                .ok()
+                .flatten(),
         };
         let server = match tokio::time::timeout(deadline, pg_diagnose(&mut conn)).await {
             Ok(facts) => facts,
@@ -1345,6 +1358,7 @@ impl Engine for Postgres {
         // socket is instant (sqlx's Drop closes it in the background).
         drop(conn);
         Diagnosis {
+            pii_views,
             connect: ConnectFact::Ok {
                 via_tunnel: self.host_override.is_some(),
             },
@@ -1389,6 +1403,50 @@ async fn pg_pii_access(conn: &mut sqlx::PgConnection, pii: &[(String, String)]) 
         });
     }
     out
+}
+
+/// Views and materialized views that read a protected column AND that this
+/// role may select from — the gap a `[pii]` rule leaves open by being keyed to
+/// one relation name.
+///
+/// Walks `pg_depend` rather than `information_schema.view_column_usage`: the
+/// information_schema view only lists columns of tables owned by an enabled
+/// role, so the recommended read-only role (which owns nothing) would always
+/// see an empty answer — a false all-clear, which is worse than no check.
+/// `None` on any failure: unverified is unverified (UX-1).
+async fn pg_pii_views(
+    conn: &mut sqlx::PgConnection,
+    pii: &[(String, String)],
+) -> Option<Vec<String>> {
+    let mut found: Vec<String> = Vec::new();
+    for (table, column) in pii {
+        let rows = sqlx::query(
+            "SELECT DISTINCT quote_ident(n.nspname) || '.' || quote_ident(v.relname) AS name \
+             FROM pg_depend d \
+             JOIN pg_rewrite r ON r.oid = d.objid \
+             JOIN pg_class v ON v.oid = r.ev_class \
+             JOIN pg_namespace n ON n.oid = v.relnamespace \
+             JOIN pg_class src ON src.oid = d.refobjid \
+             JOIN pg_attribute a ON a.attrelid = src.oid AND a.attnum = d.refobjsubid \
+             WHERE lower(src.relname) = lower($1) AND lower(a.attname) = lower($2) \
+               AND v.relkind IN ('v', 'm') AND v.oid <> src.oid \
+               AND has_table_privilege(v.oid, 'SELECT') \
+             ORDER BY 1",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_all(&mut *conn)
+        .await
+        .ok()?;
+        for row in rows {
+            if let Ok(name) = row.try_get::<String, _>(0) {
+                if !found.contains(&name) {
+                    found.push(name);
+                }
+            }
+        }
+    }
+    Some(found)
 }
 
 /// Gather the PostgreSQL role facts for doctor: superuser status, whether the
@@ -2634,6 +2692,7 @@ impl Engine for Mysql {
             Err(e) => {
                 let (message, hint) = error_parts(e);
                 return Diagnosis {
+                    pii_views: None,
                     connect: ConnectFact::Failed { message, hint },
                     server: None,
                     pii: Vec::new(),
@@ -2652,6 +2711,7 @@ impl Engine for Mysql {
         // Cloned per call: the branches below are exclusive, but each is its own
         // call site (a moving closure would be FnOnce).
         let with_server = |server| Diagnosis {
+            pii_views: None,
             connect: ConnectFact::Ok { via_tunnel },
             server: Some(server),
             pii: pii_access.clone(),
@@ -3785,6 +3845,7 @@ impl Engine for Mongo {
             Err(e) => {
                 let (message, hint) = error_parts(e);
                 return Diagnosis {
+                    pii_views: None,
                     connect: ConnectFact::Failed { message, hint },
                     server: None,
                     // Empty even under a policy: MongoDB has no field-level
@@ -3832,6 +3893,7 @@ impl Engine for Mongo {
             }
         };
         Diagnosis {
+            pii_views: None,
             connect: ConnectFact::Ok {
                 via_tunnel: self.host_override.is_some(),
             },
