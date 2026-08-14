@@ -6,8 +6,8 @@
 // The modules live in the lib target (src/lib.rs) so the fuzz targets can link
 // against them; this binary is just their cli layer.
 use nyetdb::{
-    audit, config, engine, guardrail, mongo, output, resolver, sample, secret, skill, tunnel,
-    validator,
+    audit, config, datagrip, engine, guardrail, mongo, output, resolver, sample, secret, skill,
+    tunnel, validator,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -194,6 +194,49 @@ enum Command {
         /// Item name, as written in the connection's `{ keychain = "..." }`
         item: String,
     },
+
+    /// Turn another tool's saved connections into nyet config sections
+    ///
+    ///   nyet import datagrip                 # print the sections
+    ///   nyet import datagrip --write         # append them to the config
+    ///   nyet import datagrip --path ~/proj   # one project, not the whole search
+    ///
+    /// Reads JetBrains data sources (DataGrip, IntelliJ IDEA, PyCharm — every
+    /// installed IDE and every project it remembers) and writes the TOML to
+    /// stdout for you to review. What is skipped, and why, goes to stderr.
+    ///
+    /// Two things it deliberately does NOT carry over:
+    ///
+    ///   passwords     DataGrip keeps them in its own store; nyet emits a
+    ///                 `{ keychain = "<alias>" }` reference plus the
+    ///                 `nyet secret-set` line that fills it. A config with the
+    ///                 password in it is a config the agent can read.
+    ///   allowed_dirs  emitted empty, which denies every directory. Only you
+    ///                 know which project each database belongs to, and
+    ///                 guessing would open every one of them at once.
+    #[command(verbatim_doc_comment)]
+    Import {
+        /// Which tool to read (currently: datagrip)
+        #[arg(value_enum)]
+        source: ImportSource,
+
+        /// A project directory, an .idea directory, or a dataSources.xml —
+        /// instead of searching the installed IDEs
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+
+        /// Append the sections to the config instead of printing them
+        #[arg(long)]
+        write: bool,
+    },
+}
+
+/// The tools `nyet import` can read. One today; the enum exists because the
+/// subcommand reads `import <tool>`, not `import` — adding a second tool must
+/// not change the shape of the command line.
+#[derive(Clone, Copy, ValueEnum)]
+enum ImportSource {
+    Datagrip,
 }
 
 /// `agent-setup` emits Markdown by default (the SKILL.md a human redirects to a
@@ -798,6 +841,18 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
     if let Command::SecretSet { item } = &cli.command {
         return secret_set(item);
     }
+    // And the same again: an import reads somebody else's files to PRODUCE a
+    // config, so requiring a valid one first would make the command useless to
+    // the person who has none yet.
+    if let Command::Import {
+        source,
+        path,
+        write,
+    } = &cli.command
+    {
+        let ImportSource::Datagrip = source;
+        return import_datagrip(cli.config, path.as_deref(), *write, route_format);
+    }
 
     let path = config_path(cli.config)?;
     let text = read_config(&path)?;
@@ -1304,6 +1359,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
         // read), so this arm is dead — it exists only for match exhaustiveness.
         Command::AgentSetup { .. } => unreachable!("agent-setup is short-circuited above"),
         Command::SecretSet { .. } => unreachable!("secret-set is short-circuited above"),
+        Command::Import { .. } => unreachable!("import is short-circuited above"),
     }
 }
 
@@ -1953,6 +2009,350 @@ fn agent_setup(
             emit(Format::Json, "", &output::skill_json(&text)).map_err(output_write_failure)
         }
     }
+}
+
+/// The three files one JetBrains project (or one IDE) contributes: the data
+/// sources, the local half that holds the user name and the tunnel, and
+/// whichever ssh config files can resolve that tunnel.
+struct DatagripFiles {
+    sources: PathBuf,
+    local: Option<PathBuf>,
+    ssh: Vec<PathBuf>,
+}
+
+/// `nyet import datagrip`. Local generation like agent-setup: no database, no
+/// network, and no config of our own — the point is to produce one.
+fn import_datagrip(
+    config_flag: Option<PathBuf>,
+    path: Option<&Path>,
+    write: bool,
+    route_format: &mut Format,
+) -> Result<(), Failure> {
+    let files = match path {
+        Some(p) => datagrip_files_at(p),
+        None => discover_datagrip_files(),
+    };
+    if files.is_empty() {
+        return Err(Failure::new(
+            ErrorCode::ConfigInvalid,
+            match path {
+                Some(p) => format!("no DataGrip data sources under {}", p.display()),
+                None => "no JetBrains data sources found on this machine".to_owned(),
+            },
+            "name the file or the project directly: `nyet import datagrip --path \
+             <project>` — the file is `.idea/dataSources.xml` inside a project, or \
+             `options/dataSources.xml` in the IDE's settings directory",
+        ));
+    }
+
+    let mut mapped = Vec::new();
+    let mut origins = Vec::new();
+    // Alias uniqueness spans every file: two projects both naming a database
+    // `prod-01` would otherwise emit the same section twice, and a duplicate
+    // key is a config that no longer parses at all.
+    let mut aliases = std::collections::BTreeMap::new();
+    // Diagnostics for the human, not for the config: an unreadable file among
+    // ten must not abort the import, but it must not pass in silence either.
+    let mut notes: Vec<String> = Vec::new();
+
+    for file in &files {
+        let text = match std::fs::read_to_string(&file.sources) {
+            Ok(t) => t,
+            Err(e) => {
+                notes.push(format!("{}: {e}", file.sources.display()));
+                continue;
+            }
+        };
+        let mut sources = match datagrip::parse_sources(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                notes.push(format!("{}: {e}", file.sources.display()));
+                continue;
+            }
+        };
+        if sources.is_empty() {
+            continue;
+        }
+
+        let local = file
+            .local
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| datagrip::parse_local(&t).ok())
+            .unwrap_or_default();
+        for source in &mut sources {
+            if let Some(l) = local.get(&source.uuid) {
+                source.user.clone_from(&l.user);
+                source.ssh_config_id.clone_from(&l.ssh_config_id);
+            }
+        }
+
+        // A project's own ssh configs and the IDE-wide ones share one id
+        // space, so they merge into one lookup rather than being tried in turn.
+        let mut ssh_configs = std::collections::BTreeMap::new();
+        for ssh_path in &file.ssh {
+            if let Some(parsed) = std::fs::read_to_string(ssh_path)
+                .ok()
+                .and_then(|t| datagrip::parse_ssh_configs(&t).ok())
+            {
+                ssh_configs.extend(parsed);
+            }
+        }
+
+        mapped.extend(datagrip::map_sources(&sources, &ssh_configs, &mut aliases));
+        origins.push(file.sources.display().to_string());
+    }
+
+    if mapped.is_empty() {
+        return Err(Failure::new(
+            ErrorCode::ConfigInvalid,
+            "the DataGrip files hold no data sources",
+            "open the connection in DataGrip once so it saves the url, then run \
+             the import again",
+        ));
+    }
+
+    for entry in &mapped {
+        if let datagrip::Mapped::Skipped { name, reason } = entry {
+            notes.push(format!("skipped \"{name}\": {reason}"));
+        }
+    }
+
+    let origin = origins.join(", ");
+    if write {
+        let target = config_path(config_flag)?;
+        let dropped = append_to_config(&target, &mapped, &origin)?;
+        for alias in dropped {
+            notes.push(format!(
+                "skipped \"{alias}\": the config already has a connection by that name"
+            ));
+        }
+        eprintln!("nyet: connections appended to {}", target.display());
+        report(&notes);
+        // Nothing on stdout: the config file IS the output. The envelope still
+        // travels on stderr, so the exit path stays the one every command uses.
+        *route_format = Format::Table;
+        return emit(Format::Table, "", &output::bare_success()).map_err(output_write_failure);
+    }
+
+    let text = datagrip::render(&mapped, &origin);
+    report(&notes);
+    // Routes like agent-setup's markdown: generated text on stdout, envelope
+    // on stderr, so `nyet import datagrip >> ~/.config/nyet/config.toml` is a
+    // clean append.
+    *route_format = Format::Table;
+    emit(Format::Table, &text, &output::bare_success()).map_err(output_write_failure)
+}
+
+fn report(notes: &[String]) {
+    for note in notes {
+        eprintln!("nyet: {note}");
+    }
+}
+
+/// Append the imported sections, skipping aliases the config already uses.
+/// Returns those skipped names. A duplicate `[connections.x]` is not a merge
+/// but a TOML parse error, i.e. it would break every later nyet call — so the
+/// existing config always wins.
+fn append_to_config(
+    target: &Path,
+    mapped: &[datagrip::Mapped],
+    origin: &str,
+) -> Result<Vec<String>, Failure> {
+    let existing = std::fs::read_to_string(target).unwrap_or_default();
+    let taken: std::collections::BTreeSet<String> = existing
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|t| match t.get("connections") {
+            Some(toml::Value::Table(conns)) => Some(conns.keys().cloned().collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let mut dropped = Vec::new();
+    let keep: Vec<datagrip::Mapped> = mapped
+        .iter()
+        .filter(|entry| match entry {
+            datagrip::Mapped::Ready(conn) if taken.contains(&conn.alias) => {
+                dropped.push(conn.alias.clone());
+                false
+            }
+            datagrip::Mapped::Ready(_) => true,
+            datagrip::Mapped::Skipped { .. } => false,
+        })
+        .cloned()
+        .collect();
+
+    if keep.is_empty() {
+        return Ok(dropped);
+    }
+
+    let mut text = datagrip::render(&keep, origin);
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        text.insert(0, '\n');
+    }
+
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| write_failure(target, e))?;
+        }
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    // A config carrying credentials is created owner-only, like the audit log.
+    // An EXISTING file keeps its mode: tightening someone else's permissions
+    // behind their back is a surprise, and `doctor` already warns about loose
+    // ones.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(target).map_err(|e| write_failure(target, e))?;
+    file.write_all(text.as_bytes())
+        .map_err(|e| write_failure(target, e))?;
+    Ok(dropped)
+}
+
+fn write_failure(target: &Path, e: std::io::Error) -> Failure {
+    Failure::new(
+        ErrorCode::ConfigInvalid,
+        format!("could not write {}: {e}", target.display()),
+        "run the import without --write and append the output yourself, or point \
+         --config at a path you can write",
+    )
+}
+
+/// `--path`: a dataSources.xml, a project directory, or an `.idea` directory.
+/// Accepting all three is not indulgence — a person who knows where their
+/// project is should not have to know JetBrains' layout inside it.
+fn datagrip_files_at(path: &Path) -> Vec<DatagripFiles> {
+    let sources = if path.is_file() {
+        path.to_path_buf()
+    } else {
+        [
+            path.join("dataSources.xml"),
+            path.join(".idea/dataSources.xml"),
+        ]
+        .into_iter()
+        .find(|p| p.is_file())
+        .unwrap_or_default()
+    };
+    if !sources.is_file() {
+        return Vec::new();
+    }
+    let dir = sources.parent().unwrap_or(Path::new("."));
+    let local = Some(dir.join("dataSources.local.xml")).filter(|p| p.is_file());
+    // The IDE-wide ssh configs live outside the project, so a tunnel defined
+    // there resolves only if the search finds them too.
+    let mut ssh: Vec<PathBuf> = vec![dir.join("sshConfigs.xml")];
+    if let Some(home) = home_dir() {
+        ssh.extend(
+            jetbrains_roots(&home)
+                .iter()
+                .map(|r| r.join("options/sshConfigs.xml")),
+        );
+    }
+    ssh.retain(|p| p.is_file());
+    vec![DatagripFiles {
+        sources,
+        local,
+        ssh,
+    }]
+}
+
+/// Every installed JetBrains IDE, and every project each one remembers.
+/// Data sources live in two places: the IDE's own settings (global sources)
+/// and `.idea/` inside a project — and `recentProjects.xml` is what makes the
+/// second findable without walking the whole filesystem.
+fn discover_datagrip_files() -> Vec<DatagripFiles> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let roots = jetbrains_roots(&home);
+    let mut out: Vec<DatagripFiles> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut push =
+        |sources: PathBuf, ssh: Vec<PathBuf>, seen: &mut std::collections::BTreeSet<PathBuf>| {
+            if !sources.is_file() {
+                return;
+            }
+            let key = sources.canonicalize().unwrap_or_else(|_| sources.clone());
+            if !seen.insert(key) {
+                return;
+            }
+            let dir = sources.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let mut ssh = ssh;
+            ssh.push(dir.join("sshConfigs.xml"));
+            ssh.retain(|p| p.is_file());
+            out.push(DatagripFiles {
+                local: Some(dir.join("dataSources.local.xml")).filter(|p| p.is_file()),
+                sources,
+                ssh,
+            });
+        };
+
+    for root in &roots {
+        let ide_ssh = vec![root.join("options/sshConfigs.xml")];
+        push(
+            root.join("options/dataSources.xml"),
+            ide_ssh.clone(),
+            &mut seen,
+        );
+        let recent = root.join("options/recentProjects.xml");
+        let projects = std::fs::read_to_string(&recent)
+            .ok()
+            .and_then(|t| datagrip::parse_recent_projects(&t, &home).ok())
+            .unwrap_or_default();
+        for project in projects {
+            push(
+                project.join(".idea/dataSources.xml"),
+                ide_ssh.clone(),
+                &mut seen,
+            );
+        }
+    }
+    // The project one happens to be standing in, which no IDE may remember yet.
+    if let Ok(cwd) = std::env::current_dir() {
+        let ide_ssh: Vec<PathBuf> = roots
+            .iter()
+            .map(|r| r.join("options/sshConfigs.xml"))
+            .collect();
+        push(cwd.join(".idea/dataSources.xml"), ide_ssh, &mut seen);
+    }
+    out
+}
+
+/// Where JetBrains keeps per-IDE settings. One directory per IDE AND per
+/// version (`DataGrip2026.2`, `IntelliJIdea2026.1`), so all of them are read:
+/// a data source defined in last year's install is still the user's.
+fn jetbrains_roots(home: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = home.join("Library/Application Support/JetBrains");
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData/Roaming"))
+        .join("JetBrains");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("JetBrains");
+
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    // Deterministic output: the sections come out in the same order on every
+    // run, so a re-import diffs cleanly against the last one.
+    roots.sort();
+    roots
 }
 
 /// Best-effort load of the connections reachable from cwd (consistent with
@@ -2696,6 +3096,9 @@ fn command_format_flag(command: &Command) -> Option<Format> {
         // secret-set writes one line to stderr and no envelope; like
         // agent-setup it never reaches the format-routed error paths.
         Command::SecretSet { .. } => None,
+        // import routes like agent-setup's markdown: generated text on stdout,
+        // envelope on stderr. It sets that itself before any error path.
+        Command::Import { .. } => None,
     }
 }
 
@@ -2706,7 +3109,9 @@ fn default_format(command: &Command) -> Format {
         Command::Doctor { .. } => Format::Table,
         // Markdown default routes like a data format (stderr envelope);
         // agent_setup overrides this before any error path anyway.
-        Command::AgentSetup { .. } | Command::SecretSet { .. } => Format::Table,
+        Command::AgentSetup { .. } | Command::SecretSet { .. } | Command::Import { .. } => {
+            Format::Table
+        }
         _ => Format::Json,
     }
 }

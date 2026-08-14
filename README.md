@@ -299,6 +299,49 @@ layers; MongoDB has two, and nyet says so rather than implying otherwise:
   probe by RUNNING JavaScript, which is the one thing nyet promises never to
   send.
 
+### Importing connections from DataGrip
+
+If your databases are already set up in a JetBrains IDE, `nyet import` writes
+the config sections for you:
+
+```console
+$ nyet import datagrip                    # print the sections for review
+$ nyet import datagrip --write            # append them to the config
+$ nyet import datagrip --path ~/proj      # one project instead of a search
+```
+
+Without `--path` it reads every installed JetBrains IDE (DataGrip, IntelliJ
+IDEA, PyCharm, …) and every project each one remembers, so connections defined
+inside a project's `.idea/` are found too. The TOML goes to stdout; anything
+skipped, and why, goes to stderr. Engines nyet does not speak (Oracle, MSSQL,
+…) are named there rather than silently dropped.
+
+Two things are deliberately **not** carried over:
+
+- **Passwords.** DataGrip keeps them in its own store, and a tool built on
+  "the agent does not get the secret even after finding the config" has no
+  business copying secrets into a config file. Each connection gets a
+  `password = { keychain = "<alias>" }` reference plus the `nyet secret-set`
+  line that fills it (see below); a database that authenticates as nobody gets
+  no password line at all.
+- **`allowed_dirs`.** It is emitted empty, which means *denied everywhere*.
+  DataGrip does not record which project a database belongs to, and guessing
+  `["~"]` would open every production database to an agent the moment you ran
+  the import. Fill it in per connection — that edit is the review.
+
+What it does carry over: the engine, the url (with the user name from
+DataGrip's local file), and SSH tunnels — an enabled tunnel becomes
+`[connections.X.ssh]` with the bastion from the IDE's ssh config and the
+database address as `remote`. A tunnel switched off in DataGrip is not
+imported. A name that would need quoting becomes a plain alias
+(`prod-taxi (6)` → `prod-taxi-6`), and collisions across projects get a
+numeric suffix. ClickHouse urls are rewritten to the HTTP interface, which is
+what nyet speaks, with a comment saying so.
+
+With `--write`, an alias the config already uses is skipped and named on
+stderr — the existing connection wins, because a duplicate section would leave
+you with a config that no longer parses.
+
 ### Where the password lives
 
 A connection's `password` (and `url`, if you want the whole address out of the

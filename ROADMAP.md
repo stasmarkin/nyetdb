@@ -271,6 +271,29 @@ cheaper and more necessary than what had been planned.
       protecting nothing is worse than none; the ACL key pattern, which the
       server itself enforces, is offered instead
 
+- [x] **`nyet import datagrip` (August 2026).** Was in no milestone and no
+      wishlist: the first setup step is transcribing connections a JetBrains
+      IDE already holds, and on 30-odd databases that is where people give up.
+      The command reads every installed IDE and every project it remembers
+      (`recentProjects.xml` is what makes `.idea/dataSources.xml` findable
+      without walking the filesystem), and emits config sections on stdout;
+      `--write` appends them, `--path` narrows the search to one project. Two
+      things it refuses to carry, and both are the product rather than a
+      limitation: **passwords** (DataGrip's own store holds them; the import
+      emits a `{ keychain = ... }` reference and the `secret-set` line that
+      fills it — a tool selling "the agent does not get the secret even after
+      finding the config" must not copy secrets into one) and **`allowed_dirs`**
+      (emitted empty = denied everywhere; only the human knows which project a
+      database belongs to, and guessing `["~"]` would open every production
+      database at import time). SSH tunnels do come across, but only the ones
+      DataGrip has switched on. Two things that had to be right or the output
+      is worse than useless: alias uniqueness spans the WHOLE import (two
+      projects naming a database `prod-01` would emit a duplicate section, and
+      duplicate keys mean a config that no longer parses at all — found by
+      running it against 33 real connections), and `--write` never overwrites
+      an alias the config already has. XML parsing is `roxmltree`
+      (`forbid(unsafe_code)`, one dependency): a hand-rolled scan would have to
+      get `&amp;` right in every jdbc url that carries query parameters
 - [x] **TLS for direct connections** (rustls): `sslmode`/`ssl-mode` in the url
       work, MySQL 8 `caching_sha2_password` with the password over TLS, and an
       `INSECURE_TRANSPORT` warning on unprotected transport

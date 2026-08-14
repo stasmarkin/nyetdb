@@ -3800,3 +3800,113 @@ fn mongo_config_promises_it_cannot_keep_are_exit_3() {
         );
     }
 }
+
+/// The import produces a config, so it must run before one exists — the same
+/// short-circuit `agent-setup` relies on. A refactor that moves it below the
+/// config read would break the only workflow it is for.
+#[test]
+fn import_datagrip_works_without_a_config_and_denies_every_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj/.idea");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("dataSources.xml"),
+        r#"<project version="4"><component name="DataSourceManagerImpl">
+             <data-source name="app db" uuid="u1">
+               <driver-ref>postgresql</driver-ref>
+               <jdbc-url>jdbc:postgresql://db.internal:5432/app</jdbc-url>
+             </data-source>
+           </component></project>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("dataSources.local.xml"),
+        r#"<project version="4"><component name="dataSourceStorageLocal">
+             <data-source name="app db" uuid="u1"><user-name>reader</user-name></data-source>
+           </component></project>"#,
+    )
+    .unwrap();
+
+    let out = nyet(tmp.path())
+        .args([
+            "import",
+            "datagrip",
+            "--config",
+            "/no/such/config.toml",
+            "--path",
+        ])
+        .arg(tmp.path().join("proj"))
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let toml = stdout(&out);
+    assert!(toml.contains("[connections.app-db]"), "{toml}");
+    assert!(
+        toml.contains(r#"url = "postgresql://reader@db.internal:5432/app""#),
+        "{toml}"
+    );
+    // The password is a reference the human fills, never a value.
+    assert!(
+        toml.contains(r#"password = { keychain = "app-db" }"#),
+        "{toml}"
+    );
+    // Fail closed: an unreviewed import grants nothing.
+    assert!(
+        toml.lines().any(|l| l.starts_with("allowed_dirs = []")),
+        "{toml}"
+    );
+    // Envelope routes to stderr, like every generated-text format.
+    assert!(
+        stderr(&out).contains(r#"{"v":1,"ok":true}"#),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// What the import cannot map is named on stderr rather than dropped: a
+/// connection that silently fails to appear is one the human goes looking for.
+#[test]
+fn import_datagrip_names_the_drivers_it_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idea = tmp.path().join(".idea");
+    std::fs::create_dir_all(&idea).unwrap();
+    std::fs::write(
+        idea.join("dataSources.xml"),
+        r#"<project version="4"><component name="DataSourceManagerImpl">
+             <data-source name="legacy" uuid="u1">
+               <driver-ref>oracle</driver-ref>
+               <jdbc-url>jdbc:oracle:thin:@//ora:1521/x</jdbc-url>
+             </data-source>
+             <data-source name="keep" uuid="u2">
+               <driver-ref>sqlite.xerial</driver-ref>
+               <jdbc-url>jdbc:sqlite:/tmp/dev.db</jdbc-url>
+             </data-source>
+           </component></project>"#,
+    )
+    .unwrap();
+
+    let out = nyet(tmp.path())
+        .args([
+            "import",
+            "datagrip",
+            "--config",
+            "/no/such/config.toml",
+            "--path",
+        ])
+        .arg(tmp.path())
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains(r#"path = "/tmp/dev.db""#),
+        "{}",
+        stdout(&out)
+    );
+    let err = stderr(&out);
+    assert!(err.contains(r#"skipped "legacy""#), "{err}");
+    assert!(err.contains("oracle"), "{err}");
+}

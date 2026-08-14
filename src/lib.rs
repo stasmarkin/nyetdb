@@ -9,6 +9,7 @@
 
 pub mod audit;
 pub mod config;
+pub mod datagrip;
 pub mod engine;
 pub mod guardrail;
 pub mod mongo;

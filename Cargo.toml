@@ -59,6 +59,7 @@ toml = "1.1.3"
 # userinfo/host/port split written by hand is a security-relevant class of bug.
 url = "2.5.8"
 unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
+roxmltree = { version = "0.21", default-features = false, features = ["std"] }
 
 # Keychain, macOS only. The native API is not a convenience here: the item's
 # ACL is checked against the process that asks, so shelling out to
