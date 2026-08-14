@@ -1,0 +1,177 @@
+# Golden corpus — Redis commands that must be ALLOWED (W8).
+#
+# `flags:` is what `COMMAND INFO <name>` said on a live `redis:7.4`, reduced to
+# the four properties the policy reads (`readonly`, `admin`, `blocking`,
+# `dangerous` = the `@dangerous` ACL category). `flags: unknown` is the nil the
+# server returns for a name it does not have. These are TRANSCRIBED, not
+# invented — production asks the server for them on every query, and this file
+# is what makes the RULE testable without one.
+#
+# Half the specification is here rather than in `deny.yaml`, and deliberately:
+# a classifier that quietly ate introspection would push people to hand whole
+# families back with `allow_functions`, which is worse than having no list.
+
+# --- the plain reads an agent actually writes ---
+- query: GET user:1
+  flags: readonly
+  verdict: allow
+- query: MGET user:1 user:2
+  flags: readonly
+  verdict: allow
+- query: HGETALL user:42
+  flags: readonly
+  verdict: allow
+- query: HGET user:42 email
+  flags: readonly
+  verdict: allow
+- query: LRANGE queue:jobs 0 -1
+  flags: readonly
+  verdict: allow
+- query: SMEMBERS tags:42
+  flags: readonly
+  verdict: allow
+- query: SISMEMBER tags:42 red
+  flags: readonly
+  verdict: allow
+- query: ZRANGE leaderboard 0 9 WITHSCORES
+  flags: readonly
+  verdict: allow
+- query: ZSCORE leaderboard alice
+  flags: readonly
+  verdict: allow
+- query: XRANGE events - +
+  flags: readonly
+  verdict: allow
+- query: XLEN events
+  flags: readonly
+  verdict: allow
+- query: STRLEN user:1
+  flags: readonly
+  verdict: allow
+- query: GETRANGE user:1 0 10
+  flags: readonly
+  verdict: allow
+- query: BITCOUNT flags:1
+  flags: readonly
+  verdict: allow
+- query: LCS a b
+  flags: readonly
+  verdict: allow
+- query: DBSIZE
+  flags: readonly
+  verdict: allow
+
+# --- introspection: what an agent needs to find its way around ---
+- query: EXISTS user:1
+  flags: readonly
+  verdict: allow
+- query: TYPE user:42
+  flags: readonly
+  verdict: allow
+- query: TTL session:abc
+  flags: readonly
+  verdict: allow
+- query: PTTL session:abc
+  flags: readonly
+  verdict: allow
+- query: OBJECT ENCODING queue:jobs
+  flags: readonly
+  verdict: allow
+- query: XINFO STREAM events
+  flags: readonly
+  verdict: allow
+- query: MEMORY USAGE user:1
+  flags: readonly
+  verdict: allow
+- query: DUMP user:1
+  flags: readonly
+  verdict: allow
+
+# --- SCAN and friends. Measured on 7.4: the cursor is NOT server state — a
+# cursor taken on one connection continued correctly on another — so the
+# ROADMAP's worry about a server-side cursor did not reproduce, and there is
+# nothing here for nyet to clean up after itself.
+- query: SCAN 0
+  flags: readonly
+  verdict: allow
+- query: SCAN 0 MATCH user:* COUNT 100
+  flags: readonly
+  verdict: allow
+- query: HSCAN user:42 0
+  flags: readonly
+  verdict: allow
+- query: SSCAN tags:42 0
+  flags: readonly
+  verdict: allow
+- query: ZSCAN leaderboard 0
+  flags: readonly
+  verdict: allow
+
+# --- the read-only twins of commands that are writes in their plain form.
+# This is where the server's own classification earns its keep: nyet did not
+# have to know that SORT can STORE and SORT_RO cannot.
+- query: BITFIELD_RO counters GET u8 0
+  flags: readonly
+  verdict: allow
+- query: GEORADIUS_RO places 1 1 10 km
+  flags: readonly
+  verdict: allow
+
+# --- nondeterministic reads are still reads ---
+- query: SRANDMEMBER tags:42 3
+  flags: readonly
+  verdict: allow
+- query: HRANDFIELD user:42 2
+  flags: readonly
+  verdict: allow
+- query: ZRANDMEMBER leaderboard 2
+  flags: readonly
+  verdict: allow
+- query: RANDOMKEY
+  flags: readonly
+  verdict: allow
+- query: LPOS queue:jobs a
+  flags: readonly
+  verdict: allow
+
+# --- quoting: a key with a space in it is an ordinary Redis key ---
+- query: GET "user session:42"
+  flags: readonly
+  verdict: allow
+- query: GET 'user session:42'
+  flags: readonly
+  verdict: allow
+- query: HGET "a b" "c d"
+  flags: readonly
+  verdict: allow
+- query: GET ""
+  flags: readonly
+  verdict: allow
+- query: get user:1
+  flags: readonly
+  verdict: allow
+
+# --- the config's escape hatch, and where it stops.
+#
+# `KEYS` is `readonly` AND `@dangerous`, and `INFO` is flagged NEITHER read nor
+# write — both are refused by default (see deny.yaml), and both come back by
+# NAME when the connection's owner says so. What no config line reaches is a
+# command the SERVER calls a write; that case is in deny.yaml.
+- query: KEYS user:*
+  flags: readonly,dangerous
+  allow_functions: keys
+  verdict: allow
+- query: INFO memory
+  flags: dangerous
+  allow_functions: info
+  verdict: allow
+- query: COMMAND DOCS GET
+  flags: none
+  allow_functions: command
+  verdict: allow
+# ...and the permission is scoped to the name, never to the category.
+- query: SORT_RO queue:jobs
+  flags: readonly,dangerous
+  allow_functions: keys
+  verdict: deny
+  reason: DENIED_COMMAND

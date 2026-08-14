@@ -1,0 +1,1 @@
+ALTER TABLE t UPDATE a = 1 WHERE b = 2

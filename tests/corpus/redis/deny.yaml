@@ -1,0 +1,276 @@
+# Golden corpus — Redis commands that must be REFUSED (W8).
+# reason is from the closed list: PARSE_FAILED | WRITE_OPERATION |
+# DENIED_COMMAND (see src/redis.rs).
+#
+# `flags:` is what `COMMAND INFO <name>` reported on a live `redis:7.4`,
+# transcribed (see allow.yaml's header). The interesting half of this file is
+# how MANY of these nyet gets right without knowing anything about the command:
+# the server itself says `GETEX` is a write "because it changes the TTL".
+
+# --- the obvious writes ---
+- query: SET user:1 hello
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: DEL user:1
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: EXPIRE user:1 60
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: RENAME a b
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: FLUSHALL
+  flags: write,dangerous
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: FLUSHDB
+  flags: write,dangerous
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SWAPDB 0 1
+  flags: write,dangerous
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: RESTORE k 0 payload
+  flags: write,dangerous
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: MIGRATE h 6379 k 0 100
+  flags: write,dangerous
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- READS WITH A SIDE EFFECT, which is the W7 class this engine was warned
+# about. Every one of them is caught by the SERVER's own flag, with no list on
+# nyet's side: Redis annotates GETEX itself as "RW and UPDATE because it
+# changes the TTL".
+- query: GETEX session:abc EX 60
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: GETEX session:abc
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: GETDEL user:1
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SPOP tags:42
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+# SORT can STORE, and so can BITFIELD and GEORADIUS. Their `_RO` twins are in
+# allow.yaml — nyet did not have to know the difference, the flags did.
+- query: SORT queue:jobs
+  flags: write,dangerous
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: BITFIELD counters SET u8 0 1
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: GEORADIUS places 1 1 10 km STORE out
+  flags: write
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- a write is refused even when the connection's owner asks for it. This is
+# the ONE rule `allow_functions` cannot reach: a read-only tool that can be
+# configured into writing is not a read-only tool.
+- query: SET user:1 hello
+  flags: write
+  allow_functions: set
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: FLUSHALL
+  flags: write,dangerous
+  allow_functions: flushall
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- flagged NEITHER read nor write: nyet was not told what they do, so it
+# refuses. A rule keyed on the presence of `write` would have passed every one.
+- query: SUBSCRIBE news
+  flags: none
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: PSUBSCRIBE news.*
+  flags: none
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: MULTI
+  flags: none
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: EXEC
+  flags: none
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: WATCH user:1
+  flags: none
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: SELECT 3
+  flags: none
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: RESET
+  flags: none
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: HELLO 2
+  flags: none
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: INFO
+  flags: dangerous
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: CLIENT INFO
+  flags: none
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- administration ---
+- query: CONFIG GET requirepass
+  flags: admin,dangerous
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: CONFIG SET appendonly no
+  flags: admin,dangerous
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: DEBUG SLEEP 30
+  flags: admin,dangerous
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: SHUTDOWN NOSAVE
+  flags: admin,dangerous
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: MONITOR
+  flags: admin,dangerous
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: CLIENT LIST
+  flags: admin,dangerous
+  verdict: deny
+  reason: DENIED_COMMAND
+
+# --- blocking: a read tool that can be made to wait is a read tool that can be
+# made to hang. XREAD is `readonly` AND `blocking` — the flag that matters here
+# is the second one.
+- query: BLPOP queue:jobs 0
+  flags: write,blocking
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: BRPOP queue:jobs 0
+  flags: write,blocking
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: BZPOPMIN leaderboard 0
+  flags: write,blocking
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: XREAD BLOCK 0 STREAMS events $
+  flags: readonly,blocking
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: WAIT 1 0
+  flags: blocking
+  verdict: deny
+  reason: DENIED_COMMAND
+
+# --- @dangerous: reads that are a hazard to the SERVER rather than to the
+# data. KEYS walks the whole key space on a single-threaded process; SORT_RO's
+# BY/GET patterns read keys the command never names.
+- query: KEYS *
+  flags: readonly,dangerous
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: SORT_RO queue:jobs BY weight_* GET payload_*
+  flags: readonly,dangerous
+  verdict: deny
+  reason: DENIED_COMMAND
+
+# --- SCRIPTING: nyet's own denylist, and the one place it overrules the server.
+# EVAL_RO and FCALL_RO are flagged `readonly` — the server calls them reads —
+# and they are refused anyway. Two reasons, both in src/redis.rs: the payload is
+# a program in a language layer 1 does not read (the MongoDB $where call), and
+# Redis runs a script on the single server thread without preempting it, so a
+# loop makes the whole server answer BUSY until somebody runs SCRIPT KILL.
+- query: EVAL "return redis.call('get', KEYS[1])" 1 user:1
+  flags: none
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: EVAL_RO "return 1" 0
+  flags: readonly
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: EVALSHA abc123 0
+  flags: none
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: FCALL myfunc 0
+  flags: none
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: FCALL_RO myfunc 0
+  flags: readonly
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: SCRIPT LOAD "return 1"
+  flags: none
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: FUNCTION LIST
+  flags: none
+  verdict: deny
+  reason: DENIED_COMMAND
+# ...and it IS an escape hatch, not a wall: the connection's owner can take a
+# name off nyet's own list, exactly like `allow_functions = ["pg_sleep"]` on
+# PostgreSQL.
+- query: EVAL_RO "return 1" 0
+  flags: readonly
+  allow_functions: eval_ro
+  verdict: allow
+
+# --- deny_functions: the other direction, for a connection that wants less ---
+- query: SCAN 0
+  flags: readonly
+  deny_functions: scan
+  verdict: deny
+  reason: DENIED_COMMAND
+- query: DUMP user:1
+  flags: readonly
+  deny_functions: dump
+  verdict: deny
+  reason: DENIED_COMMAND
+
+# --- an unknown name fails closed, and Redis hands nyet that for free:
+# COMMAND INFO returns nil for a name it does not have.
+- query: NOSUCHCOMMAND a b
+  flags: unknown
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: GET.EX user:1
+  flags: unknown
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- the parser fails closed too (the empty-line and control-character cases
+# live in src/redis.rs's unit tests: this format cannot express them) ---
+- query: GET "unterminated
+  flags: readonly
+  verdict: deny
+  reason: PARSE_FAILED
+- query: GET 'unterminated
+  flags: readonly
+  verdict: deny
+  reason: PARSE_FAILED

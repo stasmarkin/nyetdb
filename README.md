@@ -8,7 +8,7 @@ credentials, per-directory scoping, layered read-only enforcement (SQL AST
 validation + session-level read-only + read-only roles), and JSON output
 designed for agents.
 
-Supported: PostgreSQL, MySQL/MariaDB, SQLite, MongoDB.
+Supported: PostgreSQL, MySQL/MariaDB, SQLite, MongoDB, ClickHouse, Redis/Valkey.
 
 ## Status
 
@@ -17,7 +17,7 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MongoDB.
 - config: parsing, validation (unknown keys are hard errors), `${VAR}`
   substitution, secrets outside the file (macOS Keychain), file permission warnings;
 - directory scoping (`allowed_dirs`) and `nyet list`;
-- `nyet schema` for all three engines: tables, views, columns, primary keys,
+- `nyet schema` for every SQL engine: tables, views, columns, primary keys,
   unique constraints, indexes and foreign keys as structured JSON (see below);
 - `nyet query`, `schema`, `explain` and `doctor` for **MongoDB**: a parser for a
   subset of the mongosh read syntax plus a closed allowlist over what it parsed
@@ -27,6 +27,18 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MongoDB.
   marks every field it INFERRED from a sample as a guess, `explain` shows the
   plan without executing anything and invents no cost, and `doctor` proves
   read-only from the privileges the server publishes — without writing a byte;
+- `nyet query`, `schema`, `explain` and `doctor` for **ClickHouse**: the full
+  SQL validator on ClickHouse's own dialect plus its own denylist, layer 2 as
+  `readonly = 1` on every request (the strongest layer 2 here — it refuses
+  writes, settings changes AND most table functions), and a guardrail from
+  `EXPLAIN ESTIMATE`, which reads part metadata without touching a row (see
+  "ClickHouse" below);
+- `nyet query`, `schema`, `explain` and `doctor` for **Redis/Valkey**: a
+  command classifier that asks the SERVER what each command does (`COMMAND
+  INFO`) rather than keeping a list, RESP3 output shaping, and honest `na`
+  answers where Redis has nothing to give — there is no read-only session on
+  this engine, and `nyet schema` will not SCAN production to invent one (see
+  "Redis" below);
 - `nyet query` for **SQLite**, **PostgreSQL** and **MySQL/MariaDB**: the full
   SQL validator (read-only allowlist, recursive AST walk, Unicode stripping,
   locking clauses, per-engine function denylist with per-connection policy),
@@ -38,17 +50,17 @@ Supported: PostgreSQL, MySQL/MariaDB, SQLite, MongoDB.
 - `nyet sample <alias> <table>`: a few rows of one table (random draw, 10 by
   default) — sugar over `nyet query`, running the statement nyet writes through
   the same validator, guardrail, PII policy and audit log (see below);
-- **SSH tunnels** for PostgreSQL and MySQL/MariaDB: reach a database behind a
-  bastion by shelling out to the system `ssh` (see the SSH tunnels section below);
+- **SSH tunnels** for every server engine: reach a database behind a bastion by
+  shelling out to the system `ssh` (see the SSH tunnels section below). The
+  tunnel's local end replaces host and port and nothing else, so credentials,
+  database and the TLS decision ride along unchanged;
 - `nyet explain` and the **auto-guardrail**: the query plan, a cost estimate and
   a verdict — and, before `nyet query` runs anything, a refusal for plans whose
   estimate is over the connection's threshold (see below);
 - the stable JSON envelope and exit-code contract.
 
-Redis and ClickHouse are wishlist items rather than scheduled work, and each
-needs a decision before it is built rather than just a driver — see ROADMAP.
-`nyet query` against an engine that is not supported resolves the connection
-and returns `NOT_IMPLEMENTED`.
+`nyet query` against an engine that is not supported (Cassandra, MSSQL,
+Elasticsearch) resolves the connection and returns `NOT_IMPLEMENTED`.
 Direct connections **support TLS** (rustls): set `sslmode=require`/`verify-full`
 (Postgres) or `ssl-mode=REQUIRED`/`VERIFY_IDENTITY` (MySQL) in the `url` to force
 it — otherwise the default (`prefer`/`PREFERRED`) uses TLS only if the server
@@ -118,7 +130,8 @@ enabled = true                         # false disables logging (CI/containers)
 log_responses = false                  # true also logs the result rows
 
 [connections.prod]
-engine = "postgres"                    # postgres | mysql | mariadb | sqlite | mongodb
+engine = "postgres"                    # postgres | mysql | mariadb | sqlite
+                                       # | mongodb | clickhouse | redis (valkey)
 url = "postgres://nyet_ro@db.internal:5432/app"
 # Where the password lives. `{ keychain = "..." }` is the only source the
 # agent cannot read too — see "Where the password lives" below.
@@ -371,6 +384,74 @@ Then `url = "mongodb://nyet_ro@mongo.internal:27017/events?tls=true"` and
 `$out`/`$merge` and every write command outright — nyet's layer 1 simply gets
 there first, without a round trip.
 
+### Recommended: a read-only Redis/Valkey account (layer 3)
+
+**On Redis this is not optional advice either, and for a sharper reason than
+MongoDB's:** Redis has no read-only session, no read-only transaction and no
+per-connection switch, so there is no layer 2 at all. What stands between an
+agent and a write is nyet's classifier and the account's own ACL.
+
+```
+ACL SETUSER nyet_ro on >set-a-strong-one ~* &* -@all +@read +@keyspace -keys +command|info +info
+```
+
+Read it left to right: `-@all` starts from nothing, `+@read` adds the reading
+commands, `+@keyspace` adds `EXISTS`/`TTL`/`TYPE`/`SCAN`, and `-keys` takes
+`KEYS` back out (it walks the whole key space on a single-threaded server —
+nyet refuses it anyway, and an ACL that agrees costs nothing).
+
+**`+command|info` is not optional.** It is how nyet asks the server whether each
+command reads or writes, and `COMMAND` is not in `@read` — without it *every*
+query on the connection is refused (`UNCLASSIFIED`, and the hint prints this
+line). It publishes nothing but command signatures, identical on every Redis of
+that version. `+info` is the smaller one: `nyet schema` reads the per-database
+key counts with it, and without it the schema answer simply says the counts are
+missing and why. Narrow `~*` to a
+key pattern (`~public:*`) if the agent has no business in the rest of the key
+space: **that pattern is the only data boundary Redis offers**, and it is the
+one nyet points at instead of a `[pii]` policy, which this engine refuses (see
+"PII columns").
+
+Then `url = "redis://nyet_ro@cache.internal:6379/0"` (or `rediss://` for TLS)
+and `password = { keychain = "nyet-ro" }`.
+
+A **replica** is the other way to get layer 3, and it covers every account at
+once: `replica-read-only` (on by default) makes the server refuse writes
+outright. `nyet doctor` notices and says so.
+
+Note that this account cannot read its own ACL — `ACL` lives in `@admin` — so
+`nyet doctor` proves read-only by attempting one write instead. That probe is
+`SET <unique> 1 EX 1 NX`: `NX` so it can never overwrite anything, `EX 1` so a
+probe that DID land expires by itself.
+
+### Recommended: a read-only ClickHouse account (layer 3)
+
+ClickHouse needs **two** things, and they answer different questions — grants
+say what the account may touch, the `readonly` setting says what it may do:
+
+```sql
+CREATE USER nyet_ro IDENTIFIED BY 'set-a-strong-one' SETTINGS readonly = 1;
+GRANT SELECT ON app.* TO nyet_ro;
+```
+
+`readonly = 1` and not `2`. The difference is not a matter of degree:
+`readonly = 2` refuses writes but **allows settings changes**, so a client can
+raise its own `max_result_rows` / `max_execution_time` / `max_memory_usage` —
+and ClickHouse stops treating table functions (`url`, `file`, `s3`, `remote`,
+`executable`) as writes. `nyet doctor` has a check that tells the two apart and
+warns about the second; it does not report it as the first.
+
+One consequence worth knowing, because it looks like a bug: an account at
+`readonly = 1` may not change **any** setting, and a url parameter is a
+settings change — so nyet's own per-request caps (`max_execution_time`,
+`max_result_rows`, `max_block_size`) are refused on exactly this account. nyet
+detects that and retries without them; what bounds a query there is the
+account's own profile plus nyet's in-process deadline and row truncation. Put
+the limits in the profile if you want them enforced server-side.
+
+Then `url = "https://nyet_ro@clickhouse.internal:8443/app"` and
+`password = { keychain = "nyet-ro" }`.
+
 ### Recommended: a read-only MySQL/MariaDB user (layer 3)
 
 Same idea as the PostgreSQL role: a `SELECT`-only user makes even a direct
@@ -408,7 +489,8 @@ Then `url = "postgres://nyet_ro@db.internal:5432/app"` and
 A connection can declare which columns hold personal data. `nyet` then either
 refuses any query that could expose them, or returns them fully redacted.
 The mechanics below are the SQL engines'; MongoDB gets the same policy through
-a different pair of nets — see "PII on MongoDB" at the end of this section:
+a different pair of nets, ClickHouse gets a weaker net B and Redis cannot have
+one at all — see the three notes at the end of this section:
 
 ```toml
 [connections.prod.pii]
@@ -785,11 +867,50 @@ server:
   view created with `$unset` over the protected fields, and a role granted
   `find` on the view only.
 
+**PII on ClickHouse.** Net A is the same as on the other SQL engines, and it
+does the bulk of the work — every query that NAMES a protected column is
+refused, wildcards included, `* EXCEPT (email)` included. Net B is **weaker
+here, and this is the one place it is**: ClickHouse's HTTP interface answers
+with column names and types and no provenance at all, so there is nothing to
+ask "which table did this column come from". `check_origins` would see every
+column as unprovable and refuse every query, which is a tool switched off
+rather than a boundary — so net B compares the result column **names** against
+the protected names instead. What that closes is a view that keeps the column's
+name (`SELECT email FROM v_users`, where the rule names `users.email`); what it
+cannot close is a view that **renames** it. On PostgreSQL/MySQL/SQLite the
+driver's provenance closes that; here the boundary is a column-level `GRANT`:
+
+```sql
+REVOKE SELECT ON app.users FROM nyet_ro;
+GRANT SELECT(id, name, created_at) ON app.users TO nyet_ro;
+```
+
+One extra thing is denied on a ClickHouse connection with a policy: the **query
+log**. `system.query_log`, `query_thread_log`, `query_views_log`, `text_log`,
+`asynchronous_insert_log`, `opentelemetry_span_log` and `system.processes` keep
+the query TEXT, so somebody else's `WHERE email = 'a@b.c'` is the protected cell
+quoted verbatim — the same class as PostgreSQL's `pg_stats`, and closed the same
+way.
+
+**PII on Redis: refused, loudly, at config parse.** A `[pii]` section on a Redis
+connection is a hard config error (exit 3), not a policy that quietly does
+nothing. A rule is `table.column` and Redis has neither: no tables, no columns,
+no declared fields, and a reply is bytes with no name attached. Net A would have
+nothing to match and net B nothing to inspect, so a policy here would read as
+protection and protect nothing — the worst outcome of the three. Protect the
+data where Redis actually can: an **ACL key pattern**, which the server itself
+enforces.
+
+```
+ACL SETUSER nyet_ro on >... ~public:* -@all +@read +@keyspace -keys
+```
+
 ### SSH tunnels (a database behind a bastion)
 
 The common production setup — the database is only reachable from a jump host —
-works for PostgreSQL and MySQL/MariaDB by adding an `[ssh]` section to the
-connection:
+works for every server engine (PostgreSQL, MySQL/MariaDB, MongoDB, ClickHouse,
+Redis; SQLite is a local file and rejects `[ssh]` at config parse) by adding an
+`[ssh]` section to the connection:
 
 ```toml
 [connections.prod.ssh]
@@ -1252,6 +1373,171 @@ parameter for the setting, so doctor reads the server's startup options if the
 account may (`--noscripting` → `ok`), and otherwise says **"could not check"**
 with the reason. It will not probe by running JavaScript.
 
+### ClickHouse
+
+A ClickHouse connection is a SQL connection: the same `nyet query`, the same
+validator, the same envelope. Two things differ, and both are worth knowing
+before you point one at production.
+
+**Layer 2 is the strongest of any engine here.** nyet sends `readonly = 1` on
+every request, and ClickHouse takes that further than a read-only transaction
+does — measured on 24.8, it refuses writes, refuses every settings change, and
+refuses **table functions**: `url`, `file`, `s3`, `remote`, `executable`,
+`mysql`, `postgresql`, `mongodb`, `hdfs`, `azureBlobStorage`, `merge`, `input`,
+`format`, `loop` and `dictionary` all come back `Code: 164 READONLY`. To
+ClickHouse a table function is simply not a read.
+
+Layer 1 still has its own denylist, and the entries fall in two groups (each is
+commented with which it is, in `src/validator.rs`): the ones **measured past
+layer 2** — `cluster()` and `clusterAllReplicas()` returned rows inside
+`readonly = 1`, `sqlite()` reached its path check, `dictGet*` reached the
+dictionary lookup, `sleep()`/`sleepEachRow()` ran, the scalar `file()` reached
+its path check, `mergeTreeIndex()` exposed index granules — and the egress
+family, denied on class because a name that reaches outside the machine has no
+business being one config line away from working.
+
+**What the validator will not parse.** nyet uses sqlparser's ClickHouse
+dialect. Every write and every admin statement is refused (either as its own
+statement kind or as a parse error, which fails closed the same way), but the
+dialect also does not parse a handful of legitimate READS, and those are
+refused too:
+
+| Not parsed | Write it as |
+|---|---|
+| `GLOBAL IN`, `GLOBAL ANY LEFT JOIN` | a plain `IN` / `JOIN` where the data allows |
+| `ASOF JOIN`, `ANY`/`ALL` join modifiers | a join plus a window function |
+| `APPLY(f)` column transformer | name the columns |
+| `EXISTS TABLE t` | `SELECT count() FROM system.tables WHERE name = 't'` |
+| `view(SELECT ...)` table function | a subquery |
+| `EXPLAIN indexes = 1 ...` | plain `EXPLAIN` (nyet's own `nyet explain` covers the rest) |
+
+`FINAL`, `PREWHERE`, `ARRAY JOIN`, `SAMPLE`, `LIMIT ... BY`, `WITH FILL`,
+`WITH TOTALS`, `* EXCEPT (...)`, `* REPLACE (...)` and lambda expressions all
+parse and run.
+
+Two clauses are refused by nyet itself rather than by the parser:
+
+- **`SETTINGS k = v` in a query** — `SET` in a query's clothes, and the
+  statement form has always been `TXN_CONTROL`. Layer 2 agrees: under
+  `readonly = 1` the server refuses every settings clause anyway, so this only
+  turns an exit-7 server error into an exit-5 refusal that names the rule.
+- **`FORMAT x`** — the wire format is nyet's (it asks for `JSONCompact` and
+  parses that). Pick the output shape with `--format` instead. Reason code
+  `WIRE_FORMAT`.
+
+**The guardrail is the best of any engine here.** `EXPLAIN ESTIMATE` reports how
+many rows and marks a query will READ, from part metadata, without touching a
+row — so `mode = "rows"` is the default and the only mode besides `off`
+(ClickHouse publishes no planner cost model at all). It answers for MergeTree
+tables and comes back **empty** for system tables, table functions and anything
+ClickHouse answers from metadata; nyet reports that as *no estimate* with a
+warning, never as zero rows.
+
+The url is the HTTP interface: `http://user@host:8123/db`, or `https://` on
+8443. The scheme decides TLS — there is no `sslmode`-shaped middle ground to
+get subtly wrong — and a plain `http://` url earns an `INSECURE_TRANSPORT`
+warning like everything else below `require`.
+
+### Redis
+
+A Redis connection takes **one Redis command per call**, with `redis-cli`
+quoting:
+
+```sh
+$ nyet query cache 'GET user:1'
+{"v":1,"ok":true,"rows":[{"value":"hello"}],"meta":{"row_count":1,...}}
+
+$ nyet query cache 'HGETALL user:42'
+{"v":1,"ok":true,"rows":[{"field":"name","value":"Ann"},{"field":"email","value":"a@b.c"}],...}
+
+$ nyet query cache 'SCAN 0 MATCH user:* COUNT 100'
+{"v":1,"ok":true,"rows":[{"value":"0"},{"value":["user:42","user:1"]}],...}
+
+$ nyet query cache 'GETEX session:abc EX 60'
+{"v":1,"ok":false,"error":{"code":"NYET","reason":"WRITE_OPERATION",
+  "message":"nyet: the server classifies 'getex' as a write command", ...}}
+```
+
+**The classification comes from the server, not from a list nyet keeps.**
+Before running anything, nyet asks `COMMAND INFO` about the exact command
+(including the subcommand: `object|encoding`, not `object`) and decides from
+the flags. That is one extra round trip and no list to go stale — and the
+server is honest about the cases a hand-written list would have got wrong:
+`GETEX` is flagged `write` *"because it changes the TTL"*, `GETDEL`, `SPOP`,
+`SORT`, `BITFIELD` and `GEORADIUS` are writes while their `_RO` twins are not,
+and an unknown name comes back nil, which fails closed for free.
+
+The rule on top of those flags, in order:
+
+1. **A command the server flags `write` is refused, and nothing overrules it.**
+   Not `allow_functions`, not anything: a read-only tool that can be configured
+   into writing is not a read-only tool.
+2. nyet's own denylist — **the whole scripting family** (`EVAL`, `EVALSHA`,
+   `FCALL`, `SCRIPT`, `FUNCTION`, and the `_RO` variants the server itself
+   calls reads). Lua is opaque to layer 1, which is the same call MongoDB made
+   about `$where`; and Redis runs a script on its single thread without
+   preempting it, so a loop makes the whole server answer BUSY until somebody
+   runs `SCRIPT KILL`.
+3. `admin`, `blocking` and the `@dangerous` ACL category. That last one costs
+   something real — it takes `KEYS` (walks the whole key space on a
+   single-threaded server), `SORT_RO` (whose `BY`/`GET` patterns read keys the
+   command never names) and `INFO` with it.
+4. A command flagged **neither** read nor write (`INFO`, `PING`, `MULTI`,
+   `SUBSCRIBE`, `HELLO`, `COMMAND DOCS`) is refused: nyet was not told what it
+   does.
+
+Rules 2–4 are policy, and `validator.allow_functions` overrules them **by
+name** — for Redis those entries are command names:
+
+```toml
+[connections.cache.validator]
+allow_functions = ["info", "keys"]   # this connection's owner decided
+deny_functions  = ["dump"]           # ...and does not want this one
+```
+
+**The output contract.** Redis has no rows, so the shape of the answer follows
+the shape of the **reply**, and nyet connects with RESP3 to make that possible
+(in RESP2 a `HGETALL` reply and a `LRANGE` reply are the same flat array on the
+wire, and nyet would need the very command table this design avoids):
+
+| RESP3 reply | `columns` | rows |
+|---|---|---|
+| Map (`HGETALL`, `XINFO STREAM`) | `["field", "value"]` | one per entry |
+| Array / Set (`LRANGE`, `SMEMBERS`, `SCAN`) | `["value"]` | one per element |
+| scalar / nil (`GET`, `TTL`, `EXISTS`) | `["value"]` | one |
+
+A nested element keeps its structure in the cell as JSON — `XRANGE` gives one
+row per entry, each holding `["1-1", ["f", "v"]]`. nyet does not know that a
+stream entry is an id plus a field list, so it does not invent columns for one.
+
+**`nyet schema` answers `na`** and says why in the payload, then reports the one
+thing that costs nothing: the per-database key counts `INFO keyspace` already
+publishes.
+
+```sh
+$ nyet schema cache
+{"v":1,"ok":true,"schema":{"tables":[],
+  "na":"Redis has no schema: no tables, no collections, no declared fields. ...",
+  "databases":[{"name":"db0","keys":203,"expires":12}]}, ...}
+```
+
+Describing the contents would mean `SCAN`ning the key space — a scan of
+production for an answer that is still a guess about a naming convention — so
+nyet does not do it on its own initiative. Run it yourself when you want it:
+`nyet query cache "SCAN 0 MATCH prefix:* COUNT 100"`.
+
+**`nyet explain` has nothing to show** (Redis publishes no plan and no estimate
+of any kind) and answers `no_estimate` — while still running layer 1, so it can
+never be the way past the classifier. **`nyet sample` is refused**: there is no
+table to draw rows from, and answering with `RANDOMKEY` would be a different
+command wearing this one's name.
+
+**What Redis does not have, said plainly:** no layer 2. `nyet doctor` reports
+`read_only_session: na` rather than leaving its absence unmentioned, and the
+`--limit` truncation here is CLIENT side and late — `LRANGE k 0 -1` on a
+ten-million-element list transfers ten million elements before nyet counts
+them. See [SECURITY.md](SECURITY.md).
+
 ### nyet schema
 
 ```sh
@@ -1526,8 +1812,19 @@ Per engine:
 |---|---|---|---|
 | PostgreSQL | `cost`, `rows`, `off` | `cost` | `max_cost = 1000000.0` (`max_rows = 10000000`) |
 | MySQL/MariaDB | `rows`, `off` | `rows` | `max_rows = 10000000` |
+| ClickHouse | `rows`, `off` | `rows` | `max_rows = 10000000` |
 | SQLite | `off` only | `off` | — |
 | MongoDB | `off` only | `off` | — |
+| Redis | `off` only | `off` | — |
+
+ClickHouse's number comes from `EXPLAIN ESTIMATE`, which reads part and mark
+metadata rather than planning — the cheapest true estimate of the five. It
+answers for MergeTree tables only: system tables, table functions and anything
+the server answers from metadata (`SELECT count()`) come back empty, and nyet
+reports *no estimate* with a warning rather than a comfortable zero. SQLite,
+MongoDB and Redis publish nothing to compare, and `off` is the only mode their
+config accepts — a mode an engine cannot honor is a config error (exit 3), never
+a silent downgrade.
 
 ```toml
 [connections.prod.guardrail]
@@ -1710,9 +2007,34 @@ What each check means and what to do about it:
   but a role granted `INSERT`/`UPDATE`/`DELETE` yet not `CREATE` would also read
   `ok` here, so grant your agent's role **only `SELECT`** (the recipes above), not
   "everything except CREATE".
+  On **MongoDB** and **Redis** no probe write is made where the server will
+  simply say: MongoDB publishes the connection's whole privilege list, and Redis
+  publishes the account's ACL rules (`ACL WHOAMI` + `ACL GETUSER`). Redis has a
+  twist worth knowing — the *recommended* account cannot read its own ACL
+  (`ACL` lives in `@admin`), and reporting "could not verify" for exactly the
+  setup nyet asks for would make the check useless. So it falls back to one
+  write: `SET <unique> 1 EX 1 NX`, which cannot overwrite anything (`NX`) and
+  expires by itself in a second (`EX 1`) even if the cleanup `DEL` is refused.
+  A `NOPERM` (or a replica's `READONLY`) reads as proof; anything else is
+  `warn`.
+- **read_only_session** (Redis only) — `na`, always, and that is the point.
+  Every other engine has a layer 2: a read-only transaction, a file opened
+  `mode=ro`, `readonly = 1`. Redis has none, and saying nothing would let that
+  absence pass unmentioned. The check names what carries the weight instead
+  (layer 1 asking the server about each command, plus the ACL).
+- **readonly_setting** (ClickHouse only) — the `readonly` value the ACCOUNT's
+  own profile carries, which on this engine is layer 3 for the same knob nyet
+  uses as layer 2. `1` → `ok`. `2` → `warn`, and the wording matters: it refuses
+  writes so it *looks* read-only, while letting a client raise its own limits
+  and stopping the server from treating table functions as writes — and nyet
+  cannot tighten it per request either (measured: an account already in readonly
+  mode may not have `readonly` lowered to 1). `0` → `warn`: nothing but the
+  grants stands between a direct client and a write.
 - **not_superuser** — is the role a superuser / all-privileges account (which
   bypasses every read-only layer)? Superuser → `fail`. Fix: use a dedicated
-  `NOSUPERUSER` role with only the `SELECT` grants the agent needs.
+  `NOSUPERUSER` role with only the `SELECT` grants the agent needs. On
+  ClickHouse that means no `GRANT ALL ON *.*` and no `ACCESS MANAGEMENT`; on
+  Redis, no `+@all` and no `+@admin`.
 - **pii_columns** (only with a `[pii]` section) — do the columns marked in
   `[connections.X.pii]` actually sit
   behind a database boundary? Doctor asks the server whether this role may read
@@ -1849,17 +2171,19 @@ to do:
 |---|---|
 | `PARSE_FAILED` | the query could not be parsed — anything not understood is denied (fail closed) |
 | `MULTI_STATEMENT` | more than one statement in a single query |
-| `WRITE_OPERATION` | not a read statement (DML/DDL/PRAGMA/ATTACH/...), anywhere in the query: top level, CTE bodies (`WITH x AS (DELETE ...)`), derived tables (`SELECT * FROM (DELETE ...)`), subqueries, `SELECT INTO`, `EXPLAIN <write>`. On MongoDB: a writing method (`insertOne`, `updateMany`, `drop`, ...) and the `$out`/`$merge` stages **in every position**, nested pipelines (`$lookup`, `$unionWith`, `$facet`) included |
-| `TXN_CONTROL` | transaction or session control (BEGIN/COMMIT/ROLLBACK/SET) |
+| `WRITE_OPERATION` | not a read statement (DML/DDL/PRAGMA/ATTACH/...), anywhere in the query: top level, CTE bodies (`WITH x AS (DELETE ...)`), derived tables (`SELECT * FROM (DELETE ...)`), subqueries, `SELECT INTO`, `EXPLAIN <write>`. On MongoDB: a writing method (`insertOne`, `updateMany`, `drop`, ...) and the `$out`/`$merge` stages **in every position**, nested pipelines (`$lookup`, `$unionWith`, `$facet`) included. On Redis: the server flags the command `write` (`SET`, `GETEX`, `SPOP`, `SORT`, ...) — or flags it neither way (`INFO`, `SUBSCRIBE`, `MULTI`), or does not know it at all, in which case nyet was not told what it does and refuses |
+| `TXN_CONTROL` | transaction or session control (BEGIN/COMMIT/ROLLBACK/SET). On ClickHouse also a per-query `SETTINGS k = v` clause — `SET` in a query's clothes, which the server refuses under `readonly = 1` anyway |
+| `WIRE_FORMAT` | (ClickHouse) a `FORMAT x` clause: the wire format of the reply is nyet's (it asks for `JSONCompact` and parses that). Pick the output shape with `--format` |
 | `LOCKING_CLAUSE` | `SELECT ... FOR UPDATE` / `FOR SHARE` — takes row locks, not a plain read |
 | `DENIED_FUNCTION` | a function on the denylist for this connection (the message names it). On MongoDB: anything that runs server-side JavaScript — `$where`, `$function`, `$accumulator`, `mapReduce`, a `$code` BSON value — none of which is ever allowlisted |
 | `EXPLAIN_ANALYZE` | `EXPLAIN ANALYZE ...` (or PostgreSQL's `EXPLAIN (ANALYZE, ...)`) — it *runs* the statement it claims to explain, so it is an execution wearing a plan's clothes; use `nyet explain` for a plan, a plain `EXPLAIN` is fine as a query |
 | `EXPENSIVE_QUERY` | the query plan's estimate is above this connection's guardrail limit, so the query was not executed — the envelope carries the plan. Also used when *planning itself* outran the guardrail's budget (then there is no plan to carry): see the auto-guardrail section |
 | `EXECUTABLE_COMMENT` | a MySQL/MariaDB executable comment or optimizer hint (`/*! … */`, `/*M! … */`, `/*+ … */`) — the server runs its body but a SQL parser drops it, so nyet cannot see what it does; remove the comment |
 | `PII_COLUMN` | the query could expose a column this connection's `[pii]` policy protects — named directly, wrapped in an expression, swept up by `*`, used as a filter, or resolved from the result's provenance. See "PII columns" |
-| `DENIED_COMMAND` | (MongoDB) the collection method is not on the read allowlist — a write (`insertOne`, `drop`, ...), a database-level command (`db.runCommand`, `db.adminCommand`), a cursor method nyet does not run (`.forEach`, `.count`), or an internal `system.*` catalog. The message names it |
+| `DENIED_COMMAND` | (Redis) the command is on nyet's own denylist — the scripting family (`EVAL`, `EVALSHA`, `FCALL`, `SCRIPT`, `FUNCTION`, `_RO` variants included), or `validator.deny_functions` for this connection — or the server flags it `admin`, `blocking` or `@dangerous` (`KEYS`, `SORT_RO`, `CONFIG GET`, `XREAD BLOCK`). Everything but the first case is overrulable with `validator.allow_functions`. (MongoDB) the collection method is not on the read allowlist — a write (`insertOne`, `drop`, ...), a database-level command (`db.runCommand`, `db.adminCommand`), a cursor method nyet does not run (`.forEach`, `.count`), or an internal `system.*` catalog. The message names it |
 | `DENIED_OPERATOR` | (MongoDB) a `$`-prefixed key — pipeline stage, query operator, aggregation expression or accumulator — that is not on the read allowlist, at any nesting depth. Everything nyet has not reviewed is refused by default, including operators a newer MongoDB adds, undocumented `$_internal*` stages, Atlas-only `$search`/`$vectorSearch`, cluster introspection (`$currentOp`, `$collStats`, `$planCacheStats`) and the options nyet sets itself |
 | `PII_UNPROVABLE` | the database would not state where a result column came from, on a connection with a PII policy — an undetermined origin is refused rather than guessed |
+| `UNCLASSIFIED` | (Redis) nyet could not ASK the server what the command does — the account may not run `COMMAND INFO`, which is where the whole Redis classification comes from, so everything fails closed. **This is the one Redis refusal a rewrite cannot fix**: the `hint` prints the ACL line to grant (`+command|info`), and only the person who owns the ACL can |
 | `INTERNAL_ERROR` | nyet's own validator crashed while checking the query (or the result it came back with) — a bug in nyet, not in your SQL. The crash is caught and turned into this refusal, so a bug cannot become an unchecked query or an unchecked result: no result is returned either way. Please report it with the statement that triggered it |
 
 PRAGMA is refused with a pointer instead of a dead end: schema questions
@@ -1946,6 +2270,28 @@ lists (per engine; rationale in [docs/DEV.md](docs/DEV.md)):
     Measured: it sets `statement_timeout = 0` for the session, but does **not**
     rescue the running query (the timer is already armed).
 
+- **ClickHouse:** the shortest list of the four, because `readonly = 1` already
+  refuses table functions outright (measured — see the ClickHouse section). What
+  is on it is what got **past** layer 2 when measured on 24.8 — `cluster()` and
+  `clusterAllReplicas()` (they dial every node of a named cluster with the
+  server's inter-server credentials and RETURNED ROWS), `sqlite()` and the
+  scalar `file()` (both reached ClickHouse's `user_files` path check, not the
+  readonly one), the `dictGet*` prefix family and `dictHas`/`dictIsIn` (a cold
+  dictionary may be `SOURCE(HTTP(...))` or `SOURCE(EXECUTABLE(...))`, so
+  resolving one reaches outside), `sleep`/`sleepEachRow` (the `pg_sleep` class),
+  `catboostEvaluate` (runs a model out of process) and `mergeTreeIndex` (exposes
+  a part's index granules — column values without naming a column) — plus, on
+  class, the egress family `url`/`file`/`s3`/`gcs`/`azureBlobStorage`/`hdfs`/
+  `iceberg`/`deltaLake`/`hudi`/`remote`/`remoteSecure`/`executable`/`mysql`/
+  `postgresql`/`mongodb`/`redis`/`jdbc`/`odbc` and the introspection functions
+  (`addressToLine`, `demangle`, which are barred by
+  `allow_introspection_functions = 0` — a *setting*, not readonly). Deliberately
+  NOT on it, and allowed where layer 2 permits them: `numbers`, `values`,
+  `null`, `view`, `generateRandom`, `merge`, `format`, `input`, `loop`.
+- **Redis** has no function denylist — the config keys are there and they name
+  **commands** instead. See the Redis section: the classification comes from
+  `COMMAND INFO`, and nyet's own list is the scripting family alone.
+
 Matching is case-insensitive and is done on the **terminal** name component, so
 qualified targets (`pg_catalog.pg_sleep`, `main.load_extension`) and table-valued
 calls (`SELECT * FROM dblink(...)`) are caught, but a column or table merely
@@ -1970,9 +2316,10 @@ runs with the database user's privileges even in a read-only session.
 
 `warnings[].code` is a closed list: `TRUNCATED` (row limit cut the result),
 `GUARDRAIL_SKIPPED` (the plan carried no estimate the guardrail could use — a
-recursive CTE, an unreadable plan shape, or an EXPLAIN the server refused — so
-the query was not checked against the limit; it ran anyway, bounded by the
-timeout and row limit), `NO_PLAN` (`nyet explain` was given a metadata statement,
+recursive CTE, an unreadable plan shape, an EXPLAIN the server refused, a
+ClickHouse `EXPLAIN ESTIMATE` that answered for nothing, or an engine that
+publishes no plan at all (Redis) — so the query was not checked against the
+limit; it ran anyway, bounded by the timeout and row limit), `NO_PLAN` (`nyet explain` was given a metadata statement,
 which has no plan),
 `DUPLICATE_COLUMNS` (json rows would collapse same-named keys),
 `UNICODE_STRIPPED` (invisible characters removed from the query),
@@ -1992,7 +2339,10 @@ rows are the first ones the database returned rather than a sample — see
 The full allow/deny specification is the public test corpus in
 [`tests/corpus/`](tests/corpus/): every validator rule exists there as at
 least one allow and one deny case, and every known bypass is pinned as a
-corpus case first, then fixed.
+corpus case first, then fixed. MongoDB's lives in `tests/corpus/mongo/` and
+Redis's in `tests/corpus/redis/` — the Redis cases each carry the `flags:` a
+live `redis:7.4` reported for that command, because the classification is the
+SERVER's and a corpus that runs without one has to bring the answer with it.
 
 ## Audit log
 
@@ -2095,6 +2445,11 @@ see [Audit log](#audit-log)), `NYET` (with `reason`, see above),
 Warning codes: `TRUNCATED`, `DUPLICATE_COLUMNS`, `UNICODE_STRIPPED`,
 `INSECURE_TRANSPORT`, `SCHEMA_TRUNCATED`, `SCHEMA_SAMPLED`,
 `GUARDRAIL_SKIPPED`, `NO_PLAN`, `SAMPLE_FALLBACK`, `PII_MASKED`.
+
+`nyet schema` carries a `schema` object: `tables` always, plus `na` (a string
+saying why there is no schema to show) and `databases` on an engine that has
+none — Redis fills both, and `tables: []` on its own would read as "an empty
+database", which is a different and wrong statement.
 
 `nyet doctor` carries a `checks` array instead — one object per diagnostic
 (`{name, status, message, hint?}`) — and always `ok: true` (it ran; the verdicts

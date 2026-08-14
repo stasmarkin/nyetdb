@@ -18,15 +18,46 @@ name = "nyet"
 path = "src/main.rs"
 
 [dependencies]
+bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 clap = { version = "4.6.4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+http-body-util = "0.1.4"
+# ClickHouse speaks HTTP, and sqlx does not speak ClickHouse. The official
+# `clickhouse` crate is built around `#[derive(Row)]` + RowBinary — typed
+# structs, where nyet needs whatever columns the agent's query produced — so it
+# would have to be driven through `fetch_bytes` anyway. hyper straight, asking
+# for `FORMAT JSONCompact`, hands back names, types and rows in one shot.
+# `webpki-roots` matches the trust store sqlx is already built with
+# (`tls-rustls-ring-webpki`), so nyet has ONE set of roots, not two.
+hyper = { version = "1.11.0", default-features = false, features = ["client", "http1"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+# Named only to install the crypto provider explicitly. sqlx installs one
+# lazily on its first TLS connection, and hyper-rustls PANICS if none is
+# installed by the time it builds a connector — a ClickHouse-only process never
+# opens an sqlx connection, so nyet must not depend on that ordering.
+rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
 mongodb = "3.8"
+# Redis/Valkey. `default-features = false` drops `acl`, `geospatial`, `script`,
+# `streams` and `num-bigint`: nyet sends commands through the low-level `cmd()`
+# and reads back a raw `Value`, so the typed helpers those features add are
+# code nyet would never call — and `script` in particular builds an EVAL
+# helper for a family layer 1 refuses outright (see src/redis.rs).
+# `tls-rustls-webpki-roots` rather than the native store, to match sqlx and
+# hyper — one set of trust roots is actually USED. (redis-rs's `tls-rustls`
+# feature pulls `rustls-native-certs` into the tree either way; the
+# webpki-roots feature is what decides which store the client loads.)
+redis = { version = "1.5.0", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
 sqlparser = { version = "0.62", default-features = false, features = ["std", "visitor"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite-bundled", "postgres", "mysql", "bigdecimal", "uuid", "chrono", "json"] }
 tokio = { version = "1.53", default-features = false, features = ["rt", "time", "net"] }
 toml = "1.1.3"
+# Already in the release tree (mongodb -> hickory-resolver), so naming it here
+# costs nothing and keeps the ClickHouse url off a hand-rolled parser — a
+# userinfo/host/port split written by hand is a security-relevant class of bug.
+url = "2.5.8"
 unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 
 # Keychain, macOS only. The native API is not a convenience here: the item's
@@ -44,6 +75,9 @@ security-framework = "3.7"
 proptest = { version = "1.11.0", default-features = false, features = ["std", "bit-set"] }
 tempfile = "3.27.0"
 testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb", "mongo"] }
+# (The ClickHouse and Redis stands use `GenericImage` — testcontainers-modules
+# has no module for either — and seed themselves through the same client the
+# engine uses, the way the PostgreSQL stand uses sqlx.)
 # The PostgreSQL tests build a multi-thread runtime (testcontainers + its async
 # Drop need it); declared explicitly so it does not depend on transitive features.
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread"] }

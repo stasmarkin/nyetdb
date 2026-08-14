@@ -304,6 +304,10 @@ fn engine_modes(engine: &str) -> (Mode, &'static [Mode]) {
     match engine {
         "postgres" => (Mode::Cost, &[Mode::Cost, Mode::Rows, Mode::Off]),
         "mysql" | "mariadb" => (Mode::Rows, &[Mode::Rows, Mode::Off]),
+        // `EXPLAIN ESTIMATE` publishes rows and marks a MergeTree query will
+        // READ, from part metadata, without touching a row — the cheapest true
+        // estimate of any engine here. It publishes no cost model at all.
+        "clickhouse" => (Mode::Rows, &[Mode::Rows, Mode::Off]),
         _ => (Mode::Off, &[Mode::Off]),
     }
 }
@@ -316,6 +320,15 @@ fn why_unsupported(engine: &str) -> &'static str {
              row estimates only"
         }
         "sqlite" => "SQLite's EXPLAIN QUERY PLAN carries no cost or row estimates at all",
+        "redis" | "valkey" => {
+            "Redis publishes no query plan and no estimate of any kind — there is nothing to \
+             ask it before running a command"
+        }
+        "clickhouse" => {
+            "ClickHouse publishes no planner cost model; EXPLAIN ESTIMATE gives rows and marks, \
+             and only for MergeTree tables (system tables and table functions come back empty, \
+             which nyet reports as no estimate rather than as zero)"
+        }
         "mongodb" => {
             "MongoDB's explain publishes no cost and no row estimate in queryPlanner mode, \
              and its executionStats mode RUNS the query — which is the one thing a guardrail \

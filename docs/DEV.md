@@ -237,6 +237,12 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 │                                 bson + serde_json + output. Split off so the
 │                                 security boundary above stays about the
 │                                 boundary (Д4)
+├─ redis     (src/redis.rs)     — pure: (command line, server Flags) -> () |
+│                                 Refusal; the Redis layer 1. The tokenizer is
+│                                 nyet's; the CLASSIFICATION is the server's
+│                                 (`COMMAND INFO`), so the pure half takes the
+│                                 flags as an argument and the engine fetches
+│                                 them. std only
 ├─ validator (src/validator.rs) — pure: (SQL text, Policy) -> Allow{sql,warnings} |
 │                                 Deny{reason,message,hint}; also owns the PII
 │                                 policy (PiiRules + PiiMode) and the
@@ -252,6 +258,15 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 ├─ engine    (src/engine.rs)    — IO adapters behind trait Engine; knows sqlx,
 │                                 nothing about clap; fills in output's pure
 │                                 schema/estimate models (leaf->leaf edges)
+│  ├─ clickhouse (src/engine/clickhouse.rs) — ClickHouse over its HTTP
+│  │                               interface (hyper + JSONCompact). Its own file
+│  │                               because it shares no driver with the sqlx
+│  │                               three: layer 2 is a query PARAMETER
+│  │                               (`readonly=1`) and there is no session at all
+│  └─ redis  (src/engine/redis.rs) — Redis over redis-rs's low-level `cmd()`,
+│                                    RESP3. Owns the reply -> columns/rows
+│                                    shaping and the `COMMAND INFO` lookup that
+│                                    feeds `redis::check`
 ├─ tunnel    (src/tunnel.rs)    — SSH tunnels: pure ssh-command building +
 │                                 host parsing; the shell-out to system `ssh`
 │                                 is the only IO. std only (net/process), no
@@ -2248,6 +2263,40 @@ Runtime:
   per-crate exception — a future CC0 dependency must be its own decision. The
   driver is a big tree (hickory-dns for SRV, its own connection pool); that
   weight was accepted consciously when the engine was scoped.
+- `redis` (no default features; `tokio-comp`, `tokio-rustls-comp`,
+  `tls-rustls-webpki-roots`) — the Redis/Valkey driver. `default-features =
+  false` drops `acl`, `geospatial`, `script`, `streams` and `num-bigint`: nyet
+  sends everything through the low-level `cmd()` and reads back a raw `Value`,
+  so the typed helpers those features add are code nyet would never call — and
+  `script` in particular builds an `EVAL` helper for a family layer 1 refuses
+  outright. Justification (Д8): RESP3 is not a line format to hand-roll (typed
+  Map/Set/Double/VerbatimString/Push framing, `HELLO 3` negotiation, inline
+  commands, TLS), and RESP3 is precisely what makes the output contract possible
+  — in RESP2 a `HGETALL` reply and a `LRANGE` reply are the same flat array and
+  nyet would need a table of which command returns a map, the very list this
+  engine exists to avoid. `webpki-roots` rather than the native store, to match
+  sqlx and hyper: ONE set of trust roots in the binary, not three.
+- `hyper` + `hyper-util` (client-legacy) + `hyper-rustls` + `http-body-util` +
+  `bytes` — the ClickHouse transport, which is HTTP. sqlx does not speak
+  ClickHouse, and the official `clickhouse` crate is built around
+  `#[derive(Row)]` + RowBinary — typed structs, where nyet needs whatever
+  columns the agent's query produced — so it would have to be driven through
+  `fetch_bytes` and parsed here anyway, for the same hyper tree plus lz4 plus a
+  layer of abstraction over nyet's own code. hyper straight, asking for
+  `FORMAT JSONCompact`, hands back names, types and rows in one shot. All five
+  crates were already in `Cargo.lock` (dev-side, via testcontainers → bollard),
+  so `cargo deny` had already vetted their licenses; what is new is that they
+  now reach the RELEASE binary.
+- `rustls` (no default features, `ring`) — named only to install the crypto
+  provider explicitly. sqlx installs one lazily on its first TLS connection, and
+  `hyper-rustls` PANICS if none is installed by the time it builds a connector —
+  a ClickHouse-only process never opens an sqlx connection, so nyet must not
+  depend on that ordering.
+- `url` — the ClickHouse and Redis url handling (scheme/userinfo/host/port/path,
+  and the host+port rewrite the SSH tunnel needs). Already in the release tree
+  via `mongodb` → `hickory-resolver`, so naming it costs nothing; a
+  userinfo/host/port split written by hand is a security-relevant class of bug,
+  and the alternative to this crate is not "30 lines".
 - `tokio` (rt, time, net) — sqlx requires an async runtime; `time` gives the query
   timeout, `net` the Postgres TCP connection. The per-query runtime uses
   `enable_all` (io + time). Single-threaded, built per query.
@@ -2267,7 +2316,14 @@ Dev:
   (licenses/advisories/bans/sources) as of this step. The SSH tunnel stand
   (`tests/ssh.rs`) reuses this crate's re-exported `testcontainers` (`GenericImage`,
   networks, `container.exec`) for the `linuxserver/openssh-server` bastion — no
-  new dependency.
+  new dependency. `tests/clickhouse.rs` and `tests/redis.rs` do the same
+  (`testcontainers-modules` has no module for either) and seed themselves
+  through the same client the engine uses, the way the PostgreSQL stand uses
+  sqlx. Neither image publishes a readiness line nyet can wait on — ClickHouse
+  logs to a FILE inside the container, and Redis's log line appears before the
+  published port accepts (measured: a bare connect right after `start()` gets
+  ECONNREFUSED about half the time) — so both poll the real interface instead of
+  matching a banner.
 
 ## Tests
 
@@ -3019,14 +3075,16 @@ Rules: one case per `- query:` line (single-line queries only — semicolons
 are fine, block scalars are not supported); `verdict` is `allow` or `deny`;
 `deny` requires `reason` (one of `PARSE_FAILED`, `MULTI_STATEMENT`,
 `WRITE_OPERATION`, `TXN_CONTROL`, `LOCKING_CLAUSE`, `DENIED_FUNCTION`,
-`EXECUTABLE_COMMENT`, `EXPLAIN_ANALYZE`, `PII_COLUMN`, `PII_UNPROVABLE`);
+`EXECUTABLE_COMMENT`, `EXPLAIN_ANALYZE`, `WIRE_FORMAT`, `PII_COLUMN`,
+`PII_UNPROVABLE`);
 optional `warnings` on an allow case is the comma-joined list of expected
 warning codes (currently only `UNICODE_STRIPPED`) — allow cases without it
 must produce none, deny cases never carry warnings; optional `dialect`
 defaults from the **filename prefix** — `postgres_*.yaml` runs the PostgreSQL
 dialect + `Policy::postgres`, `mysql_*.yaml` the MySQL dialect + `Policy::mysql`
-(MariaDB is dialect-identical), everything else SQLite + `Policy::sqlite` — and a
-per-case `dialect: postgres|mysql|sqlite` still overrides. A `pii:` line placed
+(MariaDB is dialect-identical), `clickhouse_*.yaml` the ClickHouse dialect +
+`Policy::clickhouse`, everything else SQLite + `Policy::sqlite` — and a per-case
+`dialect: postgres|mysql|sqlite|clickhouse` still overrides. A `pii:` line placed
 BEFORE the first `- query:` sets the file-wide PII policy (comma-separated
 `table.column` rules, exactly what `[connections.X.pii] columns` holds), and a
 per-case `pii:` overrides it — `pii: none` turns it off for one case, so a file
@@ -3047,6 +3105,180 @@ tool that shows them.
 corpus as a failing deny case (this documents it publicly and proves the
 gap), then fix the validator until the corpus is green. Never the other
 way around — a fix without a corpus case does not exist.
+
+### The MongoDB and Redis corpora (subdirectories)
+
+`tests/corpus/mongo/` and `tests/corpus/redis/` are SUBdirectories on purpose:
+the SQL runner globs `tests/corpus/*.yaml`, and neither mongosh text nor a Redis
+command line has any business reaching sqlparser. Each has its own runner in its
+own module's tests, and the same tiny format.
+
+The Redis corpus carries one key the others do not: **`flags:`**, the four
+properties `COMMAND INFO` reported for that command on a live `redis:7.4`
+(`readonly`, `write`, `admin`, `blocking`, `dangerous`, or the two special
+values `none` and `unknown` — the latter being the nil the server returns for a
+name it does not have). That is not a design smell, it is the honest
+consequence of where the classification lives: Redis's comes from the SERVER, so
+a corpus that runs without one has to bring the answer with it. What is under
+test is the RULE — the part nyet owns — and `tests/redis.rs` is what pins that
+a live server still says what the corpus claims. A case with no `flags:` line
+fails the run loudly rather than defaulting to something.
+
+Two more optional keys, per case: `allow_functions:` and `deny_functions:`
+(comma-separated command names), which is how the corpus pins both directions of
+`validator.allow_functions` — including the one thing it must NOT reach, a
+command the server flags `write`.
+
+## Function denylist rationale (ClickHouse)
+
+The shortest of the four, and the only one where **layer 2 already covers most
+of the class**. Measured on `clickhouse-server:24.8-alpine` (W9, August 2026):
+`readonly = 1` — which `engine::Clickhouse` puts on every request — refuses
+writes, refuses every settings change, and refuses `url`, `file`, `s3`,
+`remote`, `executable`, `mysql`, `postgresql`, `mongodb`, `hdfs`,
+`azureBlobStorage`, `merge`, `input`, `format`, `loop`, `dictionary` and `zeros`
+with `Code: 164 READONLY`. A table function is simply not a read to ClickHouse.
+
+So every entry says which of two things it is, in `src/validator.rs`:
+
+**Measured past layer 2** — it ran, or reached its own argument validation,
+inside `readonly = 1`. These are the real findings:
+
+- `cluster` / `clusterallreplicas` — **returned rows**. They open connections to
+  every node of a named cluster with the server's inter-server credentials: the
+  `dblink` class, and the sharpest finding of the pass.
+- `sqlite` — reached SQLite's own "must be inside `user_files`" check, not the
+  readonly check. A `.sqlite` file dropped into that directory is then readable
+  through a read-only ClickHouse.
+- `viewifpermitted` — reached its argument validation. It picks between a SELECT
+  and a fallback TABLE FUNCTION by privilege, at runtime.
+- the `dictget` prefix family plus `dicthas` / `dictisin` — reached the
+  dictionary lookup itself. A dictionary may be `SOURCE(HTTP(...))` or
+  `SOURCE(EXECUTABLE(...))`, so the first `dictGet` on a cold one is an outbound
+  request or a spawned process.
+- `sleep` / `sleepeachrow` — **ran**. The `pg_sleep` class, and `sleepEachRow`
+  multiplies by the row count.
+- the SCALAR `file()` — reached the `user_files` path check, not readonly. One
+  entry covers it and the table function of the same name.
+- `catboostevaluate` — reached its argument-count check. It evaluates a model
+  through the library-bridge, i.e. out of process.
+- `mergetreeindex` — **ran**, and publishes a part's primary-index granules: the
+  index columns' VALUES without naming a column. The `pg_stats` class.
+
+**Denied on class** — layer 2 refused it here, and it is denied anyway, because
+layer 2 is a setting nyet asks the server for rather than a property of the
+server (an account at `readonly = 2` runs without it entirely — see
+`engine::Clickhouse::post`). Everything that reaches outside the machine or runs
+code: `url`/`urlcluster`, `s3`/`s3cluster`, `gcs`/`gcscluster`,
+`azureblobstorage`(`cluster`), `hdfs`(`cluster`), `iceberg*`, `deltalake*`,
+`hudi*`, `remote`/`remotesecure`, `executable`/`executablepool`, the foreign
+databases `mysql`/`postgresql`/`mongodb`/`redis`/`jdbc`/`odbc`, and the
+introspection functions `addresstoline`/`addresstosymbol`/`demangle` (barred by
+`allow_introspection_functions = 0`, which is a SETTING the server owner may
+have flipped, not readonly).
+
+**Deliberately absent**, and allowed wherever layer 2 permits them: `numbers`,
+`values`, `null`, `view`, `generaterandom`, `fuzzjson`, `merge`, `format`,
+`input`, `loop`. They are local generators or local reads — no egress, no code —
+and a denylist that ate them would push people to hand whole families back with
+`allow_functions`.
+
+Two ClickHouse-only clauses are refused by the walker rather than by the
+denylist: a per-query `SETTINGS k = v` (`TXN_CONTROL` — `SET` in a query's
+clothes, and layer 2 refuses every settings clause under `readonly = 1` anyway)
+and `FORMAT x` (`WIRE_FORMAT` — the reply's wire format is nyet's, which asks
+for `JSONCompact` and parses that).
+
+`CLICKHOUSE_VALUE_SAMPLING_CATALOGS` is this engine's `pg_stats`, and it is a
+different shape: no ClickHouse system table publishes sampled column values
+(checked — `system.parts_columns` has sizes and dates, never a cell). What it
+has instead is the **query log**, which keeps the query TEXT — so somebody
+else's `WHERE email = 'a@b.c'` is the protected cell quoted verbatim. Hence
+`query_log`, `query_thread_log`, `query_views_log`, `asynchronous_insert_log`,
+`opentelemetry_span_log`, `text_log` and `processes`, denied wholesale on any
+connection with a `[pii]` policy.
+
+## Command denylist rationale (Redis)
+
+Redis is the one engine with **no list of its own worth speaking of**, because
+the server publishes the classification: `COMMAND INFO <name>` returns the
+flags (`readonly`, `write`, `admin`, `blocking`) and the ACL categories
+(`@read`, `@write`, `@dangerous`, …), and `engine::Redis::flags` asks about the
+exact name that is going to run — including the subcommand (`object|encoding`,
+never `object`, which carries no flags at all).
+
+Measured on `redis:7.4` (W8, August 2026), the server is honest about precisely
+the cases a hand-written list would have got wrong:
+
+- `GETEX` is `write`, annotated by Redis itself *"RW and UPDATE because it
+  changes the TTL"*;
+- `GETDEL`, `SPOP`, `SORT`, `BITFIELD`, `GEORADIUS` are `write`, and their `_RO`
+  twins are `readonly`;
+- an unknown name returns nil, which fails closed for free;
+- `SCAN` is `readonly`, and its cursor is **not** server state — a cursor taken
+  on one connection continued correctly on another, so the ROADMAP's worry about
+  a server-side cursor did not reproduce and there is nothing to clean up.
+
+The rule in `redis::check` is therefore short, and the ORDER of it is the
+design (each step is what the previous one could not decide):
+
+0. **`write` refuses, and nothing overrules it.** This is the hard boundary, and
+   the one place Redis differs from the SQL engines' `allow_functions`: there,
+   the statement allowlist refuses `INSERT` whatever the function list says;
+   here, this rule IS that allowlist. A read-only tool that can be configured
+   into writing is not a read-only tool.
+1. nyet's own `DENIED_COMMANDS`, merged with the connection's
+   `deny_functions`/`allow_functions` — **the scripting family and nothing
+   else**: `eval`, `eval_ro`, `evalsha`, `evalsha_ro`, `fcall`, `fcall_ro`,
+   `function`, `script`. `EVAL_RO` and `FCALL_RO` are flagged `readonly` by the
+   server, so the flag rule alone would let them through. Two reasons they go
+   anyway: the payload is a program in a language layer 1 does not read (the
+   same call MongoDB made about `$where` — a validator for a second language is
+   a second validator to be wrong), and Redis executes a script on the single
+   server thread without preempting it, so a loop makes the server answer BUSY
+   to every other client until somebody runs `SCRIPT KILL`. `EVAL_RO`'s
+   read-only guarantee does nothing about that.
+2. the server did not KNOW the command (nil) — refuse.
+3. `allow_functions` by name — the connection owner overruling steps 4–6.
+4. `admin` — server operation, not data.
+5. `blocking` — a read tool that can be made to wait is a read tool that can be
+   made to hang.
+6. no `readonly` flag — nyet was not told what it does (`INFO`, `PING`, `MULTI`,
+   `SUBSCRIBE`, `HELLO`, `COMMAND DOCS` all look like this).
+7. `@dangerous` — Redis's own category for what is a hazard to the SERVER
+   rather than to the data: `KEYS` (O(N) on a single-threaded process),
+   `SORT_RO` (its `BY`/`GET` patterns read keys the command never names),
+   `INFO`, `CLIENT LIST`.
+
+Steps 4–7 read the flags in the order that TELLS the reader most, not in the
+order the rule is written: "this is administrative" beats "the server would not
+call it a read", though either would refuse.
+
+**`UNCLASSIFIED` is the reason that had to be added, and why.** `COMMAND` is not
+in Redis's `@read` category, so the read-only account nyet itself recommends
+could not run `COMMAND INFO` — and since that call IS the classification, every
+query on it was refused. Three things came out of that: the recipe grants
+`+command|info` (and `+info`, which `nyet schema` reads the key counts with),
+the refusal has its own reason so an agent does not spend its turns rewriting a
+command that was never the problem, and `nyet doctor`'s `read_only_session`
+check FAILS on such an account instead of reporting `na`. That check is the
+right place for it: it exists to say what stands in for the layer 2 Redis does
+not have, and if layer 1 cannot run, nothing does.
+
+This is the third instance of one pattern across W8/W9, and it is worth naming
+because it will happen again: **an engine's recommended hardening breaks the
+tool that recommends it.** ClickHouse's `readonly = 1` account may not set any
+of nyet's own caps; ClickHouse's `readonly = 2` account will not let nyet
+tighten it to 1; Redis's read-only ACL cannot introspect commands. All three
+were found by running the tool as the account the README tells people to
+create, not by reading docs — which is now what the integration tests do first.
+
+`CONTAINERS` (the list of commands that take a subcommand) is **not** a security
+list: a container missing from it falls back to the bare name, whose entry has
+no `readonly` flag, so it fails closed. What a missing entry costs is precision
+— and one readonly subcommand that should have been allowed. `OBJECT ENCODING`
+was refused exactly that way while `config` was missing from the list, which is
+how the bug was found.
 
 ## Function denylist rationale (SQLite)
 
@@ -3281,19 +3513,34 @@ AST node.
 ## Fuzzing (`fuzz/`, `.github/workflows/fuzz.yml`)
 
 `cargo-fuzz` on the one property layer 1 owes for **any** input: it returns a
-verdict, it does not unwind. Two targets, both taking the raw bytes as text:
+verdict, it does not unwind. Four targets, all taking the raw bytes as text:
 
 | target | boundary |
 |---|---|
-| `sql_validate` | `validator::validate`, against all three policies (`sqlite`/`postgres`/`mysql`) on every input |
+| `sql_validate` | `validator::validate`, against all four SQL policies (`sqlite`/`postgres`/`mysql`/`clickhouse`) on every input |
 | `mongo_check` | `mongo::check` |
+| `mongo_pii` | `mongo::check_with_pii` + `mongo::scan_reply` |
+| `redis_check` | `redis::parse` + `redis::check`, over every flag combination |
 
-**The oracle is indirect, and that is the whole trick.** Those boundaries wrap
-themselves in `catch_unwind` (see `INTERNAL_ERROR` in the error-code table), so
-libFuzzer would never see a panic they catch — it comes back as an ordinary
-refusal. Each target therefore panics *itself* when the verdict's reason is
-`INTERNAL_ERROR`. Panics from outside the guarded region (a refusal builder, a
-`Display` impl) still reach libFuzzer the usual way, unchanged.
+**The oracle is indirect for the SQL and MongoDB targets, and that is the whole
+trick.** Those boundaries wrap themselves in `catch_unwind` (see
+`INTERNAL_ERROR` in the error-code table), so libFuzzer would never see a panic
+they catch — it comes back as an ordinary refusal. Each target therefore panics
+*itself* when the verdict's reason is `INTERNAL_ERROR`. Panics from outside the
+guarded region (a refusal builder, a `Display` impl) still reach libFuzzer the
+usual way, unchanged.
+
+`redis_check` is the one direct target: `src/redis.rs` has no `catch_unwind` to
+work around (it is a hand-written tokenizer over `char`s plus a few set
+lookups), so a panic reaches libFuzzer normally. What it hunts is the
+tokenizer — quote state, a `\`-escape at the very end of input, and the
+container split, which does `args.remove(0)` on a command whose subcommand is
+its last token. It runs `check` over all 32 flag combinations per input, twice
+(with and without the command in `allow_functions`), because the classification
+is a handful of branches and running all of them keeps the seed corpus literal
+Redis commands rather than a packed encoding.
+
+Measured (August 2026): `redis_check` 3.07M runs in 241 s, clean.
 
 `check_origins`, the third `catching_panics` boundary, has no target: its input
 is `&[Origin]` + column names, structure a byte stream cannot reach without an
@@ -3302,7 +3549,8 @@ than a parser. The proptest in `src/validator/property.rs` and the corpus cover
 it better than random bytes would.
 
 The seed corpus in `fuzz/seeds/<target>/` is one file per query, extracted from
-the golden corpus (`tests/corpus/*.yaml` and `tests/corpus/mongo/*.yaml`) — it
+the golden corpus (`tests/corpus/*.yaml`, `tests/corpus/mongo/*.yaml` and
+`tests/corpus/redis/*.yaml`) — it
 is committed, and passed to libFuzzer as a **second, read-only** directory, so
 what the fuzzer discovers lands in the gitignored `fuzz/corpus/<target>/`
 instead of growing the repo. `fuzz/sql.dict` is not a grammar, just the tokens

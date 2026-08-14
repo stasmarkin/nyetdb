@@ -40,6 +40,15 @@ allow = ["CDLA-Permissive-2.0"]
 name = "tiny-keccak" # via mongodb
 allow = ["CC0-1.0"]
 
+# Scoped: the xxHash implementation redis-rs uses for its client-side cache key
+# hashing. BSL-1.0 is the Boost Software License — permissive and OSI-approved,
+# with the unusual property that binary redistribution needs no notice at all —
+# but it is rare enough that it stays confined to this one crate rather than
+# joining the global allowlist.
+[[licenses.exceptions]]
+name = "xxhash-rust" # via redis
+allow = ["BSL-1.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

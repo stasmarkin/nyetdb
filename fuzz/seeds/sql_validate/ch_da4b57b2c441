@@ -1,0 +1,1 @@
+SELECT dictGet('d','a',toUInt64(1))

@@ -82,6 +82,16 @@ pub fn mysql(table: &str, rows: u64, random: bool) -> String {
     format!("SELECT * FROM {}{order} LIMIT {rows}", backquote(table))
 }
 
+/// ClickHouse: backtick-quoted like MySQL, `rand()` for the draw. It has a
+/// native `SAMPLE` clause too, and it is deliberately NOT used here — `SAMPLE`
+/// needs the table to have been created with a sampling expression, so on a
+/// table without one it is a syntax error rather than a slower answer, and
+/// `nyet sample` must work on any table the agent names.
+pub fn clickhouse(table: &str, rows: u64, random: bool) -> String {
+    let order = if random { " ORDER BY rand()" } else { "" };
+    format!("SELECT * FROM {}{order} LIMIT {rows}", backquote(table))
+}
+
 /// MongoDB: `$sample` is on the pipeline allowlist and draws without reading
 /// the whole collection, so there is no cheap variant to fall back to. The
 /// collection name is not quoted because mongosh has no quoting for it — a name

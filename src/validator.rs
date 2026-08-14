@@ -13,7 +13,7 @@ use sqlparser::ast::{
     SelectItemQualifiedWildcardKind, SetExpr, Statement, TableAlias, TableFactor,
     TableFunctionArgs, TableWithJoins, UtilityOption, Visit, Visitor,
 };
-use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{ClickHouseDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use std::any::Any;
 use std::borrow::Cow;
@@ -43,6 +43,11 @@ pub enum DenyReason {
     /// The validator itself panicked: a BUG in nyet, reported to the caller as
     /// an ordinary refusal so the query still does not reach the database.
     InternalError,
+    /// ClickHouse `SELECT ... FORMAT x`: the statement picks the WIRE format of
+    /// the reply, which nyet owns (it asks for JSONCompact and parses that).
+    /// Its own reason rather than a borrowed one — "not a read operation" would
+    /// be a lie, and the fix is `--format`, not a rewrite of the SQL.
+    WireFormat,
     /// The result carries a column whose origin the database would not state,
     /// on a connection that protects columns as PII: nyet cannot prove the
     /// value is not protected data, so it refuses (fail closed).
@@ -63,6 +68,7 @@ impl DenyReason {
             DenyReason::InternalError => "INTERNAL_ERROR",
             DenyReason::PiiColumn => "PII_COLUMN",
             DenyReason::PiiUnprovable => "PII_UNPROVABLE",
+            DenyReason::WireFormat => "WIRE_FORMAT",
         }
     }
 }
@@ -107,6 +113,7 @@ enum Dialect {
     Sqlite,
     Postgres,
     Mysql,
+    Clickhouse,
 }
 
 /// Per-engine validation policy: the SQL dialect plus the function denylist
@@ -327,6 +334,23 @@ const MYSQL_VALUE_SAMPLING_CATALOGS: &[&str] = &["column_statistics", "column_st
 /// `sqlite_stat1` holds only row counts, so it is deliberately NOT here.
 const SQLITE_VALUE_SAMPLING_CATALOGS: &[&str] = &["sqlite_stat3", "sqlite_stat4"];
 
+/// ClickHouse has no `pg_stats` equivalent — measured on 24.8, no system table
+/// carries sampled column values (`system.parts_columns` publishes sizes and
+/// dates, never a cell). What it does have is worse in a different way: the
+/// **query log keeps the query TEXT**, and a `WHERE email = 'a@b.c'` written by
+/// somebody else is that cell, quoted verbatim, without this query naming a
+/// single protected column. Same class, same wholesale denial on a connection
+/// with a `[pii]` policy.
+const CLICKHOUSE_VALUE_SAMPLING_CATALOGS: &[&str] = &[
+    "query_log",
+    "query_thread_log",
+    "query_views_log",
+    "asynchronous_insert_log",
+    "opentelemetry_span_log",
+    "text_log",
+    "processes",
+];
+
 /// Where one column of a RESULT SET came from, as the driver reported it on the
 /// wire (net B). Mirrors `sqlx::ColumnOrigin` without depending on sqlx: the
 /// engines translate, this pure module judges.
@@ -474,6 +498,78 @@ fn judge_origins(
                 "nyet: result column '{}' was allowed only because this connection masks \
                  protected columns, but the database did not report it as one of them — so \
                  nyet cannot prove the value it returned is redacted, and nothing was returned",
+                columns.get(*i).map_or("?", String::as_str)
+            ),
+            hint: pii_hint(rules.mode),
+        });
+    }
+    Ok(mask)
+}
+
+/// Net B for an engine that reports **no column provenance at all**
+/// (ClickHouse: its HTTP interface answers with names and types, and nothing
+/// says which table a name came from).
+///
+/// `check_origins` cannot be used there — every column would be `Unknown`, so
+/// every query on a PII connection would refuse, which is a working tool turned
+/// off rather than a boundary. What is left is the one signal ClickHouse does
+/// send: the result column NAMES. A protected name coming back is refused;
+/// under `mask` the columns net A sanctioned are redacted and the rest still
+/// refuse, exactly as in `judge_origins`.
+///
+/// **This is a WEAKER net and the docs say so.** It closes the case net A
+/// cannot see — a view that keeps the column's name (`SELECT email FROM
+/// v_users`, where the rule names `users.email`) — and it does not close a view
+/// that RENAMES the column, because nothing in the reply mentions the original
+/// name. On the SQL engines the driver's provenance closes that; here the
+/// boundary is column-level `GRANT`s (README).
+pub fn check_result_names(
+    rules: &PiiRules,
+    columns: &[String],
+    pii_exempt: &[usize],
+) -> Result<Vec<usize>, Refusal> {
+    catching_panics(|| judge_result_names(rules, columns, pii_exempt))
+        .unwrap_or_else(|detail| Err(internal_error_refusal(&detail)))
+}
+
+fn judge_result_names(
+    rules: &PiiRules,
+    columns: &[String],
+    pii_exempt: &[usize],
+) -> Result<Vec<usize>, Refusal> {
+    let mut mask = Vec::new();
+    if rules.is_empty() {
+        return Ok(mask);
+    }
+    for (i, label) in columns.iter().enumerate() {
+        let lower = label.to_lowercase();
+        if !rules.pairs.iter().any(|(_, c)| *c == lower) {
+            continue;
+        }
+        if rules.mode == PiiMode::Mask && pii_exempt.contains(&i) {
+            mask.push(i);
+            continue;
+        }
+        return Err(Refusal {
+            reason: DenyReason::PiiColumn,
+            message: format!(
+                "nyet: result column '{label}' carries the name of a column this connection's \
+                 PII policy protects — the query reached it indirectly (through a view or a \
+                 renaming layer), so nothing was returned"
+            ),
+            hint: pii_layer_hint(),
+        });
+    }
+    // The same promise `judge_origins` enforces: net A relaxed a column only
+    // because net B was going to redact it, so an exempted column that did not
+    // come back under a protected name refuses rather than being handed over.
+    if let Some(i) = pii_exempt.iter().find(|i| !mask.contains(i)) {
+        return Err(Refusal {
+            reason: DenyReason::PiiUnprovable,
+            message: format!(
+                "nyet: result column '{}' was allowed only because this connection masks \
+                 protected columns, but it did not come back under a protected name — so nyet \
+                 cannot prove the value it returned is redacted, and nothing was returned",
                 columns.get(*i).map_or("?", String::as_str)
             ),
             hint: pii_hint(rules.mode),
@@ -742,6 +838,129 @@ const MYSQL_DENIED_FUNCTIONS: &[&str] = &[
     "masking_dictionary_remove",
 ];
 
+/// Built-in ClickHouse denylist (W9, August 2026). ClickHouse is the one engine
+/// whose layer 2 already covers most of this class: measured on
+/// `clickhouse-server:24.8-alpine`, `readonly=1` refuses `url`, `file`, `s3`,
+/// `remote`, `executable`, `mysql`, `postgresql`, `mongodb`, `hdfs`,
+/// `azureBlobStorage`, `merge`, `input`, `format`, `loop`, `dictionary` and
+/// `zeros` outright (`Code: 164 READONLY`) — a table function is simply not a
+/// read to it. So the list below exists for two reasons and says which applies:
+///
+/// - **MEASURED PAST LAYER 2** — the name ran, or reached its own argument
+///   validation, inside `readonly=1`. Those are the real findings; without this
+///   list nothing stops them.
+/// - **denied on class** — layer 2 refused it here, and it is denied anyway
+///   because layer 2 is a setting nyet asks the server for, not a property of
+///   the server: a name that reaches outside the machine or runs code has no
+///   business being one config line away from working. The refusal is also a
+///   better answer for the agent (NYET/DENIED_FUNCTION, exit 5) than a raw
+///   server error (exit 7).
+///
+/// Names are matched case-insensitively on the terminal component, so
+/// ClickHouse's camelCase spelling (`clusterAllReplicas`) is written lowercase
+/// here. Everything local and harmless is deliberately ABSENT and stays allowed
+/// where layer 2 permits it: `numbers`, `values`, `null`, `view`,
+/// `generateRandom`, `fuzzJSON`, `merge`, `format`, `input`, `loop`.
+const CLICKHOUSE_DENIED_FUNCTIONS: &[&str] = &[
+    // --- MEASURED PAST LAYER 2 -------------------------------------------
+    // `cluster('default', system.one)` and its all-replicas twin RETURNED ROWS
+    // inside readonly=1. They open connections to every node of a named cluster
+    // with the server's own inter-server credentials — the `dblink` class, and
+    // the sharpest finding of this pass, because nothing else stops it.
+    "cluster",
+    "clusterallreplicas",
+    // Reached SQLite's own path check ("must be inside 'user_files'"), not the
+    // readonly check: layer 2 does not see it at all. A `.sqlite` file dropped
+    // into `user_files` is then readable through a read-only ClickHouse.
+    "sqlite",
+    // Reached its argument validation inside readonly=1. It picks between a
+    // SELECT and a FALLBACK table function by privilege — a table function
+    // chosen at runtime is exactly what the denylist must not let past.
+    "viewifpermitted",
+    // The dictionary family reached the dictionary lookup itself ("Dictionary
+    // (`nope`) not found") inside readonly=1 — i.e. it tried. A ClickHouse
+    // dictionary may be defined with `SOURCE(HTTP(...))` or
+    // `SOURCE(EXECUTABLE(...))`, so the first `dictGet` on a cold dictionary is
+    // an outbound request or a spawned process. Prefix-matched below; these are
+    // the members that do not start with `dictget`.
+    "dicthas",
+    "dictisin",
+    // `sleep(0.1)` and `sleepEachRow` RAN inside readonly=1 (measured). The
+    // pg_sleep/SLEEP class: silent DoS that ties up a server thread, and
+    // sleepEachRow multiplies it by the row count.
+    "sleep",
+    "sleepeachrow",
+    // The SCALAR `file()` (not the table function) reached ClickHouse's own
+    // "File is not inside /var/lib/clickhouse/user_files" check, not the
+    // readonly check — layer 2 does not cover it. Same name as the table
+    // function, one entry covers both.
+    "file",
+    // Reached its argument count check inside readonly=1. It evaluates a model
+    // through the library-bridge, i.e. it runs code out of process.
+    "catboostevaluate",
+    // Exposes a MergeTree part's primary-index granules — with `with_marks`, the
+    // index columns' actual VALUES, without naming a column. The `pg_stats`
+    // class, and it ran inside readonly=1.
+    "mergetreeindex",
+    // --- denied on class ---------------------------------------------------
+    // Egress: each one fetches from, or reaches, something outside this server.
+    // All refused by readonly=1 here (except where noted); denied anyway.
+    "url",
+    "urlcluster",
+    "s3",        // `s3()` with a well-formed URI was refused by layer 2; a malformed
+    "s3cluster", // one reached URI parsing first, so the order is not a guarantee
+    "gcs",       // reached S3 URI parsing inside readonly=1
+    "gcscluster",
+    "azureblobstorage",
+    "azureblobstoragecluster",
+    "hdfs",
+    "hdfscluster",
+    "iceberg",
+    "icebergs3",
+    "icebergazure",
+    "iceberghdfs",
+    "iceberglocal",
+    "icebergcluster",
+    "deltalake",
+    "deltalakes3",
+    "deltalakeazure",
+    "deltalakecluster",
+    "hudi",
+    "hudicluster",
+    "remote",
+    "remotesecure",
+    // Foreign databases: a read-only ClickHouse must not be a proxy into a
+    // database nyet knows nothing about (no validator, no read-only session, no
+    // audit of its own).
+    "mysql",
+    "postgresql",
+    "mongodb",
+    "redis",
+    "jdbc",
+    "odbc",
+    // Runs an arbitrary program on the server and reads its output.
+    "executable",
+    "executablepool", // not present in 24.8 ("Unknown table function"); denied ahead
+    // Introspection functions: blocked by `allow_introspection_functions = 0`
+    // (the default) rather than by readonly, so the barrier is a setting the
+    // server owner may well have flipped. They read the server's own memory
+    // layout, symbols and binary paths.
+    "addresstoline",
+    "addresstolinewithinlines",
+    "addresstosymbol",
+    "demangle",
+];
+
+/// Prefix-matched ClickHouse families — fail closed on members not enumerated
+/// above. `dictget` covers `dictGet`, `dictGetOrDefault`, `dictGetOrNull`,
+/// `dictGetHierarchy`, `dictGetChildren`, `dictGetDescendants` and the ~40
+/// per-type spellings (`dictGetUInt64`, `dictGetString`, ...): every one of them
+/// resolves a dictionary, and resolving a cold dictionary is what reaches out.
+/// Not config-tunable, like PostgreSQL's `dblink`/`pg_read_` families — but
+/// `dictionary()` (the table function) is deliberately NOT here: layer 2 refuses
+/// it, and it names one object rather than triggering a load from an expression.
+const CLICKHOUSE_DENIED_PREFIXES: &[&str] = &["dictget"];
+
 impl Policy {
     /// Effective SQLite policy: built-in list minus `allow_functions` plus
     /// `deny_functions`. Deny wins when a name appears in both (fail closed).
@@ -789,6 +1008,23 @@ impl Policy {
             ),
             denied_prefixes: &[],
             value_sampling_catalogs: MYSQL_VALUE_SAMPLING_CATALOGS,
+            pii: PiiRules::default(),
+        }
+    }
+
+    /// Effective ClickHouse policy. Tuned by config like the rest; the
+    /// `dictget` family is a built-in prefix and stays out of reach of
+    /// `allow_functions` on purpose.
+    pub fn clickhouse(allow_functions: &[String], deny_functions: &[String]) -> Policy {
+        Policy {
+            dialect: Dialect::Clickhouse,
+            denied_functions: merge_denylist(
+                CLICKHOUSE_DENIED_FUNCTIONS,
+                allow_functions,
+                deny_functions,
+            ),
+            denied_prefixes: CLICKHOUSE_DENIED_PREFIXES,
+            value_sampling_catalogs: CLICKHOUSE_VALUE_SAMPLING_CATALOGS,
             pii: PiiRules::default(),
         }
     }
@@ -1118,6 +1354,7 @@ fn classify(sql: &str, policy: &Policy) -> Verdict {
         Dialect::Sqlite => parse_bounded(&SQLiteDialect {}, &sql),
         Dialect::Postgres => parse_bounded(&PostgreSqlDialect {}, &sql),
         Dialect::Mysql => parse_bounded(&MySqlDialect {}, &sql),
+        Dialect::Clickhouse => parse_bounded(&ClickHouseDialect {}, &sql),
     };
     let statements = match parsed {
         Ok(s) => s,
@@ -1830,6 +2067,37 @@ impl Visitor for Checker<'_> {
                 }
             }
         }
+        // ClickHouse `SELECT ... SETTINGS k = v`. Only the ClickHouse dialect
+        // parses these two clauses, so no dialect gate is needed here.
+        //
+        // A per-query SETTINGS clause is `SET` in a query's clothes, and the
+        // statement form is already TXN_CONTROL. Layer 2 agrees for once and
+        // says so first — measured on 24.8, `readonly=1` answers "Cannot modify
+        // 'max_threads' setting in readonly mode" to ANY settings clause,
+        // legitimate ones included. Refusing here turns that exit-7 server error
+        // into an exit-5 refusal that names the rule, and keeps layer 1 from
+        // depending on layer 2 for a knob-turning statement.
+        if query.settings.is_some() {
+            return break_deny(deny(
+                DenyReason::TxnControl,
+                "a per-query SETTINGS clause changes server settings, which nyet does not \
+                 accept"
+                    .to_string(),
+                "drop the SETTINGS clause; nyet opens the session with readonly = 1, and the \
+                 ClickHouse server refuses every settings change under it anyway",
+            ));
+        }
+        // `FORMAT x` picks the WIRE format of the reply. nyet asks for
+        // JSONCompact and parses that; a query that renames the format would
+        // hand back bytes nyet cannot read (or, worse, could half-read).
+        if query.format_clause.is_some() {
+            return break_deny(deny(
+                DenyReason::WireFormat,
+                "a FORMAT clause chooses the wire format of the reply, which nyet owns".to_string(),
+                "drop the FORMAT clause and pick the output shape with nyet's own --format \
+                 (json, jsonl, table, csv)",
+            ));
+        }
         // DESIGN §3 п.6: SELECT ... FOR UPDATE / FOR SHARE takes row locks —
         // not a plain read. (Layer 2 would refuse it too; this error is
         // clearer.)
@@ -2014,6 +2282,33 @@ impl Checker<'_> {
     fn check_joins(&self, from: &[TableWithJoins], local: &PiiScope) -> ControlFlow<Box<Verdict>> {
         for item in from {
             for join in &item.joins {
+                // ClickHouse `ARRAY JOIN expr` — found while writing the W9
+                // corpus, and it is net A's one dialect-specific hole. sqlparser
+                // parks the ARRAY expression in the join's RELATION slot, so
+                // `FROM users ARRAY JOIN email` parses as a table CALLED `email`:
+                // no `Expr` node is produced, `pre_visit_expr` never sees the
+                // name, and the protected column travelled out unflattened. The
+                // OPERATOR is what says the slot holds an expression, so that is
+                // what this reads. Refused in both modes — an ARRAY JOIN is not
+                // a projection net B could redact.
+                if matches!(
+                    join.join_operator,
+                    JoinOperator::ArrayJoin
+                        | JoinOperator::LeftArrayJoin
+                        | JoinOperator::InnerArrayJoin
+                ) {
+                    if let TableFactor::Table {
+                        name, args: None, ..
+                    } = &join.relation
+                    {
+                        if let Some(ident) = terminal_ident(name) {
+                            let lower = ident.value.to_lowercase();
+                            if self.pii.columns.contains(&lower) {
+                                return break_deny(pii_column_deny(&lower, self.policy.pii.mode));
+                            }
+                        }
+                    }
+                }
                 match join_constraint(&join.join_operator) {
                     Some(JoinConstraint::Using(names)) => {
                         for name in names {
@@ -2523,6 +2818,8 @@ mod tests {
             "postgres"
         } else if name.starts_with("mysql") {
             "mysql"
+        } else if name.starts_with("clickhouse") {
+            "clickhouse"
         } else {
             "sqlite"
         };
@@ -2662,6 +2959,7 @@ mod tests {
                     "sqlite" => Policy::sqlite(&[], &[]),
                     "postgres" => Policy::postgres(&[], &[]),
                     "mysql" => Policy::mysql(&[], &[]),
+                    "clickhouse" => Policy::clickhouse(&[], &[]),
                     other => panic!("{at}: unknown dialect {other:?}"),
                 };
                 let verdict = validate(&case.query, &policy.with_pii(pii));

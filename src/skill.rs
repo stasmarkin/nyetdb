@@ -29,7 +29,7 @@ pub enum Connections {
 /// per-user "Your connections" section begins.
 const HEAD: &str = r#"---
 name: nyet
-description: Read-only database access for AI agents. Use nyet to inspect database schemas, sample a table's rows and run safe read-only SQL (SELECT, SHOW, DESCRIBE, EXPLAIN) against the user's configured databases (PostgreSQL, MySQL/MariaDB, SQLite) or read-only mongosh queries against MongoDB. It enforces read-only, keeps credentials behind aliases, and returns compact JSON. Reach for it whenever a task needs to read from a database.
+description: Read-only database access for AI agents. Use nyet to inspect database schemas, sample a table's rows and run safe read-only SQL (SELECT, SHOW, DESCRIBE, EXPLAIN) against the user's configured databases (PostgreSQL, MySQL/MariaDB, SQLite, ClickHouse), read-only mongosh queries against MongoDB, or a single read-only command against Redis/Valkey. It enforces read-only, keeps credentials behind aliases, and returns compact JSON. Reach for it whenever a task needs to read from a database.
 ---
 
 # nyet — read-only database access
@@ -160,6 +160,75 @@ COLLECTION, not an estimate of the query. MongoDB publishes no cost or row
 estimate before execution, so there is none in the answer and no guardrail on
 this engine.
 
+## ClickHouse connections (engine `clickhouse`)
+
+Ordinary SQL, with ClickHouse's own read syntax: `FINAL`, `PREWHERE`,
+`ARRAY JOIN`, `SAMPLE`, `LIMIT n BY`, `WITH FILL`, `WITH TOTALS`,
+`* EXCEPT (...)`, `* REPLACE (...)` and lambdas all work.
+
+Two things are refused that look like ordinary syntax, so read this before
+retrying a variation:
+- a per-query `SETTINGS k = v` clause (`TXN_CONTROL`) — nyet owns the session
+  settings, and the server refuses them under `readonly = 1` anyway;
+- a `FORMAT x` clause (`WIRE_FORMAT`) — pick the output shape with nyet's own
+  `--format` instead.
+
+Not parsed at all, and therefore refused (`PARSE_FAILED`) — rewrite rather than
+retry: `GLOBAL IN`, `GLOBAL ANY LEFT JOIN`, `ASOF JOIN`, `APPLY(f)`,
+`EXISTS TABLE t` (use `SELECT count() FROM system.tables WHERE name = 't'`) and
+the `view(SELECT ...)` table function (use a subquery).
+
+Table functions that reach outside the server (`url`, `file`, `s3`, `remote`,
+`executable`, `cluster`, `mysql`, ...) are refused by nyet AND by the server.
+Local ones (`numbers`, `values`, `generateRandom`) are fine where the server
+allows them.
+
+`nyet explain` here is unusually good: `EXPLAIN ESTIMATE` reports the rows and
+marks a query will READ, from part metadata, without touching a row. It answers
+for MergeTree tables and says nothing for `system.*` tables, table functions or
+anything the server answers from metadata — an absent estimate means "unknown",
+never "zero".
+
+## Redis connections (engine `redis`)
+
+One Redis command per call, quoted the way redis-cli quotes:
+
+    nyet query <alias> 'GET user:1'
+    nyet query <alias> 'HGETALL user:42'
+    nyet query <alias> 'SCAN 0 MATCH user:* COUNT 100'
+    nyet query <alias> 'XRANGE events - +'
+
+The answer's shape follows the REPLY's shape: a hash gives columns
+`field`/`value` (one row per entry), a list/set/array gives one `value` row per
+element, a scalar gives one row. A nested element stays nested inside the cell
+(`XRANGE` gives `["1-1", ["f", "v"]]`) — nyet does not invent columns for it.
+
+**nyet asks the SERVER whether each command is a read** (`COMMAND INFO`), so the
+refusals are the server's own classification and not a list to argue with.
+Notably refused: `GETEX` (Redis calls it a write — it changes the TTL),
+`GETDEL`, `SPOP`, `SORT` (use `SORT_RO`), `BITFIELD` (use `BITFIELD_RO`),
+`GEORADIUS` (use `GEORADIUS_RO`), everything blocking (`BLPOP`, `XREAD BLOCK`),
+everything administrative (`CONFIG`, `DEBUG`, `CLIENT LIST`, `MONITOR`), `KEYS`
+(use `SCAN`), the whole scripting family (`EVAL`, `EVALSHA`, `FCALL`, `SCRIPT`,
+`FUNCTION`, `_RO` variants included), and anything Redis flags neither read nor
+write (`INFO`, `PING`, `MULTI`, `SUBSCRIBE`). If the config owner wants one of
+those back they add it to `validator.allow_functions` — you cannot.
+
+If a Redis query is refused with `UNCLASSIFIED`, do NOT rewrite it: the account
+simply may not run `COMMAND INFO`, so nyet cannot ask the server what anything
+does, and every command on that connection is refused. Stop and tell the human
+to grant `+command|info` (the `hint` prints the exact line).
+
+`nyet schema <alias>` answers `na` here plus the per-database key counts: Redis
+has no schema, and nyet will not SCAN the key space on its own. Walk it
+yourself with `SCAN` when you need to. `nyet sample` and a real `nyet explain`
+do not exist on this engine and say so.
+
+**The row limit is client-side here.** `LRANGE key 0 -1` on a huge list
+transfers the whole list before `--limit` cuts it. Ask for a range
+(`LRANGE key 0 99`), and use `MEMORY USAGE <key>` or `XLEN`/`LLEN`/`HLEN` to
+look before leaping.
+
 ## When nyet refuses (exit 5, "code":"NYET")
 
 nyet runs a single read statement only (SELECT, plus SHOW/DESCRIBE/EXPLAIN).
@@ -182,6 +251,10 @@ flag. Common reasons:
   not on nyet's read allowlist. The allowlist is closed: anything nyet has not
   reviewed is refused, so check `hint` for what IS allowed rather than retrying
   a variation.
+- `DENIED_COMMAND` (Redis) — the command is on nyet's own list (the scripting
+  family) or the server flags it administrative, blocking or `@dangerous`. The
+  `hint` names the read-only twin when there is one.
+- `WIRE_FORMAT` (ClickHouse) — a `FORMAT x` clause; drop it and use `--format`.
 - `DENIED_FUNCTION`, `LOCKING_CLAUSE` (`FOR UPDATE`/`FOR SHARE`),
   `EXPLAIN_ANALYZE`, `TXN_CONTROL`, `EXECUTABLE_COMMENT`, `PARSE_FAILED` — read
   the message and rewrite accordingly.

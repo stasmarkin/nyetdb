@@ -96,6 +96,60 @@ file it privately as above.
   view that `$unset`s the protected fields with a role scoped to it, and `nyet
   doctor` says so.
 
+- **Redis has no layer 2 at all, and this is the engine where that matters
+  most.** Every other engine gives `nyet` something the SERVER enforces for the
+  duration of a query: a read-only transaction, a file opened `mode=ro`,
+  `readonly = 1`. Redis has none — no read-only session, no read-only
+  transaction, no per-connection switch. What stands between an agent and a
+  write is (1) `nyet`'s classifier, which asks the server itself (`COMMAND
+  INFO`) whether each command is a read and refuses everything it is not told
+  is one, and (2) the account's ACL or a replica, which is layer 3. `nyet
+  doctor` reports the missing layer as `read_only_session: na` rather than
+  leaving its absence unmentioned. **Use a read-only ACL account or point the
+  connection at a replica** — on this engine that is not advice, it is the only
+  server-side boundary there is.
+
+  Two further Redis limits, both measured and both accepted:
+
+  - **The row limit is client-side and late.** Redis has no `LIMIT` and no
+    cursor for a command that returns everything, so `LRANGE k 0 -1` on a
+    ten-million-element list transfers all ten million into `nyet`'s process
+    before `--limit` counts them. The limit bounds what the AGENT is handed (and
+    therefore its context window), not what crosses the wire or what `nyet`
+    allocates. This is the SQLite class of problem in a different costume, with
+    the same containment: run the agent under a memory limit. `MEMORY USAGE
+    <key>` is allowed and is the cheap way to look before leaping.
+  - **A `[pii]` policy is refused outright** (a hard config error, exit 3)
+    rather than accepted and quietly ineffective. A rule is `table.column`;
+    Redis has no tables, no columns and no names on the wire, so neither net
+    would have anything to key on. The boundary that does exist is an ACL key
+    pattern (`~public:*`), which the server enforces.
+
+- **On ClickHouse, `nyet`'s own per-request caps are refused by exactly the
+  account it recommends — and `readonly = 2` is a trap.** Two measured facts
+  about how `readonly` works (24.8), neither of them obvious:
+
+  - An account whose profile carries `readonly = 1` may not change **any**
+    setting, and a url parameter IS a settings change. So `nyet`'s
+    `max_execution_time` / `max_result_rows` / `max_block_size` come back
+    `Code: 164` on the hardened account. `nyet` detects that and retries
+    without them; what bounds a query there is the account's own profile plus
+    `nyet`'s in-process deadline and client-side row truncation. Put the limits
+    in the profile if you want them enforced server-side.
+  - An account whose profile carries `readonly = 2` will not let `nyet` lower it
+    to `1` ("Cannot modify 'readonly' setting in readonly mode"), so `nyet`'s
+    own requests run at `2` as well. `2` refuses writes — it looks read-only —
+    but it allows settings changes and the server stops treating table functions
+    (`url`, `file`, `s3`, `remote`, `executable`) as writes. On such an account
+    what covers those is layer 1's denylist alone. `nyet doctor`'s
+    `readonly_setting` check warns about this and does not report `2` as `1`.
+
+  A third, smaller one: ClickHouse's HTTP interface reports **no column
+  provenance**, so `[pii]` net B there compares result column NAMES rather than
+  resolving them to a table. It closes a view that keeps the column's name and
+  cannot close a view that renames it — the boundary for that is a column-level
+  `GRANT`. See "PII on ClickHouse" in the README.
+
 - **On SQLite a query can exhaust the machine's memory, and nothing in `nyet`
   stops it.** SQLite is *in-process*, so the allocation happens inside `nyet`
   itself rather than on a server someone else operates — and SQLite publishes
@@ -121,6 +175,34 @@ file it privately as above.
   user function). `nyet` maintains a per-engine function denylist, but the
   completeness of that list is **not proven**. Report a bypass and it becomes a
   denylist entry plus a corpus test.
+
+  The August 2026 pass over ClickHouse measured this class rather than guessing
+  at it: each candidate was run inside `readonly = 1` on a live 24.8 server, and
+  what got through is what went on the list. `cluster('default', system.one)`
+  and `clusterAllReplicas(...)` **returned rows** — they dial every node of a
+  named cluster with the server's own inter-server credentials, the `dblink`
+  class with nothing else stopping it. `sqlite()` and the scalar `file()`
+  reached ClickHouse's `user_files` path check rather than the readonly check,
+  so a `.sqlite` file or a CSV dropped in that directory is readable through a
+  "read-only" ClickHouse. `dictGet*` reached the dictionary lookup, and a cold
+  dictionary may be `SOURCE(HTTP(...))` or `SOURCE(EXECUTABLE(...))`.
+  `sleep()`/`sleepEachRow()` ran. `mergeTreeIndex()` published a part's index
+  granules — column values without naming a column. The rest of the list
+  (`url`, `s3`, `remote`, `executable`, the foreign-database functions) WAS
+  refused by layer 2 here and is denied anyway, because layer 2 is a setting
+  `nyet` asks the server for, not a property of the server.
+
+  On Redis the same class is answered by the server and not by a list: measured
+  on 7.4, `GETEX` is flagged `write` by Redis itself *"because it changes the
+  TTL"*, and so are `GETDEL`, `SPOP`, `SORT`, `BITFIELD` and `GEORADIUS`, while
+  their `_RO` twins are not. `nyet`'s own Redis denylist is the scripting family
+  alone — `EVAL_RO` and `FCALL_RO` are flagged `readonly` by the server and
+  refused anyway, because the payload is a program in a language layer 1 does
+  not read and because Redis runs a script on its single thread without
+  preempting it (a loop makes the whole server answer BUSY until somebody runs
+  `SCRIPT KILL`). Also checked and NOT confirmed: the `SCAN` cursor is not
+  server state — a cursor taken on one connection continued correctly on
+  another — so there is nothing there for `nyet` to leave behind.
 
 - **The parser is not the server.** `sqlparser` classifies query text; the
   database executes it. Where the two diverge (nested comments, dollar-quoting,
@@ -153,6 +235,24 @@ file it privately as above.
   of how the driver sends queries today, not a promise, and anything that ever
   switches to the simple query protocol (or adds a code path building SQL as
   text for the server to split) loses it silently.
+
+  The ClickHouse dialect was measured the same way (W9, August 2026), and it
+  held: **no write parses as a plain query.** Every write and admin statement is
+  either its own statement kind (`INSERT`, `OPTIMIZE`, `TRUNCATE`, `DROP`,
+  `RENAME`, `CREATE`, `GRANT`, `SET`, `USE`) or fails to parse at all
+  (`ALTER … UPDATE/DELETE`, `SYSTEM`, `KILL`, `DETACH`, `ATTACH`, `BACKUP`,
+  `RESTORE`, `EXCHANGE`), and both outcomes refuse. The price is on the other
+  side: a handful of legitimate READS do not parse either (`GLOBAL IN`,
+  `GLOBAL ANY LEFT JOIN`, `ASOF JOIN`, `APPLY(...)`, `EXISTS TABLE`,
+  `view(SELECT ...)`), and they are refused too — listed in the README with what
+  to write instead. Multi-statement smuggling is refused twice over: `nyet`
+  refuses it, and so does the server ("Multi-statements are not allowed").
+
+  One dialect-specific hole in the PII net was found while writing that corpus
+  and closed: sqlparser parks a ClickHouse `ARRAY JOIN`'s expression in the
+  join's RELATION slot, so `FROM users ARRAY JOIN email` parses as a table
+  *called* `email` and produced no expression node for net A to see. It is now
+  read through the join operator and refused.
 
   Checked in the same pass and found to agree with the server: nested block
   comments (Postgres nests, MySQL does not — the validator is dialect-aware and

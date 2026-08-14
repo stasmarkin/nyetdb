@@ -1,0 +1,99 @@
+# Golden corpus — statements that must be ALLOWED (ClickHouse dialect).
+# Dialect defaults to `clickhouse` from the filename prefix (see docs/DEV.md).
+#
+# This file is half the specification. The other half is what nyet does NOT
+# swallow: a denylist that ate ClickHouse's introspection would push people to
+# hand the whole family back with `allow_functions`, which is worse than not
+# having the list. Every read below is one an analytics agent actually writes.
+
+# --- plain reads ---
+- query: SELECT 1
+  verdict: allow
+- query: SELECT * FROM events LIMIT 10
+  verdict: allow
+- query: SELECT count() FROM events
+  verdict: allow
+- query: SELECT user_id, count() AS n FROM events GROUP BY user_id ORDER BY n DESC LIMIT 20
+  verdict: allow
+- query: WITH recent AS (SELECT * FROM events WHERE ts > now() - INTERVAL 1 DAY) SELECT count() FROM recent
+  verdict: allow
+
+# --- ClickHouse-specific read syntax the validator must not choke on ---
+- query: SELECT * FROM events FINAL LIMIT 10
+  verdict: allow
+- query: SELECT * FROM events FINAL WHERE user_id = 1
+  verdict: allow
+- query: SELECT * FROM events PREWHERE ts > 0 WHERE user_id = 1
+  verdict: allow
+- query: SELECT * FROM events ARRAY JOIN tags
+  verdict: allow
+- query: SELECT * FROM events LEFT ARRAY JOIN tags AS tag
+  verdict: allow
+- query: SELECT * FROM events SAMPLE 0.1
+  verdict: allow
+- query: SELECT * FROM events SAMPLE 1/10 OFFSET 1/2
+  verdict: allow
+- query: SELECT user_id, count() FROM events GROUP BY user_id LIMIT 1 BY user_id
+  verdict: allow
+- query: SELECT ts, count() FROM events GROUP BY ts ORDER BY ts WITH FILL
+  verdict: allow
+- query: SELECT user_id, count() FROM events GROUP BY user_id WITH TOTALS
+  verdict: allow
+- query: SELECT * EXCEPT (secret_note) FROM events
+  verdict: allow
+- query: SELECT * REPLACE (user_id + 1 AS user_id) FROM events
+  verdict: allow
+- query: SELECT arrayMap(x -> x + 1, sizes) FROM events
+  verdict: allow
+- query: SELECT toStartOfHour(ts) AS h, uniqExact(user_id) FROM events GROUP BY h
+  verdict: allow
+- query: SELECT quantilesTDigest(0.5, 0.9)(latency_ms) FROM events
+  verdict: allow
+- query: SELECT * FROM events AS e INNER JOIN users AS u USING (user_id)
+  verdict: allow
+
+# --- introspection: the reason a denylist must stay narrow ---
+- query: DESCRIBE TABLE events
+  verdict: allow
+- query: SHOW TABLES
+  verdict: allow
+- query: SHOW CREATE TABLE events
+  verdict: allow
+- query: SELECT name, type FROM system.columns WHERE table = 'events'
+  verdict: allow
+- query: SELECT name, engine FROM system.tables WHERE database = currentDatabase()
+  verdict: allow
+- query: SELECT sum(rows), sum(bytes_on_disk) FROM system.parts WHERE table = 'events'
+  verdict: allow
+- query: SELECT value FROM system.settings WHERE name = 'readonly'
+  verdict: allow
+- query: EXPLAIN SELECT * FROM events
+  verdict: allow
+- query: EXPLAIN ESTIMATE SELECT * FROM events
+  verdict: allow
+
+# --- local table functions: no egress, no code, nothing to deny ---
+# `readonly = 1` refuses some of these on the server (layer 2), and that is the
+# server's call to make. Layer 1 has no reason to add its own refusal on top.
+- query: SELECT * FROM numbers(10)
+  verdict: allow
+- query: SELECT * FROM values('a UInt8', 1, 2)
+  verdict: allow
+- query: SELECT * FROM null('a UInt8')
+  verdict: allow
+- query: SELECT * FROM generateRandom('a UInt8', 1, 1, 1) LIMIT 3
+  verdict: allow
+- query: SELECT * FROM merge('default', '^events')
+  verdict: allow
+- query: SELECT * FROM format(CSV, 'a UInt8', '1')
+  verdict: allow
+
+# --- functions whose names merely LOOK like the denied ones ---
+# The denylist matches whole names, not substrings; a column or a UDF called
+# `file_size` or `sleep_ms` is not `file` or `sleep`.
+- query: SELECT file_size FROM events
+  verdict: allow
+- query: SELECT sleep_ms FROM events
+  verdict: allow
+- query: SELECT clusterId FROM events
+  verdict: allow

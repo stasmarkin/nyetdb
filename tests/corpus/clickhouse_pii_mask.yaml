@@ -1,0 +1,101 @@
+# Golden corpus — the PII policy under mode = "mask" (ClickHouse dialect).
+#
+# Read this together with `clickhouse_pii.yaml`: mask relaxes the PROJECTION and
+# nothing else, and every refusal that is not about the projection has to stay.
+#
+# ClickHouse-specific caveat, and it is the important line in this file: net A
+# hands net B a PROMISE (the result-column indexes it let through), and on this
+# engine net B keeps that promise by comparing NAMES, not provenance — the HTTP
+# interface reports no origin for a column. So `mask` here protects a column
+# that comes back under its own name and cannot see one a view renamed. That is
+# `validator::check_result_names`, and it is why the README tells ClickHouse
+# users that column-level GRANTs are the real boundary.
+pii: users.email, users.phone, app.customers.ssn
+pii_mode: mask
+
+# --- what mask allows: a bare, unaliased protected column in the ROOT
+# projection, which is exactly the shape net B can check by name ---
+- query: SELECT email FROM users
+  verdict: allow
+- query: SELECT users.email FROM users
+  verdict: allow
+- query: SELECT u.email FROM users AS u
+  verdict: allow
+- query: SELECT id, email, phone FROM users
+  verdict: allow
+- query: SELECT EMAIL FROM USERS
+  verdict: allow
+- query: SELECT ssn FROM app.customers
+  verdict: allow
+- query: SELECT email FROM users WHERE id = 1 LIMIT 5
+  verdict: allow
+- query: SELECT email FROM users FINAL
+  verdict: allow
+- query: SELECT email FROM users SAMPLE 0.1
+  verdict: allow
+
+# --- an ALIAS is a second name for the value, and net B would not find it
+# under the protected name — so it refuses ---
+- query: SELECT email AS e FROM users
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- an expression carries no name net B can check ---
+- query: SELECT lower(email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT concat(email, 'x') FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT toString(email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT groupArray(email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- the oracle stays shut: mask redacts the value, and a filter, a sort or a
+# dedup reads it back out of the row order or the row count ---
+- query: SELECT id FROM users WHERE email LIKE 'a%'
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email FROM users ORDER BY email
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT DISTINCT email FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email, count() FROM users GROUP BY email
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT count() FROM users ARRAY JOIN email
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- a wildcard has no result-column index to promise, in either mode ---
+- query: SELECT * FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT * EXCEPT (phone) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT *, email FROM users
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- a nested projection hands its columns to another layer, and what net B
+# sees THROUGH that layer is the documented view limitation ---
+- query: SELECT x FROM (SELECT email AS x FROM users) AS t
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- the value-sampling catalogs are not a projection to relax ---
+- query: SELECT query FROM system.query_log
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- an unruled table is untouched by any of this (UX-5) ---
+- query: SELECT * FROM orders
+  verdict: allow
+- query: SELECT sum(total) FROM orders GROUP BY user_id
+  verdict: allow

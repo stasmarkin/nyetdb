@@ -336,6 +336,7 @@ pub fn parse(text: &str, env: EnvLookup) -> Result<Config, ConfigError> {
         }
         validate_ssh(alias, conn)?;
         validate_mongodb(alias, conn)?;
+        validate_redis(alias, conn)?;
         guardrail(alias, conn)?;
         pii(alias, conn)?;
     }
@@ -432,6 +433,39 @@ fn validate_ssh(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
     crate::tunnel::validate_remote(ssh.remote.as_deref().unwrap_or_default()).map_err(invalid)?;
     if let Some(cp) = &ssh.control_persist {
         crate::tunnel::validate_control_persist(cp).map_err(invalid)?;
+    }
+    Ok(())
+}
+
+/// What Redis cannot honor, said LOUDLY at parse time (exit 3) rather than
+/// discovered as a refusal on every query (W8).
+///
+/// **`[pii]` does not exist for Redis, and pretending otherwise would be the
+/// worst kind of lie**: a config that reads as protection and protects nothing.
+/// A rule is `table.column`, and Redis has neither — no tables, no columns, no
+/// declared fields, and no provenance on the wire for either of nyet's two
+/// nets to key on. Net A could not tell which command touches a protected
+/// thing (there is no name to match), and net B could not tell what came back
+/// (a reply is bytes). So the section is refused, with the boundary that DOES
+/// work in its place.
+fn validate_redis(alias: &str, conn: &Connection) -> Result<(), ConfigError> {
+    if conn.engine != "redis" && conn.engine != "valkey" {
+        return Ok(());
+    }
+    let has_rules = conn
+        .pii
+        .as_ref()
+        .is_some_and(|p| p.columns.as_ref().is_some_and(|c| !c.is_empty()) || p.mode.is_some());
+    if has_rules {
+        return Err(ConfigError::PiiRuleInvalid {
+            alias: alias.to_string(),
+            message: "Redis has no tables and no columns, so a \"table.column\" rule cannot \
+                      match anything and nyet will not pretend it does. Protect the data where \
+                      Redis can: an ACL that hides the keys (`ACL SETUSER nyet_ro ... \
+                      ~public:* -@all +@read`) limits the account to a key pattern, which is \
+                      the boundary the server itself enforces"
+                .to_string(),
+        });
     }
     Ok(())
 }

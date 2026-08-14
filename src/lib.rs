@@ -13,6 +13,7 @@ pub mod engine;
 pub mod guardrail;
 pub mod mongo;
 pub mod output;
+pub mod redis;
 pub mod resolver;
 pub mod sample;
 pub mod secret;

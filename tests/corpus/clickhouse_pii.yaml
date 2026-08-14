@@ -1,0 +1,134 @@
+# Golden corpus — the PII policy, net A (ClickHouse dialect).
+#
+# Net A is engine-independent, and these cases prove it stayed that way through
+# the ClickHouse dialect: the same rules, expressed in ClickHouse's own read
+# syntax (FINAL, PREWHERE, ARRAY JOIN, SAMPLE, EXCEPT/REPLACE), plus the value
+# leaks that only exist here — the query LOG keeps other people's WHERE clauses
+# verbatim, which is this engine's `pg_stats`.
+#
+# Net B on ClickHouse is WEAKER than on the sqlx engines and it is documented as
+# such (validator::check_result_names): the HTTP interface reports no column
+# provenance, so what nyet can compare is the result column NAMES.
+pii: users.email, users.phone, app.customers.ssn
+
+# --- the protected column, named anywhere ---
+- query: SELECT email FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email AS x FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT u.email FROM users AS u
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT EMAIL FROM USERS
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT ssn FROM app.customers
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- ClickHouse read syntax must not become a way around the name check ---
+- query: SELECT email FROM users FINAL
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT id FROM users PREWHERE email = 'a@b.c'
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT email FROM users SAMPLE 0.1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT count() FROM users ARRAY JOIN email
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT lower(email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT toString(email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT concat(email, 'x') FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT groupArray(email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT anyLast(email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+# The oracle: a filter over the protected value leaks it one comparison at a
+# time, so it is refused even though nothing is projected.
+- query: SELECT count() FROM users WHERE email LIKE 'a%'
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT count() FROM users ORDER BY email
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- the whole row, without naming a column ---
+- query: SELECT * FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT u.* FROM users AS u
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT * FROM users FINAL
+  verdict: deny
+  reason: PII_COLUMN
+# `* EXCEPT (email)` is ClickHouse's way to say "everything but that one", and
+# nyet still refuses: net A cannot prove the server expands it the way the text
+# reads, and the same wildcard rule that stops `SELECT *` has to stop this.
+- query: SELECT * EXCEPT (email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT * REPLACE ('x' AS email) FROM users
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- the query log is this engine's value-sampling catalog ---
+# It keeps the query TEXT, so somebody else's `WHERE email = 'a@b.c'` is the
+# protected cell, quoted, without this query naming a protected column.
+- query: SELECT query FROM system.query_log
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT * FROM system.query_log LIMIT 1
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT query FROM query_log
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT query FROM system.query_thread_log
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT query FROM system.query_views_log
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT message FROM system.text_log
+  verdict: deny
+  reason: PII_COLUMN
+- query: SELECT query FROM system.processes
+  verdict: deny
+  reason: PII_COLUMN
+
+# --- and what must KEEP working: a connection with a policy is not a
+# connection that stopped answering (UX-5) ---
+- query: SELECT id FROM users
+  verdict: allow
+- query: SELECT count() FROM users
+  verdict: allow
+- query: SELECT * FROM orders
+  verdict: allow
+- query: SELECT * FROM orders FINAL WHERE user_id = 1
+  verdict: allow
+- query: SELECT o.* FROM orders AS o JOIN users AS u USING (user_id)
+  verdict: allow
+- query: SELECT sum(total) FROM orders
+  verdict: allow
+# system tables that carry SHAPES, not values, stay readable — schema
+# introspection is the agent's main tool and the denylist must not eat it
+- query: SELECT name, type FROM system.columns WHERE table = 'users'
+  verdict: allow
+- query: SELECT name, engine FROM system.tables
+  verdict: allow
+- query: SELECT sum(rows) FROM system.parts WHERE table = 'users'
+  verdict: allow

@@ -17,11 +17,12 @@ use std::sync::LazyLock;
 /// input: the dialects share a parser and differ only in tables of names, so a
 /// single mutation is worth three verdicts — and it keeps the seed corpus
 /// literal SQL, byte for byte the text a user would type.
-static POLICIES: LazyLock<[Policy; 3]> = LazyLock::new(|| {
+static POLICIES: LazyLock<[Policy; 4]> = LazyLock::new(|| {
     [
         Policy::sqlite(&[], &[]),
         Policy::postgres(&[], &[]),
         Policy::mysql(&[], &[]),
+        Policy::clickhouse(&[], &[]),
     ]
 });
 

@@ -3,12 +3,17 @@
 //! contract codes and wraps execution in a timeout. The one thing they take
 //! from `output` is the pure `schema` model (`Schema`/`SchemaTable`/... plus
 //! `build_table`, which owns the pk/unique presentation rules) — the contract
-//! shape they fill in, so the three engines cannot drift.
+//! shape they fill in, so the engines cannot drift.
+
+mod clickhouse;
+mod redis;
+pub use clickhouse::Clickhouse;
+pub use redis::Redis;
 
 use crate::guardrail::{CostEstimate, Guardrail};
 use crate::output::{
-    build_table, ConnectFact, Diagnosis, JsFact, KeyPart, PiiAccess, ProbeFact, Schema,
-    SchemaColumn, SchemaFk, SchemaIndex, SchemaTable, ServerFacts, SuperuserFact,
+    build_table, ConnectFact, Diagnosis, JsFact, KeyPart, PiiAccess, ProbeFact, ReadonlyFact,
+    Schema, SchemaColumn, SchemaFk, SchemaIndex, SchemaTable, ServerFacts, SuperuserFact,
 };
 use crate::validator::Origin;
 use futures_util::TryStreamExt;
@@ -43,7 +48,9 @@ pub struct ResultSet {
 }
 
 /// Translate the driver's column metadata into the pure `Origin` the validator
-/// judges. One place for all three engines, so they cannot drift.
+/// judges. One place for every engine whose driver reports provenance at all
+/// (the sqlx three), so they cannot drift. MongoDB, ClickHouse and Redis get no
+/// provenance from the wire and do not come through here.
 fn origins_of<C: Column>(columns: &[C]) -> Vec<Origin> {
     columns
         .iter()
@@ -67,6 +74,21 @@ pub enum EngineError {
     /// The database accepted the connection but rejected the query
     /// (-> DB_ERROR, exit 7).
     Db { message: String, hint: String },
+    /// **Layer 1 refused, from inside the engine** (-> NYET + `reason`, exit 5).
+    ///
+    /// Only Redis produces it, and only because its classification needs the
+    /// server: `COMMAND INFO` is what says whether a command reads, so the
+    /// verdict cannot be reached before connecting. It is a REFUSAL, not a
+    /// database error, and it has to arrive at the agent as one — a `NYET` with
+    /// its reason and exit 5, like every other layer-1 verdict. Mapping it to
+    /// `Db` would teach an agent that "the query was wrong" when the answer is
+    /// "nyet does not run that".
+    Refused {
+        /// From the closed contract list (`crate::redis::DenyReason`).
+        reason: &'static str,
+        message: String,
+        hint: String,
+    },
     /// The server aborted the query on its own timeout (-> TIMEOUT, exit 8).
     /// Kept distinct from `Db` so a server-side statement_timeout and the
     /// cli's own tokio timeout both map to exit 8 (deterministic exit code).
@@ -423,6 +445,7 @@ fn error_parts(e: EngineError) -> (String, String) {
     match e {
         EngineError::Connect { message, hint }
         | EngineError::Db { message, hint }
+        | EngineError::Refused { message, hint, .. }
         | EngineError::Timeout { message, hint } => (message, hint),
     }
 }
@@ -501,7 +524,11 @@ fn assemble(objects: Vec<(String, TableParts)>) -> Schema {
 /// PostgreSQL (that one is schema-first).
 fn sorted(mut tables: Vec<SchemaTable>) -> Schema {
     tables.sort_by(|a, b| a.name.cmp(&b.name));
-    Schema { tables }
+    Schema {
+        tables,
+        na: None,
+        databases: Vec::new(),
+    }
 }
 
 /// SQLite via sqlx, opened with `mode=ro` (file-level read-only — layer 2:
@@ -1343,6 +1370,8 @@ impl Engine for Postgres {
             Err(_elapsed) => ServerFacts {
                 // Server-side JavaScript is a MongoDB question only.
                 js: None,
+                readonly: None,
+                classifier_error: None,
                 superuser: SuperuserFact::Unknown(
                     "the privilege query did not finish within the timeout".to_string(),
                 ),
@@ -1566,6 +1595,8 @@ async fn pg_diagnose(conn: &mut sqlx::PgConnection) -> ServerFacts {
     ServerFacts {
         // Server-side JavaScript is a MongoDB question only.
         js: None,
+        readonly: None,
+        classifier_error: None,
         superuser,
         read_only_note,
         probe,
@@ -2204,6 +2235,15 @@ pub fn transport_below_require(engine: &str, url: &str) -> bool {
                 || url.contains("tls=true")
                 || url.contains("ssl=true"))
         }
+        // ClickHouse's transport is decided by the SCHEME, not by a parameter:
+        // `http://` is plaintext and `https://` is TLS with the webpki roots.
+        // There is no `prefer`-shaped middle to get wrong, so the check is the
+        // scheme itself — and an unparsable url errs toward "insecure", which
+        // is the safe direction for a warning.
+        "clickhouse" => !url.to_ascii_lowercase().starts_with("https://"),
+        // Redis decides TLS by scheme too: `rediss://` (two s) is TLS,
+        // `redis://` is plaintext. An unparsable url errs toward "insecure".
+        "redis" | "valkey" => !url.to_ascii_lowercase().starts_with("rediss://"),
         _ => false,
     }
 }
@@ -2812,6 +2852,8 @@ impl Engine for Mysql {
                     return with_server(ServerFacts {
                         // Server-side JavaScript is a MongoDB question only.
                         js: None,
+                        readonly: None,
+                        classifier_error: None,
                         superuser: SuperuserFact::Unknown(
                             "the privilege queries did not finish within the timeout".to_string(),
                         ),
@@ -2851,6 +2893,8 @@ impl Engine for Mysql {
                 with_server(ServerFacts {
                     // Server-side JavaScript is a MongoDB question only.
                     js: None,
+                    readonly: None,
+                    classifier_error: None,
                     superuser,
                     read_only_note,
                     probe,
@@ -2862,6 +2906,8 @@ impl Engine for Mysql {
             Err(detail) => with_server(ServerFacts {
                 // Server-side JavaScript is a MongoDB question only.
                 js: None,
+                readonly: None,
+                classifier_error: None,
                 superuser,
                 read_only_note,
                 probe: ProbeFact::Unknown {
@@ -3996,6 +4042,8 @@ impl Engine for Mongo {
                 read_only_note: None,
                 probe,
                 js: Some(self.javascript(&client).await),
+                readonly: None,
+                classifier_error: None,
             }),
             pii: Vec::new(),
         }
@@ -4079,6 +4127,8 @@ impl Mongo {
             let objects = crate::mongo::meta::collections(&reply).map_err(reply_error)?;
             return Ok(Schema {
                 tables: crate::mongo::meta::listing(objects),
+                na: None,
+                databases: Vec::new(),
             });
         };
         // The FULL listCollections carries `options.validator` — the declared
@@ -4111,7 +4161,11 @@ impl Mongo {
         // "invisible to this role", so it samples and lets the answer say
         // `sampled: 0` rather than claiming the collection is not there.
         if listed && info.is_none() {
-            return Ok(Schema { tables: Vec::new() });
+            return Ok(Schema {
+                tables: Vec::new(),
+                na: None,
+                databases: Vec::new(),
+            });
         }
         let sample = mongodb::bson::doc! {
             "aggregate": name,
@@ -4143,6 +4197,8 @@ impl Mongo {
                 indexes,
                 count,
             )],
+            na: None,
+            databases: Vec::new(),
         })
     }
 

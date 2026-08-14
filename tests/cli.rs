@@ -505,7 +505,12 @@ fn query_unsupported_engine_is_not_implemented_exit_1() {
     let cfg = write_config(
         tmp.path(),
         &format!(
-            "[connections.r]\nengine = \"redis\"\nurl = \"redis://h:6379\"\n\
+            // `cassandra` is the stand-in for an engine nyet does not support.
+            // It used to be `redis`, which stopped being unsupported in W8 —
+            // the day an engine ships, every test that used its name as a
+            // synonym for "not implemented" starts asserting the opposite of
+            // what it means.
+            "[connections.r]\nengine = \"cassandra\"\nurl = \"cql://h:9042\"\n\
              allowed_dirs = [\"{}\"]\n",
             tmp.path().display()
         ),
@@ -2223,7 +2228,12 @@ fn explain_pipeline_order_matches_query() {
     let cfg = write_config(
         tmp.path(),
         &format!(
-            "[connections.r]\nengine = \"redis\"\nurl = \"redis://h:6379\"\n\
+            // `cassandra` is the stand-in for an engine nyet does not support.
+            // It used to be `redis`, which stopped being unsupported in W8 —
+            // the day an engine ships, every test that used its name as a
+            // synonym for "not implemented" starts asserting the opposite of
+            // what it means.
+            "[connections.r]\nengine = \"cassandra\"\nurl = \"cql://h:9042\"\n\
              allowed_dirs = [\"{}\"]\n",
             tmp.path().display()
         ),
@@ -2265,7 +2275,12 @@ fn schema_pipeline_order_matches_query() {
     let cfg = write_config(
         tmp.path(),
         &format!(
-            "[connections.r]\nengine = \"redis\"\nurl = \"redis://h:6379\"\n\
+            // `cassandra` is the stand-in for an engine nyet does not support.
+            // It used to be `redis`, which stopped being unsupported in W8 —
+            // the day an engine ships, every test that used its name as a
+            // synonym for "not implemented" starts asserting the opposite of
+            // what it means.
+            "[connections.r]\nengine = \"cassandra\"\nurl = \"cql://h:9042\"\n\
              allowed_dirs = [\"{}\"]\n",
             tmp.path().display()
         ),

@@ -82,6 +82,31 @@ pub const DETAIL_LIMIT: usize = 50;
 #[derive(Serialize)]
 pub struct Schema {
     pub tables: Vec<SchemaTable>,
+    /// Why there is no schema to show, for an engine that has none (Redis).
+    /// Present in the PAYLOAD and not only in a warning, so a machine reader
+    /// gets the answer too — `tables: []` on its own reads as "an empty
+    /// database", which is a different and wrong statement (UX-1).
+    /// A String rather than a `&'static str`: the reason can carry what the
+    /// SERVER said (an account that may not run `INFO` gets the `na` plus why
+    /// the key counts are missing), and an answer that omits something without
+    /// saying so reads as a claim that there was nothing to omit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub na: Option<String>,
+    /// Redis only: what `INFO keyspace` publishes for free. It is not a schema
+    /// and it is not called one — it is the scale of the key space, which is
+    /// most of what an agent asking for a schema actually wanted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub databases: Vec<SchemaDatabase>,
+}
+
+/// One Redis logical database, from `INFO keyspace`. No scan was involved: the
+/// server keeps these counters itself.
+#[derive(Serialize)]
+pub struct SchemaDatabase {
+    pub name: String,
+    pub keys: u64,
+    /// How many of those keys carry a TTL.
+    pub expires: u64,
 }
 
 impl Schema {
@@ -268,7 +293,7 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// The single owner of the pk/unique presentation rules, so the three engines
+/// The single owner of the pk/unique presentation rules, so the engines
 /// cannot drift — they differ only in how they read their catalog:
 ///
 /// - every member of a (possibly composite) primary key gets `pk: true`;
@@ -839,6 +864,16 @@ pub enum EngineKind {
     /// layer 3 is read from the PRIVILEGES the server reports rather than
     /// probed with a write, and one check exists only here (`server_side_js`).
     Mongo,
+    /// ClickHouse: a server engine like the rest, plus one check nobody else
+    /// needs (`readonly_setting`) — its layer 2 and its layer 3 are the SAME
+    /// knob at different strengths, so doctor has to say which one the role
+    /// actually carries.
+    Clickhouse,
+    /// Redis/Valkey: a server engine with NO layer 2 at all — no read-only
+    /// session, no read-only transaction. Layer 3 is read from the account's
+    /// ACL rules, and the `read_only_layer` check says the missing layer is
+    /// missing rather than letting its absence go unmentioned.
+    Redis,
 }
 
 /// Closed, append-only status list for a doctor check. `na` = the check does
@@ -970,6 +1005,25 @@ pub enum SuperuserFact {
     Unresolved(String),
 }
 
+/// ClickHouse's `readonly` setting as the ROLE'S OWN profile carries it —
+/// layer 3 for an engine whose layer 2 is the same knob. The three values are
+/// not a scale, they are three different promises, and doctor must not report
+/// the middle one as the strong one (W9):
+///
+/// - `0` — nothing in the profile stops a direct client from writing;
+/// - `1` — writes AND settings changes refused: what nyet asks for per request;
+/// - `2` — writes refused, but the client may change settings, i.e. raise its
+///   own `max_result_rows` / `max_execution_time` / `max_memory_usage`
+///   (measured: under `readonly=2` a query set `max_result_rows` to a hundred
+///   million and the server obliged). It does not let the client lower
+///   `readonly` itself — also measured.
+pub enum ReadonlyFact {
+    Profile(u8),
+    /// The server would not say. Reported as "could not verify", never as a
+    /// pass (UX-1).
+    Unknown(String),
+}
+
 /// Server-role facts. `None` for SQLite (no server) or when the connect failed.
 pub struct ServerFacts {
     pub superuser: SuperuserFact,
@@ -980,6 +1034,15 @@ pub struct ServerFacts {
     /// MongoDB only; `None` on every other engine (there is no server-side
     /// JavaScript to ask about).
     pub js: Option<JsFact>,
+    /// ClickHouse only; `None` on every other engine (no other one makes
+    /// read-only a setting the client can be handed at two strengths).
+    pub readonly: Option<ReadonlyFact>,
+    /// **Redis only, and read only by the `read_only_session` check**, where
+    /// `None` therefore means "the classifier answered". `Some(detail)` means
+    /// `COMMAND INFO` was refused, which on this engine is total: layer 1's
+    /// whole classification comes from that call, so every query fails closed
+    /// until the account is granted `+command|info`.
+    pub classifier_error: Option<String>,
 }
 
 /// One `[pii]`-protected column, and whether the ROLE nyet connects as can read
@@ -1127,6 +1190,8 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
     // `na` line on every other engine would be noise (UX-4), and the closed
     // list of check NAMES is append-only either way (Д7).
     .chain((input.engine == EngineKind::Mongo).then(|| server_side_js_check(input)))
+    .chain((input.engine == EngineKind::Clickhouse).then(|| readonly_setting_check(input)))
+    .chain((input.engine == EngineKind::Redis).then(|| read_only_session_check(input)))
     // Only when there IS a policy: a check that reports `na` on every
     // connection without `[pii]` is pure noise in the common case (UX-4).
     .chain(input.forward.as_ref().map(ssh_forward_check))
@@ -1335,7 +1400,8 @@ fn transport_check(transport: &Transport) -> DoctorCheck {
         ),
         Transport::TlsDirect => ok_check(
             "transport_encrypted",
-            "the direct connection requires TLS (the url's sslmode/ssl-mode is require or stricter)",
+            "the direct connection requires TLS (the url's sslmode/ssl-mode is require or \
+             stricter, or — on ClickHouse — the scheme is https://)",
         ),
         Transport::InsecureDirect => warn_check(
             "transport_encrypted",
@@ -1343,8 +1409,9 @@ fn transport_check(transport: &Transport) -> DoctorCheck {
              sslmode/ssl-mode/tls is below require and there is no ssh tunnel, so nyet may talk \
              to the server in plaintext",
             "set sslmode=verify-full (Postgres), ssl-mode=VERIFY_IDENTITY (MySQL) or tls=true \
-             (MongoDB) in the url to encrypt and authenticate the connection, or route it \
-             through an ssh tunnel",
+             (MongoDB) in the url, an https:// url on 8443 (ClickHouse) or a rediss:// url \
+             (Redis), to encrypt and authenticate the connection — or route it through an ssh \
+             tunnel",
         ),
         Transport::Na => na_check(
             "transport_encrypted",
@@ -1372,6 +1439,24 @@ fn read_only_role_check(input: &DoctorInput) -> DoctorCheck {
             // privilege list the server itself published for these credentials.
             ProbeFact::Grants(grants) => mongo_grants_check(grants),
             ProbeFact::Blocked { detail, ddl_only } => {
+                // Redis: nothing was WRITTEN to find this out. The verdict comes
+                // from the account's own ACL rules, which is the MongoDB shape
+                // and for the same reason — there is no transaction to roll a
+                // probe back with, and a probe write into a live cache is not a
+                // thing a read-only tool should do. The wording has to match
+                // what actually happened, or the check claims a measurement it
+                // never made (UX-1).
+                if input.engine == EngineKind::Redis {
+                    return ok_check(
+                        "read_only_role",
+                        format!(
+                            "the server refuses writes with these credentials, so a client that \
+                             bypassed nyet and connected directly would still be read-only. On \
+                             Redis this is the ONLY layer under nyet's own — there is no \
+                             read-only session behind it ({detail})"
+                        ),
+                    );
+                }
                 // Honest headline (UX-7): only a real read-only refusal claims
                 // "every write is rejected"; an access-denied on CREATE proves
                 // only the DDL right is missing, so it says so.
@@ -1394,6 +1479,16 @@ fn read_only_role_check(input: &DoctorInput) -> DoctorCheck {
                 ok_check("read_only_role", message)
             }
             ProbeFact::Wrote { orphan } => {
+                if input.engine == EngineKind::Redis {
+                    return fail_check(
+                        "read_only_role",
+                        "these credentials CAN write: the account's ACL rules include writing \
+                         commands, so an agent with shell access could bypass nyet and change \
+                         or delete data. On Redis this is the ONLY layer under nyet's own — \
+                         there is no read-only session to fall back on",
+                        read_only_role_hint(input.engine),
+                    );
+                }
                 let mut message = "these credentials CAN write to the database directly: a probe \
                      CREATE TABLE succeeded, so an agent with shell access could bypass nyet and \
                      modify data — layer 3 is not in place"
@@ -1422,6 +1517,118 @@ fn read_only_role_check(input: &DoctorInput) -> DoctorCheck {
                  hand that a direct write is refused",
             ),
         },
+    }
+}
+
+/// Redis has no layer 2, and this check exists to SAY so rather than to let its
+/// absence go unmentioned (W8). Every other engine gets one: PostgreSQL/MySQL a
+/// read-only transaction, SQLite a file opened `mode=ro`, ClickHouse
+/// `readonly = 1`. Redis has no read-only session, no read-only transaction and
+/// no per-connection switch — the nearest things (`replica-read-only`, an ACL
+/// user) are layer 3, which `read_only_role` covers.
+///
+/// `na` and not `warn`: nothing here is misconfigured, and a warning would
+/// invite somebody to go looking for the setting that turns it on. It is a
+/// property of Redis, and the honest answer is to name it (UX-7).
+fn read_only_session_check(input: &DoctorInput) -> DoctorCheck {
+    // Layer 1 on Redis rests on ONE call. If the account may not make it,
+    // nothing stands at all — so this check, which exists to say what carries
+    // the weight in layer 2's absence, is where that has to surface. Measured:
+    // `COMMAND` is not in `@read`, so the read-only account nyet itself
+    // recommends failed every query until the recipe learned `+command|info`.
+    if let Some(detail) = input
+        .diagnosis
+        .server
+        .as_ref()
+        .and_then(|s| s.classifier_error.as_ref())
+    {
+        return fail_check(
+            "read_only_session",
+            format!(
+                "Redis has no read-only session, so layer 1 is what stands in its place — and \
+                 layer 1 cannot run: this account may not call COMMAND INFO, which is how nyet \
+                 asks the server whether a command reads or writes. Every query on this \
+                 connection is refused (UNCLASSIFIED) until that is fixed ({detail})"
+            ),
+            "grant the metadata commands — they publish nothing but command signatures, the \
+             same on every Redis of this version:\n\
+             ACL SETUSER <user> +command|info +info\n\
+             (`+info` is what `nyet schema` reads the key counts with)",
+        );
+    }
+    na_check(
+        "read_only_session",
+        "Redis has no read-only session for nyet to open: no read-only transaction, no \
+         per-connection switch. So layer 2 does not exist on this engine, and what stands \
+         between an agent and a write is layer 1 (nyet asks the SERVER, via COMMAND INFO, \
+         whether each command is a read, and refuses everything it is not told is one) plus \
+         layer 3 (the account's ACL, or a replica) — see the read_only_role check below",
+    )
+}
+
+/// ClickHouse's `readonly` is BOTH layer 2 and layer 3, at two strengths, and
+/// the difference is the whole point of this check: nyet sends `readonly=1` on
+/// every request, so a query it sends is bounded either way — but what the ROLE
+/// carries is what an agent that walks around nyet gets. `2` is the trap: it
+/// refuses writes, so it looks like read-only, while letting the client raise
+/// `max_result_rows`, `max_execution_time` and `max_memory_usage` (measured on
+/// 24.8). Reporting it as `ok` would be exactly the false pass UX-1 forbids.
+fn readonly_setting_check(input: &DoctorInput) -> DoctorCheck {
+    let Some(server) = &input.diagnosis.server else {
+        return warn_check(
+            "readonly_setting",
+            "could not verify: there is no connection to the database",
+            "fix the connectivity check above, then re-run nyet doctor",
+        );
+    };
+    let Some(readonly) = &server.readonly else {
+        return warn_check(
+            "readonly_setting",
+            "could not verify: nyet did not read the account's `readonly` setting",
+            "re-run nyet doctor; if it persists, check by hand with \
+             SELECT value FROM system.settings WHERE name = 'readonly'",
+        );
+    };
+    match readonly {
+        ReadonlyFact::Profile(1) => ok_check(
+            "readonly_setting",
+            "the account's own profile carries readonly = 1: even a direct client gets no \
+             writes and no settings changes, which is the same bound nyet sets per request. \
+             The price of that (measured): an account at readonly = 1 may not change ANY \
+             setting, so nyet's own per-request caps — max_execution_time, max_result_rows, \
+             max_block_size — are refused too, and a query is bounded by this account's own \
+             profile plus nyet's in-process deadline and row truncation. Set those limits in \
+             the profile if you want them enforced server-side",
+        ),
+        ReadonlyFact::Profile(2) => warn_check(
+            "readonly_setting",
+            "the account's profile carries readonly = 2, which is NOT the same as 1: it \
+             refuses writes, but it allows settings changes — so a client can raise its own \
+             max_result_rows / max_execution_time / max_memory_usage, and the server no longer \
+             treats a table function (url, file, s3, remote, executable) as a write. nyet \
+             cannot fix this per request either: measured, an account already in readonly mode \
+             may not have `readonly` lowered to 1, so nyet's requests run at 2 as well and what \
+             covers the table functions here is layer 1's denylist alone",
+            "set readonly = 1 in this account's settings profile: SETTINGS readonly = 1 on the \
+             user, or a profile with <readonly>1</readonly>",
+        ),
+        ReadonlyFact::Profile(0) => warn_check(
+            "readonly_setting",
+            "the account's profile carries readonly = 0: nothing but the GRANTs stands between \
+             a direct client and a write. nyet's own requests still send readonly = 1",
+            "give this account a read-only settings profile (readonly = 1) as well as \
+             SELECT-only grants — the two answer different questions",
+        ),
+        ReadonlyFact::Profile(other) => warn_check(
+            "readonly_setting",
+            format!("the server reported readonly = {other}, which nyet does not recognise"),
+            "check the account's settings profile by hand",
+        ),
+        ReadonlyFact::Unknown(detail) => warn_check(
+            "readonly_setting",
+            format!("could not verify the account's `readonly` setting: {detail}"),
+            "check by hand with SELECT value FROM system.settings WHERE name = 'readonly'",
+        ),
     }
 }
 
@@ -1723,6 +1930,21 @@ fn read_only_role_hint(engine: EngineKind) -> String {
              FLUSH PRIVILEGES;\n\
              (see the README layer-3 recipe)"
         }
+        EngineKind::Redis => {
+            "give the account an ACL that cannot write, and point the url at it:\n\
+             ACL SETUSER nyet_ro on >'...' ~* &* -@all +@read +@keyspace -keys \
+             +command|info +info\n\
+             (or point the connection at a REPLICA, where replica-read-only refuses writes for \
+             every account at once — Redis has no read-only session, so layer 3 is the only \
+             layer under nyet's own; see the README)"
+        }
+        EngineKind::Clickhouse => {
+            "create a SELECT-only account WITH a read-only settings profile — ClickHouse needs \
+             both, and they answer different questions:\n\
+             CREATE USER nyet_ro IDENTIFIED BY '...' SETTINGS readonly = 1;\n\
+             GRANT SELECT ON app.* TO nyet_ro;\n\
+             (see the README layer-3 recipe)"
+        }
         // Never reached: MongoDB answers through `mongo_grants_check`, which
         // carries its own recipe, and SQLite short-circuits to `na` above.
         EngineKind::Mongo | EngineKind::Sqlite => {
@@ -1746,6 +1968,15 @@ fn not_superuser_hint(engine: EngineKind) -> String {
             "use an account whose only role is { role: \"read\", db: \"<db>\" } on the database \
              in the url — root / dbOwner / userAdminAnyDatabase and friends can grant \
              themselves anything, so no other layer can hold"
+        }
+        EngineKind::Redis => {
+            "use an ACL account without +@all and without +@admin: those hold CONFIG, DEBUG \
+             and ACL SETUSER, so the account can rewrite its own permissions and no other \
+             layer can hold"
+        }
+        EngineKind::Clickhouse => {
+            "use an account with scoped GRANTs only — GRANT ALL ON *.* and ACCESS MANAGEMENT \
+             both let the account grant itself anything, so no other layer can hold"
         }
         EngineKind::Sqlite => "not applicable to SQLite",
     }
@@ -2208,6 +2439,8 @@ mod tests {
             true,
         );
         Schema {
+            na: None,
+            databases: Vec::new(),
             tables: vec![users, view],
         }
     }
@@ -2231,6 +2464,8 @@ mod tests {
     #[test]
     fn schema_names_only_envelope_carries_the_truncation_warning() {
         let schema = Schema {
+            na: None,
+            databases: Vec::new(),
             tables: vec![
                 SchemaTable {
                     name: "users".into(),
@@ -2456,6 +2691,8 @@ mod tests {
         );
         // Names-only listing: one line per object, no detail block.
         let listing = Schema {
+            na: None,
+            databases: Vec::new(),
             tables: vec![SchemaTable {
                 name: "users".into(),
                 kind: "table",
@@ -2536,6 +2773,8 @@ mod tests {
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     js: None,
+                    readonly: None,
+                    classifier_error: None,
                     superuser: SuperuserFact::Yes("current_setting('is_superuser') = on".into()),
                     read_only_note: None,
                     probe: ProbeFact::Wrote { orphan: None },
@@ -2654,6 +2893,8 @@ mod tests {
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     js: None,
+                    readonly: None,
+                    classifier_error: None,
                     superuser: SuperuserFact::No("off".into()),
                     read_only_note: None,
                     probe: ProbeFact::Blocked {
@@ -2735,6 +2976,8 @@ mod tests {
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     js: None,
+                    readonly: None,
+                    classifier_error: None,
                     superuser: SuperuserFact::No("current_setting('is_superuser') = off".into()),
                     read_only_note: Some("the server is a read-only replica (hot standby)".into()),
                     probe: ProbeFact::Blocked {
@@ -2778,6 +3021,8 @@ mod tests {
                     connect: ConnectFact::Ok { via_tunnel: false },
                     server: Some(ServerFacts {
                         js: None,
+                        readonly: None,
+                        classifier_error: None,
                         superuser: SuperuserFact::No("off".into()),
                         read_only_note: None,
                         probe: ProbeFact::Blocked {
@@ -2818,6 +3063,8 @@ mod tests {
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     js: None,
+                    readonly: None,
+                    classifier_error: None,
                     superuser: SuperuserFact::Unknown("could not read is_superuser".into()),
                     read_only_note: None,
                     probe: ProbeFact::Unknown {
@@ -2855,6 +3102,8 @@ mod tests {
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     js: None,
+                    readonly: None,
+                    classifier_error: None,
                     superuser: SuperuserFact::Unresolved(
                         "the account has role/proxy grants nyet does not resolve".into(),
                     ),
@@ -3027,6 +3276,8 @@ mod tests {
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     js: Some(JsFact::Disabled),
+                    readonly: None,
+                    classifier_error: None,
                     superuser: SuperuserFact::No("roles: read@app".into()),
                     read_only_note: None,
                     probe: ProbeFact::Grants(Box::new(g)),
@@ -3109,6 +3360,8 @@ mod tests {
                 connect: ConnectFact::Ok { via_tunnel: false },
                 server: Some(ServerFacts {
                     js,
+                    readonly: None,
+                    classifier_error: None,
                     superuser: SuperuserFact::No("roles: read@app".into()),
                     read_only_note: None,
                     probe: ProbeFact::Grants(Box::new(Grants {

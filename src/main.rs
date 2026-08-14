@@ -316,6 +316,8 @@ enum Db {
     Postgres(engine::Postgres),
     Mysql(engine::Mysql),
     Mongo(engine::Mongo),
+    Clickhouse(engine::Clickhouse),
+    Redis(engine::Redis),
 }
 
 impl Db {
@@ -324,6 +326,25 @@ impl Db {
     /// engine rather than handing mongosh text to sqlparser.
     fn is_mongo(&self) -> bool {
         matches!(self, Db::Mongo(_))
+    }
+
+    /// Which layer 1 applies. Redis is not SQL either: it has its own pure
+    /// parser + server-driven classifier (`src/redis.rs`), and unlike the SQL
+    /// engines its verdict needs a ROUND TRIP (`COMMAND INFO`), so the cli
+    /// cannot classify before connecting — the engine does it, on the command
+    /// it is about to run.
+    fn is_redis(&self) -> bool {
+        matches!(self, Db::Redis(_))
+    }
+
+    /// Does this engine report column PROVENANCE? ClickHouse's HTTP interface
+    /// answers with names and types and nothing else, so `check_origins` would
+    /// see all-`Unknown` and refuse every query on a PII connection — a working
+    /// tool switched off rather than a boundary. Net B there is
+    /// `validator::check_result_names`, which is honestly weaker and documented
+    /// as such (README, SECURITY.md).
+    fn reports_origins(&self) -> bool {
+        !matches!(self, Db::Clickhouse(_))
     }
 
     /// The connection url as it will actually be dialed — resolved, since it
@@ -335,6 +356,8 @@ impl Db {
             Db::Postgres(pg) => &pg.url,
             Db::Mysql(my) => &my.url,
             Db::Mongo(mg) => &mg.url,
+            Db::Clickhouse(ch) => &ch.url,
+            Db::Redis(rd) => &rd.url,
         }
     }
 
@@ -362,6 +385,8 @@ impl Db {
             Db::Postgres(e) => e.execute(sql, fetch_limit, guardrail).await,
             Db::Mysql(e) => e.execute(sql, fetch_limit, guardrail).await,
             Db::Mongo(e) => e.execute(sql, fetch_limit, guardrail).await,
+            Db::Clickhouse(e) => e.execute(sql, fetch_limit, guardrail).await,
+            Db::Redis(e) => e.execute(sql, fetch_limit, guardrail).await,
         }?;
         let mut masked = Vec::new();
         if let engine::QueryOutcome::Ran { result, .. } = &mut outcome {
@@ -379,6 +404,26 @@ impl Db {
                             ))
                         }
                         Ok(fields) => masked = fields,
+                    }
+                }
+            } else if !self.reports_origins() {
+                // ClickHouse: no provenance on the wire, so net B compares the
+                // RESULT COLUMN NAMES with the protected names. It closes the
+                // view that KEEPS the name and cannot close one that renames it;
+                // both halves are stated in the README.
+                match validator::check_result_names(pii, &result.columns, pii_exempt) {
+                    Err(refusal) => {
+                        return Ok((
+                            engine::QueryOutcome::PiiRefused(Box::new(refusal)),
+                            Vec::new(),
+                        ))
+                    }
+                    Ok(indexes) => {
+                        masked = indexes
+                            .iter()
+                            .map(|i| result.columns[*i].clone())
+                            .collect::<Vec<_>>();
+                        output::redact(&mut result.rows, &indexes);
                     }
                 }
             } else {
@@ -411,6 +456,8 @@ impl Db {
             Db::Postgres(e) => e.estimate(sql).await,
             Db::Mysql(e) => e.estimate(sql).await,
             Db::Mongo(e) => e.estimate(sql).await,
+            Db::Clickhouse(e) => e.estimate(sql).await,
+            Db::Redis(e) => e.estimate(sql).await,
         }
     }
 
@@ -426,6 +473,8 @@ impl Db {
             // driver would discover the replica set's real members and go
             // straight to them, around the bastion (see engine::Mongo::open).
             Db::Mongo(mg) => mg.host_override = Some(over),
+            Db::Clickhouse(ch) => ch.host_override = Some(over),
+            Db::Redis(rd) => rd.host_override = Some(over),
             Db::Sqlite(_) => {}
         }
     }
@@ -450,6 +499,11 @@ impl Db {
                 e.statement_timeout_ms = engine::Mysql::clamp_statement_timeout(ms);
             }
             Db::Mongo(e) => e.query_timeout_ms = ms,
+            Db::Clickhouse(e) => {
+                e.query_timeout_ms = ms;
+                e.statement_timeout_ms = engine::Clickhouse::clamp_statement_timeout(ms);
+            }
+            Db::Redis(e) => e.query_timeout_ms = ms,
         }
     }
 
@@ -463,7 +517,10 @@ impl Db {
             Db::Postgres(pg) => pg.resolve_column_origins = true,
             // MongoDB needs no origins: its net B scans the self-describing
             // result documents instead (see mongo::scan_reply in Db::execute).
-            Db::Mysql(_) | Db::Sqlite(_) | Db::Mongo(_) => {}
+            // ClickHouse has no provenance to ask for at all (see
+            // `reports_origins`); MySQL and SQLite report it on the wire for
+            // free, so neither needs a switch.
+            Db::Mysql(_) | Db::Sqlite(_) | Db::Mongo(_) | Db::Clickhouse(_) | Db::Redis(_) => {}
         }
     }
 
@@ -473,6 +530,8 @@ impl Db {
             Db::Postgres(e) => e.schema(table).await,
             Db::Mysql(e) => e.schema(table).await,
             Db::Mongo(e) => e.schema(table).await,
+            Db::Clickhouse(e) => e.schema(table).await,
+            Db::Redis(e) => e.schema(table).await,
         }
     }
 
@@ -482,6 +541,8 @@ impl Db {
             Db::Postgres(e) => e.diagnose(pii).await,
             Db::Mysql(e) => e.diagnose(pii).await,
             Db::Mongo(e) => e.diagnose(pii).await,
+            Db::Clickhouse(e) => e.diagnose(pii).await,
+            Db::Redis(e) => e.diagnose(pii).await,
         }
     }
 }
@@ -991,6 +1052,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
             // ANALYZE, so `nyet explain` cannot be a way to execute anything.
             let (conn, mut session) = open_session(&cfg, &alias, &cwd, &allowed, None)?;
             let is_mongo = session.db.is_mongo();
+            let is_redis = session.db.is_redis();
             let engine = conn.engine.clone();
             let raw_sql = query.clone();
             let cwd_str = cwd.display().to_string();
@@ -1005,9 +1067,16 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // be the way past the allowlist, so the very same parser and
                 // allowlist that refuse `db.c.aggregate([{$out: ...}])` for
                 // `query` refuse it here, before any connect (exit 5).
-                let (query, is_query, mut warnings, _) = match is_mongo {
-                    true => validate_mongo(&query, session.policy.pii())?,
-                    false => validate(&query, &session.policy)?,
+                // Redis for the same reason, one step further: its layer 1 is
+                // not SQL either, and half its verdict needs the server — so
+                // `explain` runs the syntax + denylist half here and the
+                // engine's `estimate` runs the flag half before answering.
+                let (query, is_query, mut warnings, _) = if is_mongo {
+                    validate_mongo(&query, session.policy.pii())?
+                } else if is_redis {
+                    validate_redis(&query, &session.db)?
+                } else {
+                    validate(&query, &session.policy)?
                 };
                 // The verdict is informational here, but it is measured against this
                 // connection's own guardrail, so `explain` answers exactly what
@@ -1017,7 +1086,14 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // `off` for MongoDB and there is nothing to estimate), but a
                 // MongoDB read DOES have a plan to show — one without a cost or
                 // a row count, which is exactly what its `estimate` returns.
-                let is_query = is_query || is_mongo;
+                // MongoDB has a plan to show (one without numbers), and Redis
+                // has none at all. Both are folded in here anyway, and for Redis
+                // that is not cosmetic: the engine's `estimate` is where the
+                // FLAG half of its layer 1 runs, so leaving it out would make
+                // `nyet explain FLUSHALL` answer "no plan, all good" instead of
+                // refusing — `explain` must never be the way past the
+                // classifier. It returns `Ok(None)`, which the arm below reads.
+                let is_query = is_query || is_mongo || is_redis;
 
                 // A metadata statement (SHOW/DESCRIBE, or an EXPLAIN the agent wrote
                 // itself) has no plan to ask for: wrapping it in another EXPLAIN
@@ -1039,7 +1115,12 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                 // refuse. Either way the verdict is `no_estimate` over an empty plan.
                 let empty = plan.is_none();
                 let plan = plan.unwrap_or_else(|| {
-                    if is_query {
+                    // Redis reaches here on the normal path: it publishes no
+                    // plan for anything, which is a different statement from
+                    // "planning ran out of budget" and gets its own warning.
+                    if is_redis {
+                        warnings.push(no_plan_engine_warning("Redis"));
+                    } else if is_query {
                         warnings.push(planning_too_slow_warning());
                     }
                     guardrail::CostEstimate {
@@ -1276,6 +1357,21 @@ fn rows_command(
     let cwd_str = cwd.display().to_string();
     let log_responses = cfg.audit_enabled() && cfg.audit_log_responses();
     let is_sample = matches!(source, RowSource::Sample(_));
+    // `sample` draws rows from a named collection of them, and Redis has none:
+    // no tables, no collections, nothing to draw from. Answering with
+    // `RANDOMKEY` would be a different command wearing this one's name (it
+    // returns a KEY, not a row), so this refuses instead — with the read that
+    // does what the caller probably meant.
+    if is_sample && session.db.is_redis() {
+        return Err(Failure::new(
+            ErrorCode::NotImplemented,
+            "`nyet sample` has no meaning on Redis: there is no table or collection to draw \
+             rows from",
+            "walk the key space yourself if that is what you want: \
+             `nyet query <alias> \"SCAN 0 MATCH prefix:* COUNT 100\"`, then read the keys it \
+             returns — and see `nyet schema <alias>` for how big the key space is",
+        ));
+    }
     // Flag > per-connection > [defaults] > built-in, capped by the config
     // owner's max_row_limit (see config::capped). `sample` brings its own small
     // built-in and enters it at the FLAG position: a handful of rows is the
@@ -1547,9 +1643,12 @@ fn run_attempt(
     // runs is decided by the engine: MongoDB has its own parser and
     // allowlist (mongosh text is not SQL and sqlparser must never
     // see it), everything else goes through the SQL validator.
-    let (sql, is_query, mut warnings, pii_exempt) = match session.db.is_mongo() {
-        true => validate_mongo(sql, session.policy.pii())?,
-        false => validate(sql, &session.policy)?,
+    let (sql, is_query, mut warnings, pii_exempt) = if session.db.is_mongo() {
+        validate_mongo(sql, session.policy.pii())?
+    } else if session.db.is_redis() {
+        validate_redis(sql, &session.db)?
+    } else {
+        validate(sql, &session.policy)?
     };
     // Layer 1.5: the guardrail. Only a plain query can be wrapped in an
     // EXPLAIN; SHOW/DESCRIBE are metadata no planner estimates, so they
@@ -1637,8 +1736,8 @@ fn run_attempt(
 /// extra row that proves truncation), so the statement asks for exactly what
 /// the engine will read.
 ///
-/// A fallback exists only where a guardrail can actually fire: PostgreSQL and
-/// MySQL/MariaDB. SQLite and MongoDB accept `off` and nothing else
+/// A fallback exists only where a guardrail can actually fire: PostgreSQL,
+/// MySQL/MariaDB and ClickHouse. SQLite and MongoDB accept `off` and nothing else
 /// (`guardrail::engine_modes`), so a second statement for them would be text
 /// that can never run.
 fn statements(source: &RowSource, db: &Db, rows: u64) -> (String, Option<String>) {
@@ -1655,6 +1754,15 @@ fn statements(source: &RowSource, db: &Db, rows: u64) -> (String, Option<String>
                 Some(sample::mysql(table, rows, false)),
             ),
             Db::Mongo(_) => (sample::mongo(table, rows), None),
+            Db::Clickhouse(_) => (
+                sample::clickhouse(table, rows, true),
+                Some(sample::clickhouse(table, rows, false)),
+            ),
+            // Unreachable: `sample` is refused for Redis before it gets here
+            // (there is no table to draw from). Kept as a value rather than a
+            // panic so a future path that forgets the guard produces a refusal
+            // from layer 1 instead of killing the process.
+            Db::Redis(_) => ("SAMPLE".to_string(), None),
         },
     }
 }
@@ -1940,6 +2048,52 @@ fn validate_mongo(
     }
 }
 
+/// Layer 1 for Redis, the half that can be decided WITHOUT the server.
+///
+/// Redis is the only engine whose classification needs a round trip: the
+/// verdict comes from `COMMAND INFO`, so the engine makes it, on the command it
+/// is about to run (`engine::Redis::classified`). What can be settled here is
+/// worth settling here, because everything refused before `open_tunnel` costs
+/// no ssh spawn and no connect:
+///
+/// - the SYNTAX (quoting, control characters, an empty line);
+/// - nyet's own DENYLIST, which is flag-independent by construction — `check`
+///   consults it before it looks at `flags`, which is exactly why the scripting
+///   family is refused even though the server calls `EVAL_RO` a read.
+///
+/// The flag half is deliberately NOT approximated here. `check` is called with
+/// `None` flags, which is the "the server does not know this command" case, and
+/// only a `DENIED_COMMAND` verdict is acted on — a `WRITE_OPERATION` from a
+/// `None` is an absence of knowledge, not a verdict, and the engine will ask.
+fn validate_redis(
+    command: &str,
+    db: &Db,
+) -> Result<(String, bool, Vec<output::Warning>, Vec<usize>), Failure> {
+    let Db::Redis(engine) = db else {
+        // Unreachable: the caller checked. A refusal rather than a panic keeps
+        // the fail-closed promise if a future path gets it wrong.
+        return Err(Failure::new(
+            ErrorCode::Internal,
+            "internal: the Redis validator was handed another engine",
+            "report this; nothing was sent to the database",
+        ));
+    };
+    let parsed = nyetdb::redis::parse(command)
+        .map_err(|r| Failure::new(ErrorCode::Nyet(r.reason.as_str()), r.message, r.hint))?;
+    if let Err(r) = nyetdb::redis::check(&parsed, None, &engine.denied, &engine.allowed) {
+        if r.reason == nyetdb::redis::DenyReason::DeniedCommand {
+            return Err(Failure::new(
+                ErrorCode::Nyet(r.reason.as_str()),
+                r.message,
+                r.hint,
+            ));
+        }
+    }
+    // `is_query = false`: there is no plan to wrap this in, and the guardrail is
+    // `off` for Redis anyway (guardrail::engine_modes).
+    Ok((command.to_string(), false, Vec::new(), Vec::new()))
+}
+
 /// One validator refusal -> one NYET failure (exit 5).
 fn refusal_failure(r: validator::Refusal) -> Failure {
     Failure::new(ErrorCode::Nyet(r.reason.as_str()), r.message, r.hint)
@@ -1993,12 +2147,34 @@ fn pii_masked_warning(columns: &[String]) -> output::Warning {
 fn guardrail_skipped_warning() -> output::Warning {
     output::Warning {
         code: "GUARDRAIL_SKIPPED",
-        message: "the guardrail has no estimate it can trust for this query: the planner \
-                  does not bound a recursive CTE (its cost/rows are a LOWER bound, so only \
-                  a plan already over the limit can be refused), and some plan shapes are \
-                  unreadable — so this query was not checked against the connection's \
-                  limit; bound it yourself with WHERE/LIMIT or a smaller --timeout"
+        message: "the guardrail has no estimate it can trust for this query, so it was NOT \
+                  checked against the connection's limit. Reasons differ by engine: the \
+                  PostgreSQL planner does not bound a recursive CTE (its cost/rows are a LOWER \
+                  bound, so only a plan already over the limit can be refused) and some plan \
+                  shapes are unreadable; ClickHouse's EXPLAIN ESTIMATE answers for MergeTree \
+                  tables only, and comes back empty for system tables, table functions and \
+                  anything it answers from metadata. Bound the query yourself with WHERE/LIMIT \
+                  or a smaller --timeout"
             .to_string(),
+    }
+}
+
+/// The ENGINE has no plan to publish, for anything — not this statement, not
+/// any statement. Distinct from "planning outran the budget" (which is about
+/// this query) and from "this is a metadata statement" (which is about its
+/// shape): here the command was classified, accepted and simply has nothing to
+/// estimate. The same closed contract code, a different and non-actionable
+/// story, so the agent stops looking for the plan it did not get (UX-2).
+fn no_plan_engine_warning(engine: &str) -> output::Warning {
+    output::Warning {
+        code: "GUARDRAIL_SKIPPED",
+        message: format!(
+            "{engine} publishes no query plan and no estimate of any kind, so there is nothing \
+             to show and nothing for a guardrail to compare — the command was still classified \
+             (layer 1 ran, and it refuses here exactly as it would for `nyet query`). Bound the \
+             work yourself: ask for a key range rather than a whole collection, and keep \
+             --limit small"
+        ),
     }
 }
 
@@ -2270,6 +2446,71 @@ fn build_engine(
                 validator::Policy::mysql(v_allow, v_deny),
             ))
         }
+        // ClickHouse speaks SQL, so it goes through the same validator with its
+        // own dialect and denylist. Layer 2 is `readonly=1`, which the engine
+        // puts on every request (see src/engine/clickhouse.rs).
+        "clickhouse" => {
+            let Some(url) = &conn.url else {
+                return Err(Failure::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("connection '{alias}' has engine = \"clickhouse\" but no `url`"),
+                    "add url = \"http://user@host:8123/dbname\" (or https:// on 8443) to this \
+                     connection in the config; nyet talks to ClickHouse over its HTTP interface, \
+                     and the database name is required",
+                ));
+            };
+            let url = resolve_secret(alias, "url", url)?;
+            let password = read_password(alias, conn)?;
+            Ok((
+                Db::Clickhouse(engine::Clickhouse {
+                    url,
+                    password,
+                    statement_timeout_ms: engine::Clickhouse::clamp_statement_timeout(
+                        timeout_secs.saturating_mul(1000),
+                    ),
+                    query_timeout_ms: timeout_secs.saturating_mul(1000),
+                    host_override: None,
+                    connect_timeout_ms: None,
+                }),
+                validator::Policy::clickhouse(v_allow, v_deny),
+            ))
+        }
+        // Redis is not SQL either: `src/redis.rs` is its layer 1, and the
+        // classification it applies comes from the SERVER (`COMMAND INFO`), so
+        // half of the verdict needs a connection and is made in the engine. The
+        // SQL `Policy` is still built because `Session` holds one; nothing ever
+        // hands a Redis command to sqlparser.
+        "redis" | "valkey" => {
+            let Some(url) = &conn.url else {
+                return Err(Failure::new(
+                    ErrorCode::ConfigInvalid,
+                    format!(
+                        "connection '{alias}' has engine = \"{}\" but no `url`",
+                        conn.engine
+                    ),
+                    "add url = \"redis://user@host:6379/0\" (or rediss:// for TLS) to this \
+                     connection in the config",
+                ));
+            };
+            let url = resolve_secret(alias, "url", url)?;
+            let password = read_password(alias, conn)?;
+            Ok((
+                Db::Redis(engine::Redis {
+                    url,
+                    password,
+                    // Redis has no server-side statement timeout for a single
+                    // command, so this in-process budget is the ONLY query
+                    // bound — the position SQLite is in.
+                    query_timeout_ms: timeout_secs.saturating_mul(1000),
+                    host_override: None,
+                    connect_timeout_ms: None,
+                    // For Redis these config keys name COMMANDS, not functions.
+                    denied: nyetdb::redis::denylist(v_allow, v_deny),
+                    allowed: nyetdb::redis::allowlist(v_allow),
+                }),
+                validator::Policy::sqlite(v_allow, v_deny),
+            ))
+        }
         // MongoDB is not SQL, so it brings its own layer 1 (`src/mongo.rs`) and
         // an empty SQL policy: `Policy` is still built because `Session` holds
         // one, but nothing ever hands mongosh text to sqlparser.
@@ -2306,8 +2547,8 @@ fn build_engine(
         other => Err(Failure::new(
             ErrorCode::NotImplemented,
             format!("engine \"{other}\" of connection '{alias}' is not supported yet"),
-            "supported engines: sqlite, postgres, mysql, mariadb, mongodb; others arrive in \
-             later releases",
+            "supported engines: sqlite, postgres, mysql, mariadb, mongodb, clickhouse, redis; \
+             others arrive in later releases",
         )),
     }
 }
@@ -2376,6 +2617,13 @@ fn engine_failure(e: engine::EngineError, redact_db_errors: bool) -> Failure {
         engine::EngineError::Connect { message, hint } => {
             Failure::new(ErrorCode::ConnectionFailed, message, hint)
         }
+        // A layer-1 refusal is NOT a database error and is never redacted: it
+        // is nyet's own text about nyet's own rule, and it quotes no cell.
+        engine::EngineError::Refused {
+            reason,
+            message,
+            hint,
+        } => Failure::new(ErrorCode::Nyet(reason), message, hint),
         engine::EngineError::Db { .. } if redact_db_errors => db_error_withheld(),
         engine::EngineError::Db { message, hint } => {
             Failure::new(ErrorCode::DbError, message, hint)
@@ -2470,6 +2718,8 @@ fn engine_kind(engine: &str) -> output::EngineKind {
         "sqlite" => output::EngineKind::Sqlite,
         "postgres" => output::EngineKind::Postgres,
         "mongodb" => output::EngineKind::Mongo,
+        "clickhouse" => output::EngineKind::Clickhouse,
+        "redis" | "valkey" => output::EngineKind::Redis,
         // mysql | mariadb — one driver, one dialect.
         _ => output::EngineKind::Mysql,
     }
@@ -2575,8 +2825,8 @@ fn insecure_transport_warning() -> output::Warning {
         message: "this connection's transport is not guaranteed encrypted or \
                   verified (sslmode/ssl-mode/tls below require and no ssh tunnel); \
                   set sslmode=verify-full (Postgres), ssl-mode=VERIFY_IDENTITY \
-                  (MySQL) or tls=true (MongoDB) in the url, or route through an \
-                  ssh tunnel"
+                  (MySQL), tls=true (MongoDB), an https:// url (ClickHouse) or \
+                  a rediss:// url (Redis), or route through an ssh tunnel"
             .to_string(),
     }
 }
@@ -3059,6 +3309,8 @@ mod tests {
             pii: Vec::new(),
             connect: output::ConnectFact::Ok { via_tunnel: false },
             server: Some(output::ServerFacts {
+                readonly: None,
+                classifier_error: None,
                 js: None,
                 read_only_note: None,
                 probe: output::ProbeFact::Unknown {
