@@ -1,0 +1,1 @@
+db.users.find({email: "a@b.c"})

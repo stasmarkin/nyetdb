@@ -1,0 +1,1 @@
+db.orders.aggregate([{$lookup: {from: "users", localField: "u", foreignField: "_id", as: "j"}}])

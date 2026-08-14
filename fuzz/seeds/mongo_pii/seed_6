@@ -1,0 +1,1 @@
+db.users.aggregate([{$group: {_id: "$email", n: {$sum: 1}}}])
