@@ -393,3 +393,20 @@
 - query: SELECT * FROM
   verdict: deny
   reason: PARSE_FAILED
+
+# --- W7 audit (August 2026): parser-vs-server, the fail-closed half ---
+# A backslash does NOT escape a quote under standard_conforming_strings=on
+# (the default), so the semicolon really is a separator — and the validator
+# reads it the same way the server does.
+- query: SELECT '\';DROP TABLE t;--'
+  verdict: deny
+  reason: MULTI_STATEMENT
+- query: SELECT $$a$$ ; DROP TABLE t
+  verdict: deny
+  reason: MULTI_STATEMENT
+# A homoglyph in a keyword (Cyrillic С in SELECT) does not parse — fail closed
+# rather than guessing at what the server might fold it to.
+- query: SELEСT 1
+  verdict: deny
+  reason: PARSE_FAILED
+

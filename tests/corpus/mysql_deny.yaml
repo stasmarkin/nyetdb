@@ -267,3 +267,14 @@
 - query: SELECT IS_FREE_LOCK('l')
   verdict: allow
 
+# --- W7 audit (August 2026): MySQL does NOT nest block comments, so the same
+# text that is one statement on Postgres is TWO here — the validator is
+# dialect-aware and refuses it (verified against mysql:8.4, which closes the
+# comment at the first `*/` and goes on to execute what follows).
+- query: SELECT 1 /* outer /* inner */ ; DROP TABLE t; -- */
+  verdict: deny
+  reason: MULTI_STATEMENT
+- query: SELECT 1 /* /* */ ; DROP TABLE t; */
+  verdict: deny
+  reason: PARSE_FAILED
+

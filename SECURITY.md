@@ -131,6 +131,26 @@ file it privately as above.
   **specifically** to hunt this down — but there is no 100% guarantee, which is
   why layer 3 (the read-only database role) matters.
 
+  An audit in August 2026 found one real divergence and one unadvertised
+  barrier. The divergence: with `sql_mode=NO_BACKSLASH_ESCAPES`, MySQL does not
+  treat `\'` as an escape, so `SELECT '\';SELECT 2;--'` is **two** statements to
+  the server and one string literal to the validator. The barrier: it does not
+  get through anyway, because queries are sent as *prepared statements*, and
+  neither MySQL nor PostgreSQL will accept a second statement in one — measured,
+  the server rejected the whole string with a syntax error. So multi-statement
+  smuggling has to beat the parser **and** the wire protocol, not just the
+  parser. This is worth knowing about rather than relying on: it is a property
+  of how the driver sends queries today, not a promise, and anything that ever
+  switches to the simple query protocol (or adds a code path building SQL as
+  text for the server to split) loses it silently.
+
+  Checked in the same pass and found to agree with the server: nested block
+  comments (Postgres nests, MySQL does not — the validator is dialect-aware and
+  refuses on MySQL what it accepts on Postgres), dollar-quoted strings, `E''`
+  escapes, a `;` inside a literal, and Unicode — a homoglyph in a keyword fails
+  to parse rather than being folded, and a zero-width character is stripped by
+  normalization, with the *normalized* text being what actually runs.
+
 - **The audit log and SSH tunnel have agent-reachable edges.** The default audit
   path resolves from agent-controlled `XDG_DATA_HOME`/`HOME`, so an
   agent-resistant trail needs an explicit literal `[audit] path` plus the

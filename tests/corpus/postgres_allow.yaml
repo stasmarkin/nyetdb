@@ -95,3 +95,26 @@
 # keep accepting it
 - query: SELECT * FROM "sales"."orders" ORDER BY random() LIMIT 11
   verdict: allow
+
+# --- W7 audit (August 2026): parser-vs-server agreement. Each case was run
+# against postgres:16-alpine to confirm the server reads it the same way.
+# Postgres NESTS block comments, so everything up to the matching close is one
+# comment and the statement is just `SELECT 1` — the validator agrees.
+- query: SELECT 1 /* outer /* inner */ ; DROP TABLE t; -- */
+  verdict: allow
+# Dollar quoting: the semicolons are literal text, not statement separators.
+- query: SELECT $$; DROP TABLE t; --$$
+  verdict: allow
+- query: SELECT $tag$; DROP TABLE t; --$tag$
+  verdict: allow
+# E'' escapes a quote, so the rest stays inside the literal (the server does
+# the same). The plain '...' spelling does NOT escape under
+# standard_conforming_strings=on and is refused as MULTI_STATEMENT — see
+# postgres_deny.yaml.
+- query: SELECT E'\';DROP TABLE t;--'
+  verdict: allow
+- query: SELECT 'a; DROP TABLE t'
+  verdict: allow
+- query: SELECT 1;
+  verdict: allow
+
