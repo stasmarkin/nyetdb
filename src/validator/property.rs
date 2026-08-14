@@ -142,6 +142,20 @@ const QUERY_WRAPPERS: &[(&str, &str)] = &[
 /// keeps its meaning inside it (`EXPLAIN BEGIN` really is a StartTransaction).
 const STATEMENT_WRAPPERS: &[(&str, &str)] = &[("EXPLAIN ", "")];
 
+/// One per family of `CLICKHOUSE_DENIED_FUNCTIONS`, spelled the way ClickHouse
+/// really takes them (`url`/`s3`/`executable` are TABLE functions, so they only
+/// compose from a FROM clause). Reached only through the differential test:
+/// `DIALECTS` below is what the property test itself runs, and ClickHouse is
+/// not in it — this list exists so `render("clickhouse")` has an answer.
+const CLICKHOUSE_DENIED_CALLS: &[&str] = &[
+    "SELECT * FROM url('http://127.0.0.1:1/x', CSV, 'a String')",
+    "SELECT * FROM cluster('default', system.one)",
+    "SELECT * FROM executable('x', CSV, 'a UInt8')",
+    "SELECT * FROM sqlite('/tmp/x.db', 't')",
+    "SELECT sleep(1)",
+    "SELECT dictGet('d', 'k', toUInt64(1))",
+];
+
 const DIALECTS: &[&str] = &["sqlite", "postgres", "mysql"];
 
 /// `pub(super)` here and on `Node`/`statement` below: the differential test
@@ -154,6 +168,7 @@ pub(super) fn policy(dialect: &str) -> Policy {
         "sqlite" => Policy::sqlite(&[], &[]),
         "postgres" => Policy::postgres(&[], &[]),
         "mysql" => Policy::mysql(&[], &[]),
+        "clickhouse" => Policy::clickhouse(&[], &[]),
         other => panic!("unknown dialect {other:?}"),
     }
 }
@@ -163,6 +178,7 @@ fn denied_calls(dialect: &str) -> &'static [&'static str] {
         "sqlite" => SQLITE_DENIED_CALLS,
         "postgres" => POSTGRES_DENIED_CALLS,
         "mysql" => MYSQL_DENIED_CALLS,
+        "clickhouse" => CLICKHOUSE_DENIED_CALLS,
         other => panic!("unknown dialect {other:?}"),
     }
 }

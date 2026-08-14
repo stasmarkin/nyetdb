@@ -16,16 +16,22 @@
 //!   `pg_advisory_lock`) is a write the server runs happily. That half is held
 //!   from the other side by the denylist + `property.rs`; the split is
 //!   deliberate, and this oracle is not the guard for it.
-//! * **Oracle B — one statement (Postgres only)**: layer 1 accepted the text as
-//!   exactly one statement, so the prepared protocol (which takes exactly one)
-//!   must agree. Only `pg_verdict` distinguishes it — MySQL reports a second
-//!   command as a plain syntax error and SQLite silently executes the tail, so
-//!   there the multi-statement input lands in the report, not in a finding.
+//! * **Oracle B — one statement (Postgres and ClickHouse)**: layer 1 accepted
+//!   the text as exactly one statement, so the server (whose prepared protocol
+//!   takes exactly one, or whose HTTP interface refuses two outright) must
+//!   agree. Only `pg_verdict` and `ch_verdict` distinguish it — MySQL reports a
+//!   second command as a plain syntax error and SQLite silently executes the
+//!   tail, so there the multi-statement input lands in the report, not in a
+//!   finding.
 //!
 //! The read-only guard is not trusted to hold for free: the write canary is
 //! fired BOTH before and after the input loop, so a validator regression that
 //! let one input disarm read-only mid-run (`SET ... read_only = off`) fails the
 //! test instead of turning every later input into a silent real write.
+//! ClickHouse is the one dialect where that cannot happen at all — `readonly=1`
+//! is a url parameter on every single request, not session state — and the
+//! canary still runs on both sides, where what it proves is that the server is
+//! answering the same way at the end of the run as at the start.
 //!
 //! Every other server error — no such table/column/function, a syntax that
 //! dialect does not have — is NOT a finding: it is counted and printed, so a
@@ -38,12 +44,17 @@
 //!
 //! Measured on the first full run (no divergence found, which is the result
 //! this file exists to keep true): postgres 460 allowed inputs of which 335
-//! reached execution, mysql 369/306, sqlite 399/290 — ~0.5s of round trips per
-//! dialect, ~7s wall with both containers, and +0.4s on `cargo test --lib`,
-//! where they overlap the container tests already there.
+//! reached execution, mysql 369/306, sqlite 399/290, clickhouse 352/262 — ~0.5s
+//! of round trips per dialect, ~7s wall with the containers, and +0.4s on
+//! `cargo test --lib`, where they overlap the container tests already there.
 //!
-//! Not run by `just test-fast` (see the justfile): two of the three need a
-//! container, and all three are one experiment.
+//! ClickHouse found the one divergence that is not a bypass, and it is recorded
+//! rather than fixed: its `readonly = 1` is BROADER than "not a write" and
+//! refuses two table functions the corpus allows as reads — see
+//! `CH_REFUSED_BY_LAYER2`.
+//!
+//! Not run by `just test-fast` (see the justfile): three of the four need a
+//! container, and all four are one experiment.
 
 use super::property::{policy, statement, Node};
 use super::{validate, Verdict};
@@ -109,7 +120,23 @@ fn cols(dialect: &str) -> String {
     let (json, ts, array) = match dialect {
         "postgres" => ("jsonb", "timestamptz", "text[]"),
         "mysql" => ("json", "timestamp NULL", "text"),
+        // ClickHouse takes the SQL spellings of the shared list below (`int`,
+        // `text`, `decimal(10,2)` are aliases for Int32/String/Decimal), so only
+        // the three load-bearing ones need naming — and `tags` must be a real
+        // Array, because the corpus does `ARRAY JOIN tags` on it.
+        "clickhouse" => ("String", "DateTime", "Array(String)"),
         _ => ("text", "text", "text"),
+    };
+    // Columns only one dialect's corpus projects. ClickHouse's are the
+    // analytics shapes (`quantilesTDigest(...)(latency_ms)`, `arrayMap` over
+    // `sizes`) plus the three whose NAMES look like denied functions — the
+    // cases that pin that the denylist matches calls, not identifiers.
+    let extra = match dialect {
+        "clickhouse" => {
+            ", ts DateTime, sizes Array(Int32), latency_ms Int32, secret_note String, \
+             file_size Int32, sleep_ms Int32, clusterId Int32"
+        }
+        _ => "",
     };
     format!(
         "id int, user_id int, uid int, order_id int, x int, n int, \
@@ -120,22 +147,38 @@ fn cols(dialect: &str) -> String {
          tags {array}, data {json}, doc {json}, \
          sleep int, benchmark int, get_lock int, release_lock int, load_file text, \
          master_pos_wait int, master_gtid_wait int, pg_sleep int, pg_advisory_lock int, \
-         histogram text, min_value text, max_value text, most_common_vals text"
+         histogram text, min_value text, max_value text, most_common_vals text{extra}"
     )
 }
 
 /// `CREATE TABLE`s to run BEFORE the session goes read-only.
 fn schema(dialect: &str) -> Vec<String> {
     let cols = cols(dialect);
+    // ClickHouse has no default table engine, and MergeTree has no default
+    // sorting key: a bare `CREATE TABLE t (...)` is refused outright.
+    // Replacing rather than plain MergeTree because the corpus reads `FROM
+    // events FINAL`, which only the deduplicating engines accept (ILLEGAL_FINAL
+    // otherwise) — the statement has to reach the write check, not die at the
+    // planner.
+    let engine = match dialect {
+        "clickhouse" => " ENGINE = ReplacingMergeTree ORDER BY id",
+        _ => "",
+    };
     let mut ddl: Vec<String> = SCHEMA_TABLES
         .iter()
-        .map(|t| format!("CREATE TABLE {t} ({cols})"))
+        .map(|t| format!("CREATE TABLE {t} ({cols}){engine}"))
         .collect();
     if dialect == "postgres" {
         // `SELECT ssn FROM app.customers` (corpus) and `currval('users_id_seq')`.
         ddl.insert(0, "CREATE SCHEMA app".to_string());
         ddl.push(format!("CREATE TABLE app.customers ({cols})"));
         ddl.push("CREATE SEQUENCE users_id_seq".to_string());
+    }
+    if dialect == "clickhouse" {
+        // The same `app.customers` case — a DATABASE here, since ClickHouse has
+        // no schema level between the two.
+        ddl.insert(0, "CREATE DATABASE app".to_string());
+        ddl.push(format!("CREATE TABLE app.customers ({cols}){engine}"));
     }
     ddl
 }
@@ -543,6 +586,219 @@ fn differential_sqlite_readonly_oracle() {
         assert_readonly_holds!(conn, sqlite_verdict, "sqlite", "after the loop");
         tally.assert_covered("sqlite", inputs.len());
         tally.assert_clean("sqlite");
+    });
+}
+
+// --- ClickHouse (HTTP, no session) --------------------------------------
+
+/// Digest-pinned, and the same image `tests/clickhouse.rs` pins: two files
+/// reason about one server, and a future push of the tag must not silently
+/// change it under either.
+const CH_TAG: &str =
+    "24.8-alpine@sha256:b002e56ed5c16e224c312527f6fcba7e77216fec5d7a88a7828f59efc614feb5";
+
+/// Layer 2, as ClickHouse spells it: a url PARAMETER, not a session state.
+/// There is nothing to arm and nothing an input could disarm — every request
+/// carries it or it does not exist — so the guard is repeated on every single
+/// input rather than set once. The caps are the engine's own
+/// (`Clickhouse::capped_settings`), so one pathological read cannot hang the
+/// suite; `result_overflow_mode = break` makes the row cap a stop, not an error.
+/// `union_default_mode` is the one parameter here that is NOT the engine's:
+/// ClickHouse refuses a bare `UNION` outright (EXPECTED_ALL_OR_DISTINCT), and
+/// the generator emits one in a fifth of its statements. Left at the default,
+/// those inputs die before the write check and the run degenerates into a
+/// syntax report — and how a set operation deduplicates cannot turn a read into
+/// a write, so nothing this oracle asks about is affected.
+const CH_READONLY: &str = "readonly=1&wait_end_of_query=1&max_execution_time=5\
+                           &max_result_rows=100&result_overflow_mode=break\
+                           &union_default_mode=ALL";
+
+/// Statements the corpus allows ON PURPOSE that `readonly = 1` refuses anyway.
+///
+/// ClickHouse's readonly is broader than "not a write": a table function it has
+/// not flagged as readonly-safe is refused with the same `Code: 164 (READONLY)`
+/// an INSERT gets, even when it only reads local tables. Measured on 24.8:
+/// `merge` and `format` are refused, `numbers`/`values`/`null`/`generateRandom`
+/// run. Layer 1 is right to allow them — they are reads, and a rule denying
+/// them would carry no security content — and nyet stays fail-closed either
+/// way, since layer 2 is what refuses them and the engine's hint says exactly
+/// that. So this is divergence to RECORD, not a bypass.
+///
+/// Exact texts, never a pattern: anything NEW that lands on 164 is still a
+/// finding, which is the point of the list being here rather than in the
+/// oracle.
+const CH_REFUSED_BY_LAYER2: &[&str] = &[
+    "SELECT * FROM merge('default', '^events')",
+    "SELECT * FROM format(CSV, 'a UInt8', '1')",
+];
+
+/// One HTTP request straight at the server, which is deliberately NOT
+/// `engine::Clickhouse`: that client DEGRADES its own parameters when the
+/// account may not set them, and its last step drops `readonly` itself (see
+/// `Clickhouse::post`). That is right for the tool — there the account's own
+/// profile carries layer 2 — and wrong for an oracle, where dropping `readonly`
+/// would EXECUTE the very input under test.
+///
+/// HTTP/1.0 on purpose, the same reason the stand in tests/clickhouse.rs gives:
+/// 1.1 makes the server answer `Transfer-Encoding: chunked`, and this is a
+/// socket and a format string, not an HTTP client.
+async fn ch_try(port: u16, params: &str, sql: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .ok()?;
+    let (mut read, mut write) = stream.into_split();
+    // JSONCompact because that is the format nyet's engine asks for, and the
+    // format decides where a failure hides — see `ch_verdict`.
+    let request = format!(
+        "POST /?database=default&{params} HTTP/1.0\r\nHost: 127.0.0.1\r\n\
+         X-ClickHouse-Format: JSONCompact\r\nContent-Length: {}\r\n\r\n{sql}",
+        sql.len()
+    );
+    write.write_all(request.as_bytes()).await.ok()?;
+    let mut response = String::new();
+    read.read_to_string(&mut response).await.ok()?;
+    Some(response)
+}
+
+async fn ch_post(port: u16, params: &str, sql: &str) -> String {
+    ch_try(port, params, sql)
+        .await
+        .unwrap_or_else(|| panic!("clickhouse did not answer: {sql}"))
+}
+
+/// What the server thought, read from ALL THREE places a ClickHouse failure can
+/// hide: the status line, the `X-ClickHouse-Exception-Code` header, and — the
+/// nasty one — an `"exception"` field INSIDE a well-formed JSON document, right
+/// beside `"data": [], "rows": 0`. Measured: a refused write comes back as
+/// valid JSONCompact saying zero rows, so "it parsed" is not "it ran", and an
+/// oracle that only looked at the body would score every finding as a pass.
+fn ch_verdict(response: &str) -> ServerVerdict {
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or((response, ""));
+    let status_ok = head.lines().next().is_some_and(|l| l.contains(" 200 "));
+    let code = head.lines().find_map(|line| {
+        line.to_ascii_lowercase()
+            .strip_prefix("x-clickhouse-exception-code:")
+            .map(|code| code.trim().to_string())
+    });
+    if status_ok && code.is_none() && !body.contains("\"exception\":") {
+        return ServerVerdict::Ran;
+    }
+    // The message itself, unwrapped from the JSON field it arrived in and
+    // trimmed of the `(version 24.8...)` banner every ClickHouse exception ends
+    // with — otherwise the report's classes are all JSON punctuation.
+    let msg = match body.lines().find(|l| l.contains("DB::Exception: ")) {
+        Some(line) => {
+            let text = line.split_once("DB::Exception: ").unwrap().1;
+            text.rsplit_once(" (version ")
+                .map_or(text, |(m, _)| m)
+                .trim()
+        }
+        None => head.lines().next().unwrap_or_default().trim(),
+    }
+    .to_string();
+    match code.as_deref() {
+        // READONLY — the one code that means "this is not a read", and a
+        // sharper oracle than the other three dialects have: ClickHouse counts
+        // a settings change and nearly every table function as a write too.
+        Some("164") => ServerVerdict::Write(msg),
+        // SYNTAX_ERROR. Unlike MySQL's, the multi-command refusal is a message
+        // of its own under it, so oracle B is a finding here rather than a line
+        // in the report: layer 1 accepted the text as exactly one statement and
+        // the server counted two.
+        Some("62") if msg.contains("Multi-statements are not allowed") => {
+            ServerVerdict::MultiStatement(msg)
+        }
+        other => ServerVerdict::Other(format!(
+            "{} {}",
+            other.unwrap_or("no-code"),
+            first_words(&msg)
+        )),
+    }
+}
+
+/// Fire the write canary and assert `readonly=1` still refuses it as a write —
+/// the ClickHouse shape of `assert_readonly_holds!`, which cannot be used here
+/// (there is no sqlx error and no connection to borrow).
+async fn ch_readonly_holds(port: u16, when: &str) {
+    let got = ch_verdict(&ch_post(port, CH_READONLY, WRITE_CANARY).await);
+    assert!(
+        matches!(got, ServerVerdict::Write(_)),
+        "clickhouse: read-only does not hold {when} — write canary judged {got:?}",
+    );
+}
+
+#[test]
+fn differential_clickhouse_readonly_oracle() {
+    use testcontainers_modules::testcontainers::core::IntoContainerPort;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
+
+    block_on(async {
+        let container = GenericImage::new("clickhouse/clickhouse-server", CH_TAG)
+            .with_exposed_port(8123.tcp())
+            .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
+            .start()
+            .await
+            .expect("start clickhouse-server (is docker/colima running?)");
+        let port = container.get_host_port_ipv4(8123).await.unwrap();
+        // This image logs to a FILE inside the container, so there is no banner
+        // on any stream to wait for: the interface answering IS the readiness
+        // signal (the same poll tests/clickhouse.rs runs).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ch_try(port, "", "SELECT 1")
+            .await
+            .is_none_or(|r| !r.contains(" 200 "))
+        {
+            assert!(Instant::now() < deadline, "clickhouse never came up");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // The schema goes in WITHOUT layer 2 — this is the setup, not an input.
+        for ddl in schema("clickhouse") {
+            let reply = ch_post(port, "wait_end_of_query=1", &ddl).await;
+            assert!(
+                matches!(ch_verdict(&reply), ServerVerdict::Ran),
+                "schema setup failed: {ddl}\n{reply}"
+            );
+        }
+
+        ch_readonly_holds(port, "before the loop").await;
+        let multi = ch_verdict(&ch_post(port, CH_READONLY, MULTI_CANARY).await);
+        assert!(
+            matches!(multi, ServerVerdict::MultiStatement(_)),
+            "clickhouse oracle B is blind to {MULTI_CANARY:?}: {multi:?}",
+        );
+
+        let inputs = allowed_inputs("clickhouse");
+        // The exception list is not allowed to rot into a list of statements
+        // nobody sends any more.
+        for pinned in CH_REFUSED_BY_LAYER2 {
+            assert!(
+                inputs.iter().any(|sql| sql == pinned),
+                "{pinned:?} is no longer an allowed input — drop it from CH_REFUSED_BY_LAYER2"
+            );
+        }
+        let started = Instant::now();
+        let mut tally = Tally::default();
+        for sql in &inputs {
+            let verdict = match ch_verdict(&ch_post(port, CH_READONLY, sql).await) {
+                ServerVerdict::Write(_) if CH_REFUSED_BY_LAYER2.contains(&sql.as_str()) => {
+                    ServerVerdict::Other("164 allowed read, refused by readonly=1".to_string())
+                }
+                other => other,
+            };
+            tally.record(sql, verdict);
+        }
+        tally.report("clickhouse", inputs.len(), started.elapsed());
+        // Re-armed after the loop like the other three, even though layer 2 here
+        // rides on every request and no input could have switched it off: what
+        // it still proves is that the SERVER is answering the same way at the
+        // end of the run as at the start.
+        ch_readonly_holds(port, "after the loop").await;
+        tally.assert_covered("clickhouse", inputs.len());
+        tally.assert_clean("clickhouse");
+        drop(container);
     });
 }
 
