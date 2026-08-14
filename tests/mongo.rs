@@ -150,6 +150,19 @@ async fn start_and_seed() -> (ContainerAsync<Mongo>, u16) {
     .unwrap();
     // A view plus a role scoped to it: the README's own recipe for exposing a
     // curated slice, and the setup where `listCollections` is Unauthorized.
+    // Two views over the PROTECTED collection: one that hands the field on
+    // (the gap `pii_views` reports) and one built the way `pii_columns`
+    // recommends, which must NOT be reported — otherwise the two checks
+    // contradict each other.
+    db.run_command(doc! { "create": "validated_view", "viewOn": "validated", "pipeline": [] })
+        .await
+        .unwrap();
+    db.run_command(doc! {
+        "create": "validated_safe", "viewOn": "validated",
+        "pipeline": [ { "$unset": ["email"] } ]
+    })
+    .await
+    .unwrap();
     db.run_command(doc! { "create": "small_view", "viewOn": "small", "pipeline": [] })
         .await
         .unwrap();
@@ -704,6 +717,26 @@ fn pii_policy_denies_and_masks(home: &Path, port: u16) {
     let columns = v["schema"]["tables"][0]["columns"].as_array().unwrap();
     let email = columns.iter().find(|c| c["name"] == "email").unwrap();
     assert_eq!(email["pii"], "mask", "{v}");
+
+    // W7: a [pii] rule names one collection, so a view over it is outside the
+    // policy — doctor names such views instead of leaving them to be found the
+    // hard way. `validated_safe` $unsets the field, so it is NOT reported: the
+    // check probes what the view actually exposes (with `$type`, which answers
+    // "missing" rather than the value), not merely what it reads.
+    let out = run(home, &deny_cfg, &["doctor", "mg", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = envelope(&out);
+    let check = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "pii_views")
+        .unwrap_or_else(|| panic!("no pii_views check: {v}"));
+    assert_eq!(check["status"], "warn", "{check}");
+    let message = check["message"].as_str().unwrap();
+    assert!(message.contains("validated_view"), "{check}");
+    assert!(!message.contains("validated_safe"), "{check}");
+    assert!(!message.contains("small_view"), "{check}");
 }
 
 /// `nyet schema` on a real server: the listing, a collection with a declared

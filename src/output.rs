@@ -1136,7 +1136,7 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
         input
             .pii_mode
             .and(input.diagnosis.pii_views.as_ref())
-            .map(|views| pii_views_check(views)),
+            .map(|views| pii_views_check(views, input.engine)),
     )
     .chain([permissions_check(&input.permissions)])
     .collect()
@@ -1645,23 +1645,45 @@ fn secret_source_check(secret: SecretFact) -> DoctorCheck {
 /// value itself. nyet cannot fix that for the human (widening the policy to
 /// every dependent view would be nyet deciding what their data model means),
 /// but it can refuse to let them find out the hard way.
-fn pii_views_check(views: &[String]) -> DoctorCheck {
+fn pii_views_check(views: &[String], engine: EngineKind) -> DoctorCheck {
+    // The two engines answer slightly different questions, and the wording has
+    // to match: PostgreSQL filters by what this role may SELECT, MongoDB
+    // reports every view that exposes the collection (it has no cheap
+    // per-object privilege predicate). Promising the narrower thing on Mongo
+    // would be a claim nyet did not check.
+    let scoped = engine != EngineKind::Mongo;
     if views.is_empty() {
         return ok_check(
             "pii_views",
-            "no view this role can read exposes a protected column",
+            match scoped {
+                true => "no view this role can read exposes a protected column",
+                false => "no view exposes a protected collection",
+            },
         );
     }
-    warn_check(
-        "pii_views",
-        format!(
-            "the [pii] policy is keyed to the table it names, so these views over a \
-             protected column are NOT covered and this role can read them: {}",
-            views.join(", ")
+    match scoped {
+        true => warn_check(
+            "pii_views",
+            format!(
+                "the [pii] policy is keyed to the table it names, so these views over a \
+                 protected column are NOT covered and this role can read them: {}",
+                views.join(", ")
+            ),
+            "name each view in [pii] columns as well (\"<view>.<column>\"), or revoke this \
+             role's SELECT on it — a rule on the table does not follow the data into a view",
         ),
-        "name each view in [pii] columns as well (\"<view>.<column>\"), or revoke this \
-         role's SELECT on it — a rule on the table does not follow the data into a view",
-    )
+        false => warn_check(
+            "pii_views",
+            format!(
+                "the [pii] policy is keyed to the collection it names, so these views over \
+                 a protected collection are NOT covered by it: {}",
+                views.join(", ")
+            ),
+            "name each view in [pii] columns as well (\"<view>.<field>\"), or keep this \
+             role away from it — a rule on the collection does not follow the data into a \
+             view (whether the role may read them is not something nyet checked here)",
+        ),
+    }
 }
 
 fn permissions_check(permissions: &Permissions) -> DoctorCheck {
@@ -2461,6 +2483,47 @@ mod tests {
     /// A worst-case Postgres setup: the role can write and is a superuser, the
     /// transport is insecure and the config file is loose. Every warn/fail
     /// carries an actionable hint (Д10); every ok/na does not.
+    /// W7: the two engines answer different questions, and the wording must
+    /// not promise more than was checked — PostgreSQL scopes the list to what
+    /// the role may read, MongoDB cannot and says so.
+    #[test]
+    fn pii_views_check_promises_only_what_each_engine_verified() {
+        let none = pii_views_check(&[], EngineKind::Postgres);
+        assert_eq!(none.status, CheckStatus::Ok);
+        assert!(
+            none.message.contains("this role can read"),
+            "{}",
+            none.message
+        );
+
+        let pg = pii_views_check(&["public.v_users".to_string()], EngineKind::Postgres);
+        assert_eq!(pg.status, CheckStatus::Warn);
+        assert!(pg.message.contains("public.v_users"), "{}", pg.message);
+        assert!(
+            pg.hint.as_deref().unwrap().contains("revoke"),
+            "{:?}",
+            pg.hint
+        );
+
+        // Mongo: no per-object privilege predicate, so no claim about reach.
+        let mongo = pii_views_check(&["people".to_string()], EngineKind::Mongo);
+        assert_eq!(mongo.status, CheckStatus::Warn);
+        assert!(
+            !mongo.message.contains("this role can read"),
+            "{}",
+            mongo.message
+        );
+        assert!(
+            mongo
+                .hint
+                .as_deref()
+                .unwrap()
+                .contains("not something nyet checked"),
+            "{:?}",
+            mongo.hint
+        );
+    }
+
     #[test]
     fn doctor_checks_cover_all_statuses_with_hints() {
         let input = DoctorInput {

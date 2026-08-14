@@ -1449,6 +1449,89 @@ async fn pg_pii_views(
     Some(found)
 }
 
+/// Views over a protected collection: MongoDB keeps `viewOn` (and the view's
+/// own pipeline) in `listCollections`, so the question a `[pii]` rule cannot
+/// answer for itself — "what else reads this data under another name" — is one
+/// server round trip away.
+///
+/// Both halves matter: `viewOn` is the ordinary case, and a view whose pipeline
+/// pulls the collection in with `$lookup`/`$unionWith` reads it just as truly
+/// while naming something else in `viewOn`. Unlike the PostgreSQL twin this
+/// does NOT filter by what the role may read: MongoDB has no cheap per-object
+/// privilege predicate, so the list is "views that expose it", and the check's
+/// wording promises exactly that and no more. `None` on any failure — an
+/// unanswered question is never a pass (UX-1).
+async fn mongo_pii_views(db: &mongodb::Database, pii: &[(String, String)]) -> Option<Vec<String>> {
+    use mongodb::bson::{doc, Bson, Document};
+
+    /// Does this view pipeline pull `target` in by name anywhere inside it?
+    fn pipeline_reads(value: &Bson, target: &str) -> bool {
+        match value {
+            Bson::Document(doc) => doc.iter().any(|(key, inner)| {
+                (matches!(key.as_str(), "from" | "coll")
+                    && inner.as_str().is_some_and(|name| name == target))
+                    || pipeline_reads(inner, target)
+            }),
+            Bson::Array(items) => items.iter().any(|item| pipeline_reads(item, target)),
+            _ => false,
+        }
+    }
+
+    let filter = doc! { "type": "view" };
+    let mut cursor = db.list_collections().filter(filter).await.ok()?;
+    let mut views: Vec<(String, Document)> = Vec::new();
+    while cursor.advance().await.ok()? {
+        let spec = cursor.deserialize_current().ok()?;
+        let options = mongodb::bson::to_document(&spec.options).ok()?;
+        views.push((spec.name, options));
+    }
+    let mut found: Vec<String> = Vec::new();
+    for (collection, field) in pii {
+        for (name, options) in &views {
+            let reads = options
+                .get_str("viewOn")
+                .is_ok_and(|on| on.eq_ignore_ascii_case(collection))
+                || options
+                    .get("pipeline")
+                    .is_some_and(|p| pipeline_reads(p, collection));
+            if !reads || found.contains(name) {
+                continue;
+            }
+            // Reading the collection is not the same as exposing the field —
+            // and the fix `pii_columns` recommends is precisely a view that
+            // $unsets it. Warning about THAT would make the two checks
+            // contradict each other, so ask the view whether the field
+            // survives. `$type` answers with "missing" instead of the value,
+            // so the diagnosis never pulls protected data into nyet.
+            let probe = vec![
+                doc! { "$limit": 1i64 },
+                doc! { "$project": { "kind": { "$type": format!("${field}") } } },
+            ];
+            let exposed = match db.collection::<Document>(name).aggregate(probe).await {
+                Ok(mut cursor) => match cursor.advance().await {
+                    // An empty view proves nothing either way; the pipeline
+                    // still names the field, so keep it on the list.
+                    Ok(false) => true,
+                    Ok(true) => cursor
+                        .deserialize_current()
+                        .ok()
+                        .and_then(|d: Document| d.get_str("kind").ok().map(str::to_string))
+                        .is_none_or(|kind| kind != "missing"),
+                    Err(_) => true,
+                },
+                // Cannot ask (no privilege on the view, for instance) -> keep
+                // it: unverified is never a pass.
+                Err(_) => true,
+            };
+            if exposed {
+                found.push(name.clone());
+            }
+        }
+    }
+    found.sort();
+    Some(found)
+}
+
 /// Gather the PostgreSQL role facts for doctor: superuser status, whether the
 /// server is a hot standby / defaults to read-only (WHY a write would be
 /// refused), and the write probe (the FACT that it is).
@@ -3839,7 +3922,11 @@ impl Engine for Mongo {
     /// anything itself — and it checks the WHOLE cluster, because a role that
     /// may write in another database is a way out for this one's data
     /// (`$out: {db: ..., coll: ...}`, measured).
-    async fn diagnose(&self, _pii: &[(String, String)]) -> Diagnosis {
+    ///
+    /// The `pii` argument is used for the view check below: MongoDB has no
+    /// field privileges to ask about, but it does publish which collection
+    /// each view reads.
+    async fn diagnose(&self, pii: &[(String, String)]) -> Diagnosis {
         let (client, database) = match self.open().await {
             Ok(open) => open,
             Err(e) => {
@@ -3892,8 +3979,15 @@ impl Engine for Mongo {
                 )
             }
         };
+        // A [pii] rule names one collection, so a view over it is outside the
+        // policy — the same gap the PostgreSQL check reports, and MongoDB
+        // publishes the answer in listCollections.
+        let pii_views = match pii.is_empty() {
+            true => None,
+            false => mongo_pii_views(&db, pii).await,
+        };
         Diagnosis {
-            pii_views: None,
+            pii_views,
             connect: ConnectFact::Ok {
                 via_tunnel: self.host_override.is_some(),
             },
