@@ -38,7 +38,7 @@
 
 # DESCRIBE and the SHOW family are in the top-level allowlist (DESIGN §3);
 # on SQLite most of them fail later, in the database (DB_ERROR), but the
-# validator must not block a read. One case per reachable AST variant (Д6).
+# validator must not block a read. One case per reachable AST variant (D6).
 - query: DESCRIBE users
   verdict: allow
 - query: DESC users

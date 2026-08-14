@@ -1,7 +1,7 @@
 //! MySQL/MariaDB end-to-end: drive the real binary against a throwaway
 //! mariadb:11.4 container (testcontainers + Docker/colima). Requires a reachable
 //! Docker daemon; these tests fail (not skip) without one, so CI with a docker
-//! service runs them. Pins exit codes and envelope structure (Д7).
+//! service runs them. Pins exit codes and envelope structure (D7).
 //!
 //! MariaDB is the e2e flavor because its default `mysql_native_password` auth
 //! works over the plaintext loopback — MySQL 8's default `caching_sha2_password`

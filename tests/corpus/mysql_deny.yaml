@@ -74,7 +74,7 @@
   verdict: deny
   reason: MULTI_STATEMENT
 
-# --- locking clauses (DESIGN §3 п.6) ---
+# --- locking clauses (DESIGN §3 step 6) ---
 - query: SELECT * FROM users FOR UPDATE
   verdict: deny
   reason: LOCKING_CLAUSE

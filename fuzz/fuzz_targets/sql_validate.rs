@@ -2,7 +2,7 @@
 //! verdict for ANY string, never unwind.
 //!
 //! The oracle is indirect on purpose. `validate` wraps itself in `catch_unwind`
-//! (a panic is a bug, but it must not escape as an abort — Д3), so libFuzzer
+//! (a panic is a bug, but it must not escape as an abort — D3), so libFuzzer
 //! would never see the panic it catches: it comes back as an ordinary refusal
 //! with `reason = INTERNAL_ERROR`. So THAT is what this target treats as the
 //! crash. Panics from anywhere outside the guarded region — the refusal

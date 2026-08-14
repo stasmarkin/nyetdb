@@ -1,4 +1,4 @@
-//! cli layer: clap, orchestration, all IO, exit codes. The "лапша" lives
+//! cli layer: clap, orchestration, all IO, exit codes. The "noodles" live
 //! here and only here; config/resolver/output stay pure.
 
 #![forbid(unsafe_code)]
@@ -122,7 +122,7 @@ enum Command {
         // A sample is a handful of rows by definition, and the number lands in
         // the statement nyet writes: without a ceiling here, `--limit
         // 9223372036854775807` reaches the database as a LIMIT it cannot read
-        // and comes back as a DB_ERROR about text the agent never wrote (Д10).
+        // and comes back as a DB_ERROR about text the agent never wrote (D10).
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
         limit: Option<u64>,
         /// Query timeout in seconds (default: per-connection timeout_secs,
@@ -713,7 +713,7 @@ fn audit_finish(
 /// Resolve the audit-log path: an explicit literal `[audit] path`, else
 /// `$XDG_DATA_HOME/nyet/audit.jsonl`, else `~/.local/share/nyet/audit.jsonl`.
 /// If none can be formed (no HOME, no XDG) auditing cannot proceed — fail
-/// closed rather than silently skip (Д3, no panic).
+/// closed rather than silently skip (D3, no panic).
 fn audit_path(cfg: &config::Config) -> Result<PathBuf, Failure> {
     if let Some(p) = &cfg.audit.path {
         return Ok(PathBuf::from(p));
@@ -736,7 +736,7 @@ fn audit_path(cfg: &config::Config) -> Result<PathBuf, Failure> {
 
 /// A command's structured result as a `Value`, for the audit `response` field
 /// (schema/explain/doctor). A serialization that somehow failed degrades to
-/// null rather than panicking (Д3) — the record is still written.
+/// null rather than panicking (D3) — the record is still written.
 fn payload_value<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
@@ -750,7 +750,7 @@ fn audit_timestamp() -> String {
 }
 
 /// The audit write failed: the result is withheld (UX-8) and the agent is told
-/// how to fix or disable auditing (Д10). The path is not a secret.
+/// how to fix or disable auditing (D10). The path is not a secret.
 fn audit_failed(path: &Path, e: &std::io::Error) -> Failure {
     Failure::new(
         ErrorCode::AuditFailed,
@@ -786,7 +786,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
-    // agent-setup is local generation (Д9: no runtime, no db, no network) and
+    // agent-setup is local generation (D9: no runtime, no db, no network) and
     // must survive a missing/broken config (degradation, never exit 3), so it
     // short-circuits before the mandatory config read below.
     if let Command::AgentSetup { format } = &cli.command {
@@ -935,7 +935,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
 
                 // An explicit [table] that matched nothing: the catalog answered,
                 // the object simply is not there. DB_ERROR (exit 7) with the way
-                // out (Д10) — no new error code for it.
+                // out (D10) — no new error code for it.
                 if let Some(name) = &table {
                     if schema.tables.is_empty() {
                         let what = if is_mongo { "collection" } else { "table" };
@@ -967,7 +967,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
                         // describe a collection without sampling it, so the
                         // listing lists (one round trip) and the agent asks
                         // about the one it cares about. Same contract code —
-                        // "you got names only" is what it means (Д7).
+                        // "you got names only" is what it means (D7).
                         true => output::Warning {
                             code: "SCHEMA_TRUNCATED",
                             message: format!(
@@ -1384,7 +1384,7 @@ fn rows_command(
     };
     // `max_row_limit` clamps silently, so a `sample` sitting ON the ceiling must
     // not be told to raise `--limit` — that is the one thing that cannot work,
-    // and an agent that tries it tries it forever (Д10). Asking for the ceiling
+    // and an agent that tries it tries it forever (D10). Asking for the ceiling
     // is how the ceiling is read back: without one, nothing caps u64::MAX.
     let clamped = is_sample && limit >= cfg.row_limit(conn, Some(u64::MAX));
     // Fetch limit+1 to detect truncation without reading everything: the
@@ -1491,7 +1491,7 @@ fn rows_command(
                 code: "TRUNCATED",
                 message: match (over_limit, is_sample) {
                     // `sample` wrote the statement, so "add WHERE/LIMIT" would
-                    // be advice about SQL the agent never saw (Д10): the two
+                    // be advice about SQL the agent never saw (D10): the two
                     // things it can actually do are ask for more rows, or go
                     // read the table itself. Unless the ceiling already cut the
                     // ask — then "raise --limit" is the one advice that cannot
@@ -1514,7 +1514,7 @@ fn rows_command(
                     ),
                     // The rows are big, not many — so "narrow the query" is
                     // again advice about a statement the agent never wrote
-                    // (Д10); what it holds is a SMALLER --limit and the choice
+                    // (D10); what it holds is a SMALLER --limit and the choice
                     // of fields.
                     (false, true) => format!(
                         "the database cut this answer off at {} rows on its own reply-size \
@@ -1525,7 +1525,7 @@ fn rows_command(
                         skill::shell_quote(&alias)
                     ),
                     // Telling the agent to raise --limit here would be
-                    // wrong: the limit was never reached (Д10).
+                    // wrong: the limit was never reached (D10).
                     (false, false) => format!(
                         "result truncated to {} rows by the database's own reply-size \
                          limit (16 MiB), reached before the {limit}-row limit: there \
@@ -1777,7 +1777,7 @@ fn statements(source: &RowSource, db: &Db, rows: u64) -> (String, Option<String>
 /// The invocation is printed to be RUN, so both arguments are shell-quoted: the
 /// statement carries `"` on PostgreSQL/SQLite and backticks on MySQL, and a
 /// backtick inside a double-quoted shell word is command substitution. A hint
-/// that cannot be pasted is a hint that lies (Д10); one that runs something
+/// that cannot be pasted is a hint that lies (D10); one that runs something
 /// else entirely is worse.
 fn sample_fallback_warning(alias: &str, suggestion: &str) -> output::Warning {
     output::Warning {
@@ -1812,7 +1812,7 @@ struct SampleFailure<'a> {
 }
 
 /// A `sample` failure is read by an agent that never wrote the statement, so
-/// every hint that says "narrow your query" is a dead end here (Д10): what the
+/// every hint that says "narrow your query" is a dead end here (D10): what the
 /// agent actually chose is the NAME, `--limit`, `--timeout` — and the option of
 /// writing the query itself. Only the outcomes it can act on are rewritten, and
 /// the original hint is KEPT wherever it still carries something these texts
@@ -2118,7 +2118,7 @@ fn mongo_pii_refusal(r: mongo::Refusal) -> validator::Refusal {
     }
 }
 
-/// The guardrail asked for a plan and got nothing it could judge. Д10 — what
+/// The guardrail asked for a plan and got nothing it could judge. D10 — what
 /// happened, why, what to do instead. Shared by `query` (which then ran the
 /// query unguarded) and `explain` (whose verdict is `no_estimate` for the very
 /// same reason), so the agent is never left guessing why there is no number.
@@ -2590,7 +2590,7 @@ fn open_tunnel(
     Ok(Some(tunnel))
 }
 
-/// The runtime is built lazily, only when an engine actually runs (Д9:
+/// The runtime is built lazily, only when an engine actually runs (D9:
 /// config/validator failures never pay the async tax). enable_all: the time
 /// driver arms the engine's in-process connect and query deadlines, and the IO
 /// driver backs the TCP connection (SQLite needs neither but pays nothing
@@ -2667,7 +2667,7 @@ fn redact_diagnosis(diagnosis: &mut output::Diagnosis) {
 /// integer: "alice@example.com"* — which is an exfiltration channel one cell per
 /// query, straight past every filter on the result. Filtering the text with
 /// patterns would be theatre (UX-7): the whole message is withheld, and the
-/// agent is told where the real one lives (Д10). Connections without a PII
+/// agent is told where the real one lives (D10). Connections without a PII
 /// policy are untouched — they keep the verbatim, actionable error.
 fn db_error_withheld() -> Failure {
     Failure::new(
@@ -2833,7 +2833,7 @@ fn insecure_transport_warning() -> output::Warning {
 
 /// MongoDB `schema`: the answer contains an INFERENCE, and the agent has to be
 /// told in the same breath (UX-1/UX-7). New contract code `SCHEMA_SAMPLED`,
-/// append-only (Д7) — it means "part of this schema payload is a guess", which
+/// append-only (D7) — it means "part of this schema payload is a guess", which
 /// no existing code says.
 fn sampled_schema_warning(sampled: u32) -> output::Warning {
     output::Warning {
@@ -3445,7 +3445,7 @@ mod tests {
         }
     }
 
-    /// Д10: the hint of a `sample` failure must point at something the agent can
+    /// D10: the hint of a `sample` failure must point at something the agent can
     /// do — and must not throw away what the original hint knew. The withheld
     /// database error is the case that matters: its hint is the ONLY place the
     /// agent learns the real message is in the server's log.

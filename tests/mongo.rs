@@ -1,7 +1,7 @@
 //! MongoDB end-to-end: drive the real binary against a throwaway `mongo:8`
 //! container (testcontainers + Docker/colima). Requires a reachable Docker
 //! daemon; this test fails (not skips) without one, like the other engines'.
-//! Pins exit codes and envelope structure (Д7) plus the two claims that only a
+//! Pins exit codes and envelope structure (D7) plus the two claims that only a
 //! live server can settle: that the row limit and the timeout really bite, and
 //! that layer 1 refuses a write BEFORE the server ever sees it.
 //!
@@ -405,7 +405,7 @@ fn mongo_query_end_to_end() {
                 .find(|w| w["code"] == "TRUNCATED")
                 .unwrap_or_else(|| panic!("{query}: no TRUNCATED warning in {v}"))
                 .clone();
-            // Д10: telling the agent to raise --limit here would be wrong — the
+            // D10: telling the agent to raise --limit here would be wrong — the
             // limit was never reached.
             let text = warning["message"].as_str().unwrap();
             assert!(text.contains("16 MiB"), "{text}");
@@ -956,7 +956,7 @@ fn doctor_proves_read_only_from_privileges(home: &Path, port: u16) {
     // a diagnosis), and every check that needed the server says so instead of
     // passing. Lives here rather than in tests/cli.rs because a dead MongoDB
     // connect costs ten seconds of server selection, and that gate is the fast
-    // one (Д9).
+    // one (D9).
     let dead = home.join("config_dead.toml");
     std::fs::write(
         &dead,

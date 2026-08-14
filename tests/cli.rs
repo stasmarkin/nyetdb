@@ -1,5 +1,5 @@
 //! Integration tests: run the real binary, pin down envelope structure,
-//! error codes and exit codes (Д7: the output is an API).
+//! error codes and exit codes (D7: the output is an API).
 
 use std::fs;
 use std::path::Path;
@@ -30,7 +30,7 @@ fn error_envelope(out: &Output) -> serde_json::Value {
     let v: serde_json::Value = serde_json::from_str(stdout(out).trim()).unwrap();
     assert_eq!(v["v"], 1);
     assert_eq!(v["ok"], false);
-    // Every error must carry an actionable hint (Д10).
+    // Every error must carry an actionable hint (D10).
     assert!(v["error"]["hint"].is_string(), "hint missing: {v}");
     v
 }
@@ -1500,7 +1500,7 @@ fn sample_limit_flag_wins_and_the_default_beats_a_configured_row_limit() {
 
 /// The config owner's ceiling beats the sample's own default and its flag —
 /// silently, like everywhere else. What must NOT stay silent is the advice: an
-/// agent told to "raise --limit" against a ceiling raises it forever (Д10).
+/// agent told to "raise --limit" against a ceiling raises it forever (D10).
 #[test]
 fn sample_is_clamped_by_max_row_limit() {
     let (tmp, cfg) = sample_fixture("[defaults]\nmax_row_limit = 2\n");
@@ -1628,7 +1628,7 @@ fn sample_of_a_pii_table_is_refused_in_both_modes() {
         assert_eq!(v["error"]["code"], "NYET");
         assert_eq!(v["error"]["reason"], "PII_COLUMN");
         // "name the columns instead" is the advice, and `sample` cannot: the
-        // hint has to say which command can (Д10).
+        // hint has to say which command can (D10).
         let hint = v["error"]["hint"].as_str().unwrap();
         assert!(hint.contains("nyet query db"), "{hint}");
         assert_no_pii_leak(&out, "sample users");
@@ -1857,7 +1857,7 @@ fn schema_listing_past_the_detail_limit_is_names_only_with_a_warning() {
     assert_eq!(tables[50], serde_json::json!({"name": "v", "kind": "view"}));
     assert_eq!(v["warnings"][0]["code"], "SCHEMA_TRUNCATED");
     let message = v["warnings"][0]["message"].as_str().unwrap();
-    // Actionable (Д10): it names the way to the details.
+    // Actionable (D10): it names the way to the details.
     assert!(message.contains("nyet schema db <table>"), "{message}");
 
     // ...and asking for one of them still gives the full detail.
@@ -2428,7 +2428,7 @@ fn doctor_flags_loose_config_permissions_but_exits_0() {
         .find(|c| c["name"] == "config_permissions")
         .unwrap();
     assert_eq!(perms["status"], "warn");
-    // Actionable (Д10): the hint says how to fix it.
+    // Actionable (D10): the hint says how to fix it.
     assert!(
         perms["hint"].as_str().unwrap().contains("chmod 600"),
         "{perms}"
@@ -3725,7 +3725,7 @@ fn mongo_layer1_refuses_before_touching_the_network() {
             assert_eq!(v["error"]["reason"], *reason, "{command} {query}");
             assert!(
                 v["error"]["hint"].as_str().is_some_and(|h| !h.is_empty()),
-                "{command} {query}: a refusal without a way forward is not a refusal (Д10)"
+                "{command} {query}: a refusal without a way forward is not a refusal (D10)"
             );
         }
     }
@@ -3738,7 +3738,7 @@ fn the_mongodb_only_doctor_check_is_emitted_for_mongodb_only() {
     // including the fail-closed verdicts without a server — is pinned purely in
     // src/output.rs and end to end in tests/mongo.rs, because a dead MongoDB
     // connect costs ten seconds of server selection and this gate is the fast
-    // one (Д9).
+    // one (D9).
     let tmp = tempfile::tempdir().unwrap();
     let cfg = write_config(
         tmp.path(),
@@ -3793,7 +3793,7 @@ fn mongo_config_promises_it_cannot_keep_are_exit_3() {
         assert_eq!(out.status.code(), Some(3), "{name}: {}", stdout(&out));
         let v = error_envelope(&out);
         assert_eq!(v["error"]["code"], "CONFIG_INVALID", "{name}");
-        // Д10: the message says what is wrong and the hint what to do instead.
+        // D10: the message says what is wrong and the hint what to do instead.
         assert!(
             !v["error"]["message"].as_str().unwrap().is_empty(),
             "{name}"

@@ -1,6 +1,6 @@
 //! SQL validator, layer 1: pure classification of a query string into
 //! Allow/Deny. Depends only on sqlparser + unicode-properties (+std) — the
-//! golden corpus runs without live databases (Д1/Д2). Fail closed: anything
+//! golden corpus runs without live databases (D1/D2). Fail closed: anything
 //! not understood is denied.
 //!
 //! Pipeline (DESIGN §3): Unicode normalization -> parse -> exactly one
@@ -124,7 +124,7 @@ pub struct Policy {
     /// Lowercased effective denylist (matching is case-insensitive).
     denied_functions: BTreeSet<String>,
     /// Built-in, non-config-tunable name prefixes that are denied wholesale
-    /// (e.g. the `dblink*` and `pg_read_*` families, DESIGN §3 п.7) — fail
+    /// (e.g. the `dblink*` and `pg_read_*` families, DESIGN §3 step 7) — fail
     /// closed on functions we did not enumerate by exact name.
     denied_prefixes: &'static [&'static str],
     /// Catalogs of THIS engine that publish sampled data values (see
@@ -163,7 +163,7 @@ pub struct PiiRules {
 }
 
 /// The sanction a matching rule carries (`[connections.X.pii] mode`). One mode
-/// per connection on purpose (Д5): per-column modes would multiply the rules an
+/// per connection on purpose (D5): per-column modes would multiply the rules an
 /// agent has to learn without protecting anything the connection-wide choice
 /// does not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -185,7 +185,7 @@ impl PiiMode {
         }
     }
 
-    /// Config value -> mode. Fail loud (Д3): a typo must not silently pick the
+    /// Config value -> mode. Fail loud (D3): a typo must not silently pick the
     /// weaker OR the stronger sanction.
     pub fn parse(value: &str) -> Result<PiiMode, String> {
         match value {
@@ -201,7 +201,7 @@ impl PiiMode {
 }
 
 impl PiiRules {
-    /// Parse `["users.email", "app.users.phone"]`. Fail loud (Д3) on anything
+    /// Parse `["users.email", "app.users.phone"]`. Fail loud (D3) on anything
     /// that is not `table.column` / `schema.table.column` **or that cannot
     /// possibly match an identifier**: a rule nyet accepts but can never match
     /// is worse than a rejected one — the config owner believes the column is
@@ -589,7 +589,7 @@ const SQLITE_DENIED_FUNCTIONS: &[&str] = &[
     "edit",           // sqlite3 CLI function: spawns an editor process
 ];
 
-/// Built-in PostgreSQL denylist (DESIGN §3 п.7; rationale in docs/DEV.md):
+/// Built-in PostgreSQL denylist (DESIGN §3 step 7; rationale in docs/DEV.md):
 /// functions that act OUTSIDE the read-only transaction — layer 2 does not
 /// stop them, so the validator is the only guard. Exact names here; the
 /// file-read and dblink families are prefix-matched (see below).
@@ -1104,7 +1104,7 @@ pub fn strip_control(sql: &str) -> (Cow<'_, str>, usize) {
 /// question, so an executed opener is flagged by at least one. Doubling
 /// (`''`/`""`/`` `` ``) is mode-independent and applied in both. Over-denial of a
 /// benign string containing a backslash is the acceptable failure direction.
-/// Pure (Д1); scans bytes (ASCII delimiters never collide with UTF-8 >= 0x80).
+/// Pure (D1); scans bytes (ASCII delimiters never collide with UTF-8 >= 0x80).
 fn has_mysql_executable_comment(sql: &str) -> bool {
     scan_executable_comment(sql, true) || scan_executable_comment(sql, false)
 }
@@ -1401,7 +1401,7 @@ fn classify(sql: &str, policy: &Policy) -> Verdict {
             "pass exactly one read statement, e.g. SELECT * FROM some_table LIMIT 10",
         );
     };
-    // Recursive walk (DESIGN §3 п.4–7): the visitor sees every Statement
+    // Recursive walk (DESIGN §3 step 4–7): the visitor sees every Statement
     // node in the tree — the top-level one AND writes nested in CTE bodies,
     // derived tables and subqueries (sqlparser wraps those in SetExpr::
     // Insert/Update/Delete/Merge, whose inner Statement is visited too) —
@@ -1433,7 +1433,7 @@ fn classify(sql: &str, policy: &Policy) -> Verdict {
     // Sorting/grouping/dedup on a column the mask would redact reads the value
     // back out of the row order or the row count, so it is refused before the
     // walk — and with its own message, because the fix is "remove the clause",
-    // not "do not name the column" (Д10).
+    // not "do not name the column" (D10).
     if let Some(clause) = mask_ordering_conflict(&stmt, &maskable) {
         return pii_mask_ordering_deny(clause);
     }
@@ -1503,7 +1503,7 @@ struct Checker<'a> {
 /// Sorting, grouping and dedup are handled separately, by
 /// `mask_ordering_conflict` — they are a property of the STATEMENT, not of the
 /// projection node, and they get their own refusal so the agent is told what to
-/// remove (Д10). The exemption itself is a PROMISE: the index is recorded and
+/// remove (D10). The exemption itself is a PROMISE: the index is recorded and
 /// `check_origins` refuses the result if the column did not come back masked.
 ///
 /// Everything else — wildcards in every spelling, whole-row composites,
@@ -1565,7 +1565,7 @@ fn maskable_projection(
 /// Those read the real value back out through the row ORDER or the row COUNT
 /// even when every cell is `[REDACTED]`, so the statement is refused — with its
 /// own message, because "remove the ORDER BY" is a different instruction from
-/// "do not name this column" (Д10).
+/// "do not name this column" (D10).
 ///
 /// The check is a DENYLIST, not an allowlist, and that is the whole point.
 /// While anything is maskable, a sort/group key is accepted ONLY when it is a
@@ -2098,7 +2098,7 @@ impl Visitor for Checker<'_> {
                  (json, jsonl, table, csv)",
             ));
         }
-        // DESIGN §3 п.6: SELECT ... FOR UPDATE / FOR SHARE takes row locks —
+        // DESIGN §3 step 6: SELECT ... FOR UPDATE / FOR SHARE takes row locks —
         // not a plain read. (Layer 2 would refuse it too; this error is
         // clearer.)
         if let Some(lock) = query.locks.first() {
@@ -2511,7 +2511,7 @@ fn pragma_deny() -> Verdict {
     )
 }
 
-/// The one hint every PII refusal carries (Д10: what to do instead). It must
+/// The one hint every PII refusal carries (D10: what to do instead). It must
 /// also close the door on the obvious next move — there is no flag, and asking
 /// nyet again in another shape will not help; the policy belongs to whoever owns
 /// the config file, exactly like the guardrail's ceiling.
@@ -2552,12 +2552,12 @@ fn pii_hint(mode: PiiMode) -> String {
 }
 
 /// `mode = "mask"`, and the SELECT list mixes a wildcard with a column the mask
-/// would redact. Its own refusal (Д10): the fix is "list the columns", which is
+/// would redact. Its own refusal (D10): the fix is "list the columns", which is
 /// not what any other PII message says.
 /// A result column that turns out to come from a protected column through a
 /// layer the policy does not name (a view, a renaming select). No rewrite of the
 /// QUERY helps — the fix is in the config, so say that instead of repeating the
-/// generic advice (Д10).
+/// generic advice (D10).
 fn pii_layer_hint() -> String {
     "the column reached the result through a layer this connection's PII policy does not \
      name — a view or another renaming layer over a protected table — and nyet refuses \
@@ -2585,7 +2585,7 @@ fn pii_mask_wildcard_deny() -> Verdict {
 }
 
 /// `mode = "mask"`, and the statement SORTS, GROUPS or DEDUPES on a column the
-/// mask would redact. Its own refusal on purpose (Д10): the agent removed
+/// mask would redact. Its own refusal on purpose (D10): the agent removed
 /// nothing useful by dropping the column — what it has to drop is the clause,
 /// and the ordinary "do not name this column" message would send it in circles.
 fn pii_mask_ordering_deny(clause: &str) -> Verdict {
@@ -2783,9 +2783,9 @@ mod tests {
         }
     }
 
-    /// Golden corpus (Д6): every yaml file in tests/corpus is the public
+    /// Golden corpus (D6): every yaml file in tests/corpus is the public
     /// security specification. Format — see docs/DEV.md; parsed here by a
-    /// deliberately tiny line-based reader instead of a yaml dependency (Д8).
+    /// deliberately tiny line-based reader instead of a yaml dependency (D8).
     #[derive(Debug)]
     struct Case {
         file: String,
@@ -2991,7 +2991,7 @@ mod tests {
                             case.warnings.is_none(),
                             "{at}: warnings on a deny case (denies carry none)"
                         );
-                        // Д10: a refusal without an actionable hint does not ship.
+                        // D10: a refusal without an actionable hint does not ship.
                         assert!(!hint.is_empty(), "{at}: empty hint");
                         assert!(!message.is_empty(), "{at}: empty message");
                     }
@@ -3330,7 +3330,7 @@ mod tests {
         assert!(!rules.protects("orders", "email"));
         // no rules at all = the historical behavior
         assert!(PiiRules::parse(&[], PiiMode::Deny).unwrap().is_empty());
-        // garbage fails loud, naming the offender (Д3/Д10)
+        // garbage fails loud, naming the offender (D3/D10)
         for bad in [
             "",
             "email",
@@ -3581,7 +3581,7 @@ mod tests {
 
     /// The mask relaxation is per OCCURRENCE, not per name: the very same
     /// `email` is allowed in the projection and refused in the WHERE of one
-    /// statement — and the refusal has to teach the mask (Д10).
+    /// statement — and the refusal has to teach the mask (D10).
     #[test]
     fn mask_mode_relaxes_the_projection_and_nothing_else() {
         let policy = Policy::sqlite(&[], &[])
@@ -3609,7 +3609,7 @@ mod tests {
 
     #[test]
     fn pii_refusals_say_there_is_no_override() {
-        // Д10 + the guardrail's rule: an agent that can lift its own limit does
+        // D10 + the guardrail's rule: an agent that can lift its own limit does
         // not have one, so every PII hint must close that door explicitly.
         let policy = Policy::postgres(&[], &[])
             .with_pii(PiiRules::parse(&["users.email".to_string()], PiiMode::Deny).unwrap());

@@ -1045,7 +1045,7 @@ fn ssh_tunnel_failure_is_exit_6() {
     assert_eq!(out.status.code(), Some(6), "{}", stdout(&out));
     let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
     assert_eq!(v["error"]["code"], "CONNECTION_FAILED");
-    // The hint must be actionable (Д10).
+    // The hint must be actionable (D10).
     assert!(!v["error"]["hint"].as_str().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(runtime_dir(home.path()));
 }

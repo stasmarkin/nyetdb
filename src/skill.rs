@@ -1,7 +1,7 @@
 //! Pure generator for `nyet agent-setup`: a Claude Code skill (SKILL.md —
 //! YAML frontmatter + Markdown body) that teaches an AI agent to use nyet.
 //!
-//! Д1/Д2: a stable instruction template plus the user's already-read
+//! D1/D2: a stable instruction template plus the user's already-read
 //! connections -> one String, no IO. The cli reads the config and writes the
 //! output. Token-economical on purpose (UX-4) — it is a document the agent
 //! reads and pays for — while still self-sufficient (UX-3): an agent seeing

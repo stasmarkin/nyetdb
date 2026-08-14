@@ -1,6 +1,6 @@
 version: 2
 
-# Actions are SHA-pinned for supply chain safety (Д8), which also freezes them:
+# Actions are SHA-pinned for supply chain safety (D8), which also freezes them:
 # a pin never floats to a fix on its own. Dependabot re-pins to the new SHA when
 # an update lands. For cargo it opens the bump PR that `cargo audit` only warns
 # about. Grouped + PR-capped so routine bumps don't become a review flood.

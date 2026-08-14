@@ -2,7 +2,7 @@
 //! `listIndexes`, `$collStats`, `$sample`, `explain` and `connectionStatus`
 //! into the answers `nyet schema` / `explain` / `doctor` publish.
 //!
-//! Pure (Д1/Д2) — documents in, contract structures out, no IO — so every
+//! Pure (D1/D2) — documents in, contract structures out, no IO — so every
 //! reply shape below is unit-tested without a server, including the shapes a
 //! healthy server never sends (empty, truncated, missing a field, the wrong
 //! type). The engine does nothing here but the round trips.
@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 /// One batch, one round trip, and enough that a field present in 3% of the
 /// collection is usually seen at least once — while a bigger sample would cost
 /// the agent tokens for fields it will meet once a year. Deliberately NOT
-/// configurable (Д5, like `output::DETAIL_LIMIT`): the escape hatch is a
+/// configurable (D5, like `output::DETAIL_LIMIT`): the escape hatch is a
 /// query, which is honest about what it is —
 /// `nyet query <alias> 'db.<c>.aggregate([{$sample: {size: 1000}}])'`.
 pub const SAMPLE_SIZE: u32 = 100;
@@ -42,7 +42,7 @@ pub const MAX_FIELDS: usize = 100;
 /// is still visible — the leaf's type reads `object` — but is not enumerated.
 const MAX_PATH_SEGMENTS: usize = 3;
 
-/// Bound on every recursive walk over a server reply (Д3: no input, however
+/// Bound on every recursive walk over a server reply (D3: no input, however
 /// odd, may exhaust the stack).
 const MAX_DEPTH: usize = 50;
 

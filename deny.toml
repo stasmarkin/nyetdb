@@ -1,4 +1,4 @@
-# cargo-deny config: supply chain gates (Д8). CI fails on violations.
+# cargo-deny config: supply chain gates (D8). CI fails on violations.
 
 [graph]
 all-features = true

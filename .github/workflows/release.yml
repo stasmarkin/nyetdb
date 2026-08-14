@@ -15,7 +15,7 @@
 # title/body based on your changelogs.
 
 name: Release
-# Least privilege at the workflow level (Д8); only the `host` job that creates
+# Least privilege at the workflow level (D8); only the `host` job that creates
 # the GitHub Release escalates to contents: write (below). Build jobs stay read.
 permissions:
   contents: read

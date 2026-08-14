@@ -1,4 +1,4 @@
-# Golden corpus — Unicode Cf/Cc stripping (DESIGN §3 п.1, SQLite dialect).
+# Golden corpus — Unicode Cf/Cc stripping (DESIGN §3 step 1, SQLite dialect).
 # CAUTION: the queries below contain REAL invisible characters (zero-width
 # joiner U+200D, zero-width space U+200B, RTL override U+202E, BOM U+FEFF,
 # control U+0001). The validator strips Cf/Cc (keeping \t \n \r) BEFORE

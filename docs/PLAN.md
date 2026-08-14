@@ -1,147 +1,160 @@
-# nyetdb — План имплементации
+# nyetdb — Implementation plan
 
-ROADMAP отвечает «что и зачем», этот план — «в каком порядке». Правила
-нарезки шагов:
+The ROADMAP answers "what and why"; this plan answers "in what order". Rules
+for slicing the steps:
 
-- **Каждый шаг добавляет бизнес-value** — после мержа пользователь (человек
-  или агент) умеет что-то новое, что можно показать.
-- **Каждый шаг self-contained** — без заделов «на будущее»: код, который
-  понадобится в шаге N+2, пишется в шаге N+2 (YAGNI пошагово, Д5).
-- **Definition of Done для каждого шага:**
-  1. тесты написаны и зелёные (корпус/интеграционные/snapshot — по природе шага);
-  2. README.md (инструкция по эксплуатации) дописан под новую возможность;
-  3. docs/DEV.md (инструкция по разработке) дописан, если менялась структура
-     или процесс;
-  4. fmt + clippy (deny warnings) + cargo-deny чистые;
-  5. один шаг = один PR/коммит в main с внятным сообщением.
+- **Every step adds business value** — after the merge, a user (human or
+  agent) can do something new that can be demonstrated.
+- **Every step is self-contained** — no groundwork "for later": code needed in
+  step N+2 gets written in step N+2 (YAGNI, step by step, D5).
+- **Definition of Done for every step:**
+  1. tests written and green (corpus / integration / snapshot — whichever the
+     step calls for);
+  2. README.md (the operating manual) extended for the new capability;
+  3. docs/DEV.md (the development manual) extended if the structure or the
+     process changed;
+  4. fmt + clippy (deny warnings) + cargo-deny clean;
+  5. one step = one PR/commit into main with a meaningful message.
 
-Порядок движков — прагматичный и отличается от продуктового приоритета
-ROADMAP: SQLite идёт первым как walking skeleton (весь пайплайн без серверов
-и testcontainers), PostgreSQL остаётся флагманом релиза. Релиз v0.1
-объявляется после шага 6.
+The order of engines is pragmatic and differs from the product priority in the
+ROADMAP: SQLite comes first as a walking skeleton (the whole pipeline with no
+servers and no testcontainers), PostgreSQL remains the flagship of the
+release. v0.1 is declared after step 6.
 
 ---
 
-## Шаг 1 — Скелет: конфиг + резолвер + `nyet list` + CI
+## Step 1 — Skeleton: config + resolver + `nyet list` + CI
 
-**Value:** человек пишет конфиг и сразу проверяет его валидность и scoping;
-агент видит, какие подключения доступны из текущей папки.
+**Value:** the human writes a config and immediately checks that it is valid
+and correctly scoped; the agent sees which connections are reachable from the
+current directory.
 
-**Скоуп:**
-- clap-скелет (`list`, `query` как заглушка с честной ошибкой `NOT_IMPLEMENTED`);
-- config: toml → чистые структуры, env-подстановка `${VAR}`, `password_env`,
-  unknown key = ошибка, warning про права файла;
-- resolver: (cwd, config) → доступные подключения (canonicalize, префикс);
-- JSON-конверт v1 (`ok`/`error`), exit-коды 0/1/2/3/4;
+**Scope:**
+- clap skeleton (`list`, and `query` as a stub with an honest
+  `NOT_IMPLEMENTED` error);
+- config: toml → pure structures, `${VAR}` env substitution, `password_env`,
+  unknown key = error, warning about file permissions;
+- resolver: (cwd, config) → reachable connections (canonicalize, prefix);
+- JSON envelope v1 (`ok`/`error`), exit codes 0/1/2/3/4;
 - GitHub Actions CI: fmt, clippy (deny), test, cargo-deny + cargo-audit.
 
-**Тесты:** unit на config (валидный/битый/env/права), unit на resolver
-(символические ссылки, `~`, вложенные пути), snapshot конверта `list`.
+**Tests:** unit tests for config (valid / broken / env / permissions), unit
+tests for the resolver (symlinks, `~`, nested paths), a snapshot of the `list`
+envelope.
 
-**Доки:** README: установка, полный пример конфига, `nyet list`.
-Создаётся docs/DEV.md: сборка, запуск тестов, карта модулей (из PRINCIPLES Д2).
+**Docs:** README: installation, a full config example, `nyet list`.
+docs/DEV.md is created: build, running tests, the module map (from PRINCIPLES
+D2).
 
-## Шаг 2 — `nyet query` для SQLite: первый end-to-end
+## Step 2 — `nyet query` for SQLite: the first end-to-end
 
-**Value:** агент безопасно читает локальные `.db`-файлы — уже полезно в
-реальной работе (у агентов постоянно под рукой SQLite).
+**Value:** the agent reads local `.db` files safely — already useful in real
+work (agents have SQLite at hand constantly).
 
-**Скоуп:**
-- trait `Engine` + SQLite-движок (sqlx, `mode=ro` — file-level read-only);
-- валидатор, минимальное ядро: parse (fail-closed) → single statement →
+**Scope:**
+- trait `Engine` + the SQLite engine (sqlx, `mode=ro` — file-level read-only);
+- the validator, minimal core: parse (fail closed) → single statement →
   top-level allowlist (`Query`/`Explain`/`Show*`/`Describe`);
 - row limit (fetch limit+1 → `truncated`), timeout;
-- вывод: json (default) + table; поле `warnings`; exit-коды 5/7/8.
+- output: json (default) + table; the `warnings` field; exit codes 5/7/8.
 
-**Тесты:** первый golden-корпус (`tests/corpus/*.yaml`, SQLite-диалект:
-allow/deny базовые), интеграционные на fixture-базе, snapshot конверта
-успеха/отказа/обрезки.
+**Tests:** the first golden corpus (`tests/corpus/*.yaml`, SQLite dialect:
+basic allow/deny), integration tests against a fixture database, snapshots of
+the success / refusal / truncation envelopes.
 
-**Доки:** README: `nyet query`, форматы, как читать отказ (`NYET` + reason +
-hint). DEV: как устроен корпус и как добавить кейс.
+**Docs:** README: `nyet query`, the formats, how to read a refusal (`NYET` +
+reason + hint). DEV: how the corpus works and how to add a case.
 
-## Шаг 3 — Валидатор целиком (слой 1 как заявлено в DESIGN)
+## Step 3 — The whole validator (layer 1 as declared in DESIGN)
 
-**Value:** модель безопасности слоя 1 полностью соответствует DESIGN §3 —
-для всех текущих и будущих SQL-движков; появляется настраиваемость policy.
+**Value:** the layer-1 security model fully matches DESIGN §3 — for every
+current and future SQL engine; policy becomes configurable.
 
-**Скоуп:**
-- нормализация Unicode (Cf/Cc) + warning `UNICODE_STRIPPED`;
-- рекурсивный AST-visitor: writes в CTE/подзапросах;
-- locking clauses (`FOR UPDATE`/`FOR SHARE`);
-- denylist функций per-engine + `validator.allow_functions`/`deny_functions`
-  из конфига;
-- форматы вывода jsonl (конверт в stderr) и csv.
+**Scope:**
+- Unicode normalization (Cf/Cc) + the `UNICODE_STRIPPED` warning;
+- recursive AST visitor: writes in CTEs and subqueries;
+- locking clauses (`FOR UPDATE` / `FOR SHARE`);
+- a per-engine function denylist + `validator.allow_functions` /
+  `deny_functions` from the config;
+- the jsonl (envelope on stderr) and csv output formats.
 
-**Тесты:** корпус пополняется всеми известными обходами (CTE-write,
-multi-statement, SET, zero-width, denylist, locking) — это и есть публичная
-спецификация безопасности; unit на merge policy из конфига.
+**Tests:** the corpus grows to hold every known bypass (CTE write,
+multi-statement, SET, zero-width, denylist, locking) — that corpus *is* the
+public security specification; unit tests for merging policy from the config.
 
-**Доки:** README: секция Security — что блокируется, что настраивается.
-DEV: процесс «нашёл обход → падающий тест в корпус → фикс».
+**Docs:** README: a Security section — what is blocked, what is configurable.
+DEV: the "found a bypass → failing test into the corpus → fix" process.
 
-## Шаг 4 — PostgreSQL: флагманский движок
+## Step 4 — PostgreSQL: the flagship engine
 
-**Value:** главный сценарий продукта — агент читает прод/стейдж PostgreSQL.
+**Value:** the product's main scenario — an agent reading production or
+staging PostgreSQL.
 
-**Скоуп:**
-- Postgres-движок: `default_transaction_read_only=on` + обёртка
-  `SET TRANSACTION READ ONLY` + `statement_timeout` (слой 2);
-- PostgreSqlDialect в валидаторе, Pg-ветка корпуса.
+**Scope:**
+- the Postgres engine: `default_transaction_read_only=on` plus a
+  `SET TRANSACTION READ ONLY` wrapper plus `statement_timeout` (layer 2);
+- PostgreSqlDialect in the validator, a Pg branch of the corpus.
 
-**Тесты:** testcontainers: слой 2 реально держит (write, протащенный мимо
-валидатора руками, падает на уровне БД); e2e query/timeout/row-limit.
+**Tests:** testcontainers: layer 2 really holds (a write smuggled past the
+validator by hand fails at the database level); e2e query / timeout /
+row-limit.
 
-**Доки:** README: подключение Postgres, рекомендация read-only роли (с SQL
-для её создания). DEV: как гонять интеграционные тесты локально (docker).
+**Docs:** README: connecting Postgres, the read-only role recommendation (with
+the SQL to create it). DEV: how to run the integration tests locally (docker).
 
-## Шаг 5 — SSH-туннели
+## Step 5 — SSH tunnels
 
-**Value:** прод за бастионом — самый частый реальный сетап — работает.
+**Value:** production behind a bastion — the most common real-world setup —
+works.
 
-**Скоуп:** шелл-аут в системный `ssh -N -L` с `ControlMaster=auto
-ControlPersist=15m`, случайный локальный порт, ошибки туннеля → exit 6 с
-внятным hint.
+**Scope:** shelling out to the system `ssh -N -L` with `ControlMaster=auto
+ControlPersist=15m`, a random local port, tunnel failures → exit 6 with a
+clear hint.
 
-**Тесты:** интеграционный с openssh-контейнером (touch-стенд:
-контейнер-бастион + контейнер-Postgres); unit на построение командной строки
-ssh и разбор ошибок.
+**Tests:** an integration test with an openssh container (a touch stand: a
+bastion container plus a Postgres container); unit tests for building the ssh
+command line and for parsing its errors.
 
-**Доки:** README: секция ssh-конфига с примером. DEV: как поднять ssh-стенд.
+**Docs:** README: the ssh config section with an example. DEV: how to bring up
+the ssh stand.
 
-## Шаг 6 — MySQL/MariaDB + релизный пайплайн → **релиз v0.1**
+## Step 6 — MySQL/MariaDB + the release pipeline → **release v0.1**
 
-**Value:** вторая серверная база; тула ставится одной командой без cargo.
+**Value:** a second server-side database; the tool installs with one command,
+without cargo.
 
-**Скоуп:**
-- MySQL-движок (`SET SESSION TRANSACTION READ ONLY`, `max_execution_time`),
-  MySqlDialect-ветка корпуса, testcontainers;
-- dist: GitHub Releases + shell installer + Homebrew tap; версия 0.1.0;
-- README: safety-история как главный питч (материал для анонса).
+**Scope:**
+- the MySQL engine (`SET SESSION TRANSACTION READ ONLY`,
+  `max_execution_time`), a MySqlDialect branch of the corpus, testcontainers;
+- dist: GitHub Releases + shell installer + Homebrew tap; version 0.1.0;
+- README: the safety story as the main pitch (material for the announcement).
 
-**Доки:** README: установка через installer/brew. DEV: release process
-(тег → dist → артефакты).
+**Docs:** README: installing via the installer or brew. DEV: the release
+process (tag → dist → artifacts).
 
 ---
 
-## После v0.1 (нарезка уточнится по обратной связи)
+## After v0.1 (the slicing will be refined by feedback)
 
-Каждый пункт — такой же self-contained шаг со своим value/тестами/доками:
+Every item is the same kind of self-contained step, with its own value, tests
+and docs:
 
-7. ~~`nyet schema` — introspection, токен-оптимизированный формат (UX-3, UX-4).~~ **сделано**
-8. ~~`nyet explain` + auto-guardrail по стоимости плана.~~ **сделано**
-9. ~~`nyet doctor` — честная диагностика сетапа (UX-7).~~ **сделано**
-10. ~~`nyet agent-setup` — генерация Claude Code скилла (SKILL.md) для агента (UX-3).~~ **сделано**
-11. ~~Аудит-лог (UX-8).~~ **сделано**
-12. npm-обёртка через dist (закрывает бэклог npm-имён).
-13. Redis-движок (`COMMAND INFO`).
-14. MongoDB-движок (свой allowlist команд).
-15. ClickHouse-движок (`readonly=1`).
-16. Connection daemon — только после замеров латентности (ROADMAP v0.5).
+7. ~~`nyet schema` — introspection in a token-optimized format (UX-3, UX-4).~~ **done**
+8. ~~`nyet explain` + the auto-guardrail on plan cost.~~ **done**
+9. ~~`nyet doctor` — honest diagnostics of the setup (UX-7).~~ **done**
+10. ~~`nyet agent-setup` — generating a Claude Code skill (SKILL.md) for the agent (UX-3).~~ **done**
+11. ~~The audit log (UX-8).~~ **done**
+12. An npm wrapper via dist (closes the npm-name backlog item).
+13. The Redis engine (`COMMAND INFO`).
+14. The MongoDB engine (its own command allowlist).
+15. The ClickHouse engine (`readonly=1`).
+16. The connection daemon — only after latency is measured (ROADMAP v0.5).
 
-## Правила ведения плана
+## Rules for keeping this plan
 
-- План — живой: после каждого шага сверяемся, следующий шаг можно перерезать.
-- Шаг не начинается, пока предыдущий не задеплоен в main с зелёным CI.
-- Если посреди шага обнаружился «нужный задел на будущее» — это сигнал
-  перерезать шаги, а не написать задел (Д5).
+- The plan is alive: after every step we re-check, and the next step may be
+  re-sliced.
+- A step does not start until the previous one is deployed to main with green
+  CI.
+- If "groundwork we will need later" shows up mid-step, that is a signal to
+  re-slice the steps, not to write the groundwork (D5).

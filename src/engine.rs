@@ -1,4 +1,4 @@
-//! Engines: IO adapters behind the `Engine` trait (Д2). Engines know their
+//! Engines: IO adapters behind the `Engine` trait (D2). Engines know their
 //! drivers (sqlx) and nothing about clap; the cli layer maps `EngineError` onto
 //! contract codes and wraps execution in a timeout. The one thing they take
 //! from `output` is the pure `schema` model (`Schema`/`SchemaTable`/... plus
@@ -295,7 +295,7 @@ async fn budgeted_plan(
     Plan::of(tokio::time::timeout(Duration::from_millis(deadline_ms), plan).await)
 }
 
-/// The one planned abstraction of the project (Д5). Fetches at most
+/// The one planned abstraction of the project (D5). Fetches at most
 /// `fetch_limit` rows; the caller passes limit+1 to detect truncation.
 // The lint fires only because src/lib.rs makes this trait technically public;
 // it is implemented and used inside this crate alone (the lib target exists for
@@ -840,7 +840,7 @@ async fn sqlite_columns(
     for row in rows {
         let name: String = row.try_get("name").map_err(db_error)?;
         // Lenient on the rest: a pragma column nyet cannot decode must not
-        // fail the whole introspection (Д3 — no panics, no dead ends).
+        // fail the whole introspection (D3 — no panics, no dead ends).
         let ty: String = row.try_get("type").unwrap_or_default();
         let notnull: i64 = row.try_get("notnull").unwrap_or(0);
         let default: Option<String> = row.try_get("dflt_value").unwrap_or(None);
@@ -2094,7 +2094,7 @@ fn decode_pg_row(row: &PgRow) -> Result<Vec<Value>, EngineError> {
 
 /// Decode one PostgreSQL cell into JSON by its wire type. Types real tables
 /// are full of are handled explicitly; anything else falls back to a text
-/// decode and, failing that, a clear DB_ERROR (never a panic — Д3).
+/// decode and, failing that, a clear DB_ERROR (never a panic — D3).
 ///
 /// Representation choices (DEV.md): numeric -> string (exact, no f64
 /// rounding), timestamp/date/time -> ISO-ish string, uuid -> string,
@@ -2223,7 +2223,7 @@ pub fn transport_below_require(engine: &str, url: &str) -> bool {
         }),
         // Read off the url text rather than through the driver: parsing a
         // MongoDB url is async (SRV) and this runs before any runtime exists
-        // (Д9). `tls`/`ssl` are synonyms; `mongodb+srv://` turns TLS on by
+        // (D9). `tls`/`ssl` are synonyms; `mongodb+srv://` turns TLS on by
         // default, which an explicit `false` can still switch off. Erring
         // toward "insecure" is the safe direction for a warning.
         "mongodb" => {
@@ -3062,7 +3062,7 @@ async fn mysql_metadata(conn: &mut sqlx::MySqlConnection) -> (SuperuserFact, Opt
 /// The account's superuser status from `SHOW GRANTS`. Honesty-first: a query
 /// failure is `Unknown` (never a false "not a superuser"), and role/proxy grants
 /// nyet does not resolve are `Unresolved` (verify by hand) — no role resolver
-/// (Д5), just an honest gap.
+/// (D5), just an honest gap.
 async fn mysql_superuser(conn: &mut sqlx::MySqlConnection) -> SuperuserFact {
     let Some(grants) = mysql_grants(conn).await else {
         return SuperuserFact::Unknown("could not read SHOW GRANTS".to_string());
@@ -3471,7 +3471,7 @@ fn decode_mysql_row(row: &MySqlRow) -> Result<Vec<Value>, EngineError> {
 /// DECIMAL -> string (exact), FLOAT/DOUBLE -> number, text/ENUM -> string,
 /// DATE/DATETIME/TIMESTAMP/TIME -> string, binary/BLOB -> lowercase hex,
 /// JSON -> structured JSON, NULL -> null. Anything else falls back to a text
-/// decode and, failing that, a clear ::CHAR-cast DB_ERROR (never a panic, Д3).
+/// decode and, failing that, a clear ::CHAR-cast DB_ERROR (never a panic, D3).
 fn decode_mysql_column(row: &MySqlRow, i: usize) -> Result<Value, EngineError> {
     let raw = row.try_get_raw(i).map_err(mysql_error)?;
     if raw.is_null() {

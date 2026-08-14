@@ -132,7 +132,7 @@ Two flavors are tested on purpose to cover both timeout variables and both
 `JSON` as `LONGTEXT` → returned as a string).
 
 **TLS is provided by rustls, not native-tls/OpenSSL.** The sqlx feature is
-`tls-rustls-ring-webpki` (chosen over the alternatives per Д8):
+`tls-rustls-ring-webpki` (chosen over the alternatives per D8):
 
 - **rustls, not `tls-native-tls`** — native-tls means system OpenSSL (a C
   dependency, per-platform build/audit surface) or SChannel/Secure Transport;
@@ -151,7 +151,7 @@ Two flavors are tested on purpose to cover both timeout variables and both
 This still does **not** enable sqlx's `mysql-rsa` feature: that pulls the `rsa`
 crate flagged by RUSTSEC-2023-0071 (unpatched timing attack), which
 `cargo-deny`/`cargo-audit` reject — the wrong dependency for a
-credential-handling tool (Д8). It is unnecessary now: MySQL 8's default
+credential-handling tool (D8). It is unnecessary now: MySQL 8's default
 `caching_sha2_password` sends the password over the TLS channel instead of a
 client-side RSA exchange. The rustls stack adds five crates to the runtime tree
 (`rustls`, `ring`, `rustls-webpki`, `webpki-roots`, `subtle`) and their licenses
@@ -246,7 +246,7 @@ local port and asserts the `CONNECTION_FAILED` (exit 6) envelope. The pure ssh
 command-building, host/remote validation, and the url→localhost override are
 covered by unit tests in `src/tunnel.rs` / `src/engine.rs` (no network).
 
-## Module map (PRINCIPLES Д2)
+## Module map (PRINCIPLES D2)
 
 Every module below `cli` lives in a **library target** (`src/lib.rs`), which
 `src/main.rs` then imports; the binary is the cli layer and nothing else. The
@@ -267,7 +267,7 @@ cli (src/main.rs) — clap, orchestration, all IO, exit codes, tokio runtime
 │                                 schema/plan/doctor structures of `output`;
 │                                 bson + serde_json + output. Split off so the
 │                                 security boundary above stays about the
-│                                 boundary (Д4)
+│                                 boundary (D4)
 ├─ redis     (src/redis.rs)     — pure: (command line, server Flags) -> () |
 │                                 Refusal; the Redis layer 1. The tokenizer is
 │                                 nyet's; the CLASSIFICATION is the server's
@@ -334,7 +334,7 @@ structs are the serialized contract, so they live in the pure module (with
 `build_table`, the single owner of the pk/unique presentation rules) and the
 engines fill them in. That direction is still downward — `output` depends on
 serde alone, `engine` on all of sqlx. The runtime is built
-lazily, only when an engine actually executes (Д9: `list`, config errors and
+lazily, only when an engine actually executes (D9: `list`, config errors and
 validator refusals never start it). `nyet doctor` reuses this same
 `engine -> output` edge: the engine's `diagnose()` fills in `output`'s pure
 `Diagnosis` facts, and the pure `output::doctor_checks` turns them into the
@@ -344,7 +344,7 @@ verdicts (see the doctor section below).
 
 For a Postgres connection with an `[ssh]` section, the cli opens a local port
 forward *after* the validator (a refused query still exits 5 without paying for
-ssh) and *before* the engine connects. The split follows Д1/Д2:
+ssh) and *before* the engine connects. The split follows D1/D2:
 
 - **Pure core** (unit-tested, no network): `parse_host` (`[user@]hostname[:port]`
   → destination + optional `-p` port, with strict validation), `ssh_args`
@@ -372,7 +372,7 @@ ssh) and *before* the engine connects. The split follows Д1/Д2:
   The registry file is `<XDG_RUNTIME_DIR|~/.ssh>/nyet/fwd-<dest>-<sshport>-<remote>`
   (0600 in a 0700 dir; `@`/`:` sanitized to `_`), a plain `key=value` text record
   — `cat` is the last-resort discovery tool and this module owes nothing to serde
-  (Д2). It holds the port, the **master pid**, the creation time and the pair.
+  (D2). It holds the port, the **master pid**, the creation time and the pair.
   `open` locks it (`File::try_lock` in a bounded loop — a wedged holder must not
   hang the CLI; giving up means "no reuse", never a hang) for the whole
   create-or-adopt window, so two concurrent runs cannot both create a forward.
@@ -468,10 +468,10 @@ ssh) and *before* the engine connects. The split follows Д1/Д2:
   (capped 10s so a blackholed bastion fails fast), spawns the system `ssh`, and
   maps failures to a `TunnelError` the cli turns into `CONNECTION_FAILED`
   (exit 6). No `russh` — the system binary inherits `~/.ssh/config`, keys, agent
-  and `ProxyJump` (Д8), and ControlPersist over the ControlPath reuses the master
-  between runs (Д9). The `Option<Tunnel>` guard is kept in the cli `Query` arm so
+  and `ProxyJump` (D8), and ControlPersist over the ControlPath reuses the master
+  between runs (D9). The `Option<Tunnel>` guard is kept in the cli `Query` arm so
   it drops after the query executes.
-- **Measured effect, and why not `ssh -O forward` (Д9).** Medians against the
+- **Measured effect, and why not `ssh -O forward` (D9).** Medians against the
   container bastion, real `ssh`, warm master: `-O check` **3.2 ms**,
   `-O forward -L` **3.0 ms**, `-O cancel -L` **3.0 ms**, `-f -N -L` **4.2 ms**;
   cold (no master) **44.9 ms** whether it is one spawn (`-f -N -L` builds master
@@ -696,7 +696,7 @@ differently per engine. SQLite's legacy "a non-rowid PK column may hold NULL"
 quirk is deliberately not represented.
 
 `DETAIL_LIMIT = 50` (a const in `src/output.rs` — an output policy, so it sits
-with the schema model; deliberately not configurable, Д5) is the
+with the schema model; deliberately not configurable, D5) is the
 adaptive-listing threshold: past it a `nyet schema <alias>` with no table
 returns names+kinds only and the cli adds `SCHEMA_TRUNCATED` (the cli asks
 `Schema::is_listing()` — derived from the payload, not a second copy of the
@@ -793,7 +793,7 @@ the real mistake.
 ### The texts, and what an agent can actually do with them
 
 Every text on this path is written for a reader who did NOT write the statement,
-which rules out most of the advice the shared paths give (Д10). `rows_command`
+which rules out most of the advice the shared paths give (D10). `rows_command`
 rewrites the two `TRUNCATED` messages, and `sample_failure_hint` — which takes a
 `SampleFailure` describing what THIS run did (engine, whether the fallback ran,
 whether the server's words were withheld), because advice that ignores that is
@@ -846,7 +846,7 @@ identifier. `"` doubled for SQLite/PostgreSQL, `` ` `` doubled for MySQL.
 Quoting is injection-prevention code, so it exists in ONE copy: `engine`'s
 introspection calls `sample::backquote` and `sample::split_qualified` rather
 than keeping its own (the dependency points at the pure, std-only module, which
-is the direction Д2 asks for). PostgreSQL therefore splits on the FIRST dot by
+is the direction D2 asks for). PostgreSQL therefore splits on the FIRST dot by
 the very function `nyet schema` uses — so `nyet schema pg sales.orders`
 and `nyet sample pg sales.orders` read one argument the same way; SQLite and
 MySQL take the whole argument as one name (neither `nyet schema` nor `sample`
@@ -895,7 +895,7 @@ the command.
 ## Auto-guardrail and `nyet explain` (`src/guardrail.rs`)
 
 No new dependency: the plan is JSON (`serde_json`, already there) or ordinary
-result rows the engines already decode. The split follows Д1/Д2 — the engines
+result rows the engines already decode. The split follows D1/D2 — the engines
 run the EXPLAIN (IO), `guardrail` parses and judges (pure, fixture-tested), the
 cli decides what the verdict means for the envelope.
 
@@ -936,7 +936,7 @@ the `EXPLAIN SELECT ...` allow twins.
   conservative direction — rows mode is a proxy for work done, and what is
   *returned* is already bounded by the row limit. The column comes
   back as `json`; a text-returning server or an unexpected shape degrades to
-  "no estimate" rather than failing (Д3). **A plan containing a `Recursive
+  "no estimate" rather than failing (D3). **A plan containing a `Recursive
   Union` node makes the numbers a LOWER BOUND** (they are kept, and still refuse
   when already over the limit) — see the recursive-CTE section below.
 - **MySQL/MariaDB** — the **classic tabular `EXPLAIN`**, deliberately, because
@@ -1277,14 +1277,14 @@ value }` (and `PlanTooSlow { budget_ms }` for the budget case) — the engines n
 (and `plans()`, so they never even see the mode); the comparison, the texts and
 the envelope shape live in the pure module.
 
-**No cache, on purpose (Д5).** Plans are not memoized between runs: a plan
+**No cache, on purpose (D5).** Plans are not memoized between runs: a plan
 depends on statistics, parameters and server settings, and a stale cached
 estimate would be a guardrail that lies. Reconsider only if a connection daemon
 (ROADMAP v0.5) ever gives it a natural home.
 
 ## MongoDB (`src/mongo.rs` layer 1, `engine::Mongo` IO)
 
-The odd engine out, and the README says so out loud. Split per Д1/Д2: the whole
+The odd engine out, and the README says so out loud. Split per D1/D2: the whole
 of layer 1 — parsing the agent's text, classifying it, and building the wire
 command — is a **pure** module with `mongodb::bson` as its only dependency, and
 the engine does nothing but IO.
@@ -1410,7 +1410,7 @@ which is the point of the shape.
   through constructor arguments, which is why the depth is threaded through
   `parse_args` too (without it `NumberLong(NumberLong(...))` restarted the
   count at zero and a few thousand of them overflowed the stack; an abort is
-  not a refusal, Д3). 100 is MongoDB's own BSON nesting limit, so nyet refuses
+  not a refusal, D3). 100 is MongoDB's own BSON nesting limit, so nyet refuses
   exactly what the server would.
 
 ### The engine
@@ -1444,7 +1444,7 @@ which is the point of the shape.
   trailing `{$limit: N+1}`. `ResultSet::truncated` carries the fact up, and the
   cli ORs it into `meta.truncated`; the `TRUNCATED` warning then says which of
   the two happened, because "raise --limit" is the wrong advice for a limit
-  that was never reached (Д10). The agent's own `.limit(n)` is `min`ed with
+  that was never reached (D10). The agent's own `.limit(n)` is `min`ed with
   nyet's, so it can only lower the effective limit.
   *Residual, accepted:* a truncated read leaves the server-side cursor open,
   and nyet does not send `killCursors` — MongoDB reaps an idle cursor after ten
@@ -1552,7 +1552,7 @@ which is the point of the shape.
   error with an honest reason. There is deliberately **no per-query
   `GUARDRAIL_SKIPPED` warning**: that code means "the guardrail was ON and could
   not reach a verdict", and emitting it where no guardrail was ever armed would
-  both change the meaning of a contract code (Д7) and tax every single call
+  both change the meaning of a contract code (D7) and tax every single call
   (UX-4) — SQLite, which is in the same position, does not warn either. The
   honest statement lives in the README and in the config error.
 - **No schema.** `nyet schema` answers anyway (see below), but nothing in that
@@ -1564,7 +1564,7 @@ which is the point of the shape.
 Same split as layer 1: `src/mongo/meta.rs` is **pure** (server documents in,
 contract structures out) and `engine::Mongo` only does the round trips. It is
 its own file rather than more of `src/mongo.rs` because that file is the
-security boundary and should stay about the boundary (Д4).
+security boundary and should stay about the boundary (D4).
 
 **`nyet schema` — the honesty rule.** MongoDB has no schema, so no line of the
 answer may read like one. Every field carries `source`:
@@ -1583,7 +1583,7 @@ disagreement is a real property of the data.
 
 Decisions worth writing down:
 
-- **Sample size 100, not configurable** (Д5, like `output::DETAIL_LIMIT`): one
+- **Sample size 100, not configurable** (D5, like `output::DETAIL_LIMIT`): one
   batch, one round trip, and enough to see a field present in ~3% of the
   collection. The escape hatch is honest about being one —
   `nyet query <alias> 'db.c.aggregate([{$sample: {size: 1000}}])'`. `$sample`
@@ -1740,7 +1740,7 @@ a `Grants` variant for it; the pg/mysql probe is untouched.
   because "could not verify" reading as `ok` is the failure mode this whole
   command exists to avoid (UX-1).
 
-### Error codes (Д7: append-only)
+### Error codes (D7: append-only)
 
 `PARSE_FAILED`, `WRITE_OPERATION`, `DENIED_FUNCTION` and `INTERNAL_ERROR` are
 REUSED with exactly their existing meaning (a unit test pins that the strings
@@ -1928,8 +1928,8 @@ scope (ROADMAP v0.5).
 A local generator (UX-3: an agent must be able to learn nyet by itself) that
 emits a **Claude Code skill** — a `SKILL.md` with YAML frontmatter
 (`name`/`description`) and a Markdown body. No new dependency; no database, no
-network, no runtime (Д9 — it short-circuits at the top of `run()`, before the
-config read). The split follows Д1/Д2: `skill::skill` is a **pure function**
+network, no runtime (D9 — it short-circuits at the top of `run()`, before the
+config read). The split follows D1/D2: `skill::skill` is a **pure function**
 (instruction template + the already-read connections -> String, unit-tested with
 no IO), and the cli does the best-effort config load and the stream write.
 
@@ -1944,7 +1944,7 @@ recommended field and is what Claude uses to decide when to load the skill
 (kebab-safe single token) and a `description` phrased as *when* to use nyet
 (reading a database, inspecting schema, safe read-only queries), so the file is
 valid whether dropped in as a directory skill or a plugin skill. The generator
-writes the YAML by hand (no yaml crate — Д8): the frontmatter is trivial and we
+writes the YAML by hand (no yaml crate — D8): the frontmatter is trivial and we
 generate it, we do not parse it. A `frontmatter_is_valid_and_names_the_skill`
 unit test parses it manually and asserts `name`/`description` are present and
 non-empty, and that exactly two bare `---` fences exist (no stray fence in the
@@ -1986,7 +1986,7 @@ write failure (a full disk -> `INTERNAL`, exit 1) errors.
 ## `nyet doctor` (`src/output.rs` verdicts, `engine::diagnose` facts)
 
 Honest setup diagnostics for a **human** (UX-7). No new dependency. The split
-follows Д1/Д2: the engine gathers FACTS (`Engine::diagnose -> output::Diagnosis`,
+follows D1/D2: the engine gathers FACTS (`Engine::diagnose -> output::Diagnosis`,
 an IO call), the pure `output::doctor_checks` compares them with the expectation
 and builds the verdicts (fixture-free, unit-tested), and the cli orchestrates and
 formats. The envelope carries a new append-only field `checks: [{name, status,
@@ -2192,7 +2192,7 @@ Honesty-first again: a metadata failure is `SuperuserFact::Unknown` → `warn`
   it); a `SHOW GRANTS` failure or empty result → `Unknown`; **role or PROXY grants
   nyet does not resolve → `Unresolved` → `warn`** ("nyet checks direct grants
   only — verify elevated privileges by hand"), never a false "not a superuser" (no
-  role resolver, Д5 — just an honest gap). The raw grant line is never echoed
+  role resolver, D5 — just an honest gap). The raw grant line is never echoed
   (MariaDB embeds `IDENTIFIED BY PASSWORD '*hash'`): only the privilege type is
   named. The probe remains the authoritative writability check; the grant scan
   only feeds `not_superuser`.
@@ -2200,12 +2200,12 @@ Honesty-first again: a metadata failure is `SuperuserFact::Unknown` → `warn`
 ### Tests
 
 - **Pure (`src/output.rs`)** — `doctor_checks` over hand-built facts: all four
-  statuses with hints (Д10), the probe-blocked ok path (both `ddl_only` headlines)
+  statuses with hints (D10), the probe-blocked ok path (both `ddl_only` headlines)
   with a replica note, the **unknown-is-warn-never-a-false-ok** path (a
   non-read-only probe error and an undetermined superuser status both `warn`), the
   **orphan reporting** (a `Wrote { orphan }` surfaces the leftover name) and
   `Unresolved` grants `warn`, the connect-failure shape, the SQLite `na` honesty,
-  the config-level (no-alias) checks, and a compact envelope + table snapshot (Д7).
+  the config-level (no-alias) checks, and a compact envelope + table snapshot (D7).
 - **Pure (`src/engine.rs`)** — `classify_mysql_create_failure` over error numbers
   (read-only errnos → `Blocked`; another server error → no orphan; `None` /
   transport failure → `MaybeOrphan`, the lost-ACK case that must name the table),
@@ -2230,7 +2230,7 @@ Honesty-first again: a metadata failure is `SuperuserFact::Unknown` → `warn`
   `require`-mode url reads `transport_encrypted: ok` even when the connect then
   fails on the no-TLS container. All exit 0.
 
-## Dependencies (Д8: each one justified)
+## Dependencies (D8: each one justified)
 
 Runtime:
 
@@ -2254,7 +2254,7 @@ Runtime:
   table for Unicode stripping. `char::is_control` covers only Cc; Cf (zero-width
   joiners, direction overrides, BOM) needs the General_Category data, and a
   hand-maintained range table would silently rot as Unicode evolves — fail closed
-  wants the real table. Chosen over alternatives per Д8: unicode-rs org (the
+  wants the real table. Chosen over alternatives per D8: unicode-rs org (the
   maintainers of the ecosystem's core unicode crates), zero dependencies, no_std,
   tiny generated tables.
 - `sqlx` (runtime-tokio; `tls-rustls-ring-webpki`, `sqlite-bundled`, `postgres`,
@@ -2276,7 +2276,7 @@ Runtime:
   ONLY` plus a `SET SESSION max_execution_time`/`max_statement_time`.
 - `mongodb` (default features: `rustls-tls`, `dns-resolver`, `bson-2`,
   `compat-3-*`) — the MongoDB driver, and through its `bson` re-export the BSON
-  model the pure `src/mongo.rs` builds and classifies. Justification (Д8): the
+  model the pure `src/mongo.rs` builds and classifies. Justification (D8): the
   wire protocol is not a line format one can hand-roll — it is OP_MSG framing,
   BSON encoding/decoding for every type, SCRAM-SHA-256 authentication, TLS,
   server discovery and cursor management; the "30 lines of our own" alternative
@@ -2300,7 +2300,7 @@ Runtime:
   sends everything through the low-level `cmd()` and reads back a raw `Value`,
   so the typed helpers those features add are code nyet would never call — and
   `script` in particular builds an `EVAL` helper for a family layer 1 refuses
-  outright. Justification (Д8): RESP3 is not a line format to hand-roll (typed
+  outright. Justification (D8): RESP3 is not a line format to hand-roll (typed
   Map/Set/Double/VerbatimString/Push framing, `HELLO 3` negotiation, inline
   commands, TLS), and RESP3 is precisely what makes the output contract possible
   — in RESP2 a `HGETALL` reply and a `LRANGE` reply are the same flat array and
@@ -2341,7 +2341,7 @@ Dev:
 - `testcontainers-modules` (`postgres`, `mysql`, `mariadb` features) — the
   server-engine integration and e2e tests need a real server; this spins a
   throwaway container per test (`postgres:16-alpine`, `mysql:8.4`, `mariadb:11.4`)
-  and tears it down. Chosen over a hand-rolled `docker run` wrapper (Д8): it owns
+  and tears it down. Chosen over a hand-rolled `docker run` wrapper (D8): it owns
   image pull, readiness wait and cleanup (the ryuk reaper), and each module ships
   the ready image config. Dev-only — it never reaches a release binary. Its (large) transitive tree passes `cargo deny`
   (licenses/advisories/bans/sources) as of this step. The SSH tunnel stand
@@ -2363,7 +2363,7 @@ Dev:
   validator corpus, engine read-only/decoding (on temp SQLite files).
 - `tests/cli.rs` runs the real binary via `CARGO_BIN_EXE_nyet` with
   `env_clear()` + a temp `HOME`, pinning exit codes and envelope structure
-  (Д7: the output is an API — changing codes/structure must break tests).
+  (D7: the output is an API — changing codes/structure must break tests).
   Query tests build a fixture SQLite database with sqlx.
 - `nyet schema` is covered at three levels. Unit snapshots of the envelope and
   the pk/unique folding (`src/output.rs`). SQLite e2e in `tests/cli.rs`: the
@@ -2709,7 +2709,7 @@ reports `Table(table, column)` — verified against postgres:16-alpine
 `SELECT id FROM users` if the prepare is removed). Cost: one extra DESCRIBE round
 trip, paid ONLY by connections with a PII policy (`Postgres::resolve_column_origins`,
 set in `open_session`). The alternative — reading oid+attnum and querying
-`pg_attribute` ourselves — costs the same round trip and more code (Д5).
+`pg_attribute` ourselves — costs the same round trip and more code (D5).
 PostgreSQL names the table search_path-relative (`users`, `s.t`, `v`), which is
 why matching ignores the schema qualifier.
 
@@ -2852,7 +2852,7 @@ whatever the column's real type is (number, date, JSON). The `PII_MASKED` warnin
 is what makes that legible to the agent — it names the columns (never values,
 never a count, since every row of the column is replaced anyway) and says the
 type and length are gone too. `output::REDACTED` is a const, not a config key
-(Д5): a configurable mask string is another way to leak (a per-column string
+(D5): a configurable mask string is another way to leak (a per-column string
 would fingerprint the column) and buys nothing.
 
 **The exemption is a PROMISE, and net B enforces it (review round 5).** Net A
@@ -2900,7 +2900,7 @@ correctly — the test pins both sides).
 
 **What sorting/grouping costs, and why the check is a DENYLIST.** A statement
 that SORTS, GROUPS or DEDUPES while a maskable column is projected is refused by
-`mask_ordering_conflict`, with its own message and hint (Д10: the fix is "use a
+`mask_ordering_conflict`, with its own message and hint (D10: the fix is "use a
 column name", which the generic "do not name this column" text never says). The
 rule: while anything is maskable, an `ORDER BY`/`GROUP BY` key is accepted ONLY
 when it is a plain `Expr::Identifier`/`CompoundIdentifier` — a NAME, which
@@ -3047,7 +3047,7 @@ still sqlparser + std only. `engine.rs` imports `validator::Origin` to translate
 once, the IO adapter fills it in). `config.rs` calls `validator::PiiRules::parse`
 from `config::pii` — the same single-entry-point pattern as `config::guardrail`:
 called at parse time so a malformed rule is a loud exit 3, and again by the cli
-to get the value. No new dependency (Д8).
+to get the value. No new dependency (D8).
 
 ### PostgreSQL `*_to_xml` — a function-denylist hole, wider than PII
 
@@ -3082,7 +3082,7 @@ substring matcher would be a second, non-tunable mechanism for one family.
 `PREPARE`/`EXECUTE` are likewise statements, and SQLite has no equivalent — so
 the fix is PostgreSQL-only.
 
-## Validator corpus (Д6)
+## Validator corpus (D6)
 
 `tests/corpus/*.yaml` is the public specification of what the validator
 allows and denies. **A validator rule does not exist without corpus cases**
@@ -3091,7 +3091,7 @@ bypass gets a failing corpus case first, then the fix.
 
 Format — a deliberately tiny YAML subset (parsed by ~40 lines in
 `src/validator.rs` tests; a yaml crate is not worth the supply-chain surface
-for this, Д8):
+for this, D8):
 
 ```yaml
 # comment
@@ -3132,7 +3132,7 @@ covered by unit tests next to the merge logic. Note `sqlite_unicode.yaml`
 contains REAL invisible characters (that is the point) — edit it with a
 tool that shows them.
 
-**Found a bypass?** The process is fixed (Д6): first add the bypass to the
+**Found a bypass?** The process is fixed (D6): first add the bypass to the
 corpus as a failing deny case (this documents it publicly and proves the
 gap), then fix the validator until the corpus is green. Never the other
 way around — a fix without a corpus case does not exist.
@@ -3336,7 +3336,7 @@ the DENIED_FUNCTION machinery honest.
 Unlike SQLite these are real, always-present risks: they act *outside* the
 read-only transaction (session/cluster/filesystem/network), so layer 2 does
 not stop them — the validator (layer 1) is the only guard. Built-in list
-(DESIGN §3 п.7), all `DENIED_FUNCTION`:
+(DESIGN §3 step 7), all `DENIED_FUNCTION`:
 
 Exact names (config-tunable via `allow_functions` / `deny_functions`):
 
@@ -3503,7 +3503,7 @@ coverage gap here: mutating the `--` line-comment guard survived the suite, so
 Deliberately *not* included: `is_used_lock` / `is_free_lock` (pure reads).
 `SLEEP`/`BENCHMARK`/`GET_LOCK` being denied means the timeout integration tests
 use a heavy `information_schema` cross join instead. Add a new entry with a
-failing corpus case first (Д6).
+failing corpus case first (D6).
 
 **Known representation choices (documented, not bugs):** `TIMESTAMP` decodes to
 the value in the connection's session time zone rendered as a naive string
@@ -3647,7 +3647,7 @@ Regenerate the workflow after editing `[dist]` config: `dist init --yes` (writes
 config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
 
 > **`dist generate` overwrites `release.yml` — re-apply four hardenings after it
-> (Д8), dist does not emit them:** (1) pin every `uses:` to a full commit SHA
+> (D8), dist does not emit them:** (1) pin every `uses:` to a full commit SHA
 > (dist writes floating `@v4` tags); (2) drop the workflow-level `permissions`
 > to `contents: read` and give only the `host` job `contents: write` (dist writes
 > `contents: write` at the workflow level, so every job — including the
@@ -3737,7 +3737,7 @@ agent MUST see this, or it reads the mask as data; the warning names columns
 only, never values, and never a count).
 
 Codes are append-only; renaming/removing one is a breaking change (bump `v`).
-Every error must carry an actionable `hint` (Д10) — tests enforce it.
+Every error must carry an actionable `hint` (D10) — tests enforce it.
 
 `nyet doctor` adds no error/warning code — it exits 0/3 only (see the doctor
 section above). Check NAMES are append-only too: `server_side_js` is the
@@ -3777,7 +3777,7 @@ check via `diagnose_connection`, not an exit-6 envelope).
 ## Audit log (`src/audit.rs`)
 
 The forensic log the human relies on (UX-8): one jsonl line per
-database-touching command. The split follows Д1/Д2 — `audit.rs` is a pure record
+database-touching command. The split follows D1/D2 — `audit.rs` is a pure record
 builder plus the single IO primitive, the cli owns the orchestration.
 
 **Record schema, versioned independently.** `audit_v` (a `const` in `audit.rs`)
@@ -3813,7 +3813,7 @@ errors *before* the session (unknown alias, directory denied, unsupported
 engine, an unresolvable `password`) are **not** logged — there is no engine to name
 and no database interaction; behavior there is byte-for-byte as before.
 `list`, `agent-setup` and `doctor` with no alias never contact a database and
-are not logged (Д9 — nothing extra on the cold-start path).
+are not logged (D9 — nothing extra on the cold-start path).
 
 **Fail-closed ordering (UX-8/UX-1).** The record is written and flushed before
 the result is released. If the append fails, `audit_finish` returns
@@ -3834,13 +3834,13 @@ with `O_APPEND`. Two concurrent large writes each land whole. Proven by
 cross-process e2e `audit_is_safe_across_concurrent_processes` (two `nyet query`
 processes, big-blob rows).
 
-**Durability trade-off (Д9).** The line is `write`+`flush`ed (in the OS cache,
+**Durability trade-off (D9).** The line is `write`+`flush`ed (in the OS cache,
 visible to readers, survives a process crash) but NOT `fsync`ed: a per-query
 fsync would tax every request, and a full power loss dropping only the last line
 is acceptable for a cooperative-agent log. The load-bearing guarantee is the
 cli's ORDERING (record committed before the agent gets its result), not fsync.
 
-**No new dependency (Д8).** The timestamp comes from `chrono`, already in the
+**No new dependency (D8).** The timestamp comes from `chrono`, already in the
 tree via sqlx (`sqlx::types::chrono`); the lock is `std`. `audit.rs` depends on
 serde/serde_json + std only.
 
@@ -3855,7 +3855,7 @@ agent-controlled — an agent can redirect the DEFAULT log by setting
 defense is an explicit literal `path` plus a read-only role, not the log alone).
 literal-only therefore hardens the explicit pin, not the default. If neither
 HOME nor XDG_DATA_HOME is set and no explicit path is given, auditing cannot
-proceed and fails closed (`AUDIT_FAILED`), never a panic (Д3).
+proceed and fails closed (`AUDIT_FAILED`), never a panic (D3).
 
 **Existing-file permission warning.** `main::warn_loose_permissions` (shared
 with the config file) stat-warns to stderr if an EXISTING log has group/other

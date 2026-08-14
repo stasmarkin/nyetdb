@@ -8,7 +8,7 @@ on:
     - cron: "20 3 * * *"
   workflow_dispatch:
 
-# Security tool: least privilege for the workflow token (Д8). The one job that
+# Security tool: least privilege for the workflow token (D8). The one job that
 # needs more (issues: write, to file the crash) asks for it itself.
 permissions:
   contents: read
@@ -16,7 +16,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# All actions are pinned to full commit SHAs (supply chain, Д8).
+# All actions are pinned to full commit SHAs (supply chain, D8).
 jobs:
   fuzz:
     runs-on: ubuntu-latest

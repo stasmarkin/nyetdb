@@ -1,5 +1,5 @@
 //! Audit log (UX-8): one JSON line per database-touching command, appended to
-//! `~/.local/share/nyet/audit.jsonl` for the human's forensics. Split per Д1/Д2:
+//! `~/.local/share/nyet/audit.jsonl` for the human's forensics. Split per D1/D2:
 //! this module is the pure record builder (`Event` -> compact JSON line, snapshot
 //! tested with an injected timestamp) plus the ONE piece of IO the feature needs
 //! (`append`: mkdir + create 0600 + advisory-lock + write + flush). Orchestration
@@ -106,7 +106,7 @@ pub struct Event<'a> {
 
 /// Serialize an event to its one-line JSON form (no trailing newline).
 pub fn line(event: &Event) -> String {
-    // Internal invariant (Д3): our structs and Values serialize infallibly.
+    // Internal invariant (D3): our structs and Values serialize infallibly.
     serde_json::to_string(event).expect("audit record serialization cannot fail")
 }
 
@@ -121,7 +121,7 @@ pub fn line(event: &Event) -> String {
 ///   (`File::lock`, flock(2) on unix) is held across the write+flush, so two
 ///   nyet processes appending large (>4 KiB, multi-`write()`) lines cannot mix
 ///   their bytes. Combined with `O_APPEND`, each line lands whole at the end.
-/// - **durability (Д9 trade-off)**: the line is written and flushed to the OS
+/// - **durability (D9 trade-off)**: the line is written and flushed to the OS
 ///   (visible to readers, survives a process crash) but NOT `fsync`ed — a
 ///   per-query fsync would tax every request, and a full OS/power loss losing
 ///   only the very last record is acceptable for a cooperative-agent forensic

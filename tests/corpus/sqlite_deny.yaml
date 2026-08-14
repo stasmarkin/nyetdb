@@ -122,7 +122,7 @@
   verdict: deny
   reason: PARSE_FAILED
 
-# --- writes nested deeper in the tree (recursive AST walk, DESIGN §3 п.5) ---
+# --- writes nested deeper in the tree (recursive AST walk, DESIGN §3 step 5) ---
 - query: WITH x AS (DELETE FROM t) SELECT 1
   verdict: deny
   reason: WRITE_OPERATION
@@ -152,7 +152,7 @@
   verdict: deny
   reason: PARSE_FAILED
 
-# --- locking clauses (DESIGN §3 п.6) ---
+# --- locking clauses (DESIGN §3 step 6) ---
 - query: SELECT * FROM users FOR UPDATE
   verdict: deny
   reason: LOCKING_CLAUSE
@@ -163,7 +163,7 @@
   verdict: deny
   reason: LOCKING_CLAUSE
 
-# --- function denylist (DESIGN §3 п.7; rationale in docs/DEV.md) ---
+# --- function denylist (DESIGN §3 step 7; rationale in docs/DEV.md) ---
 - query: SELECT load_extension('/tmp/evil.so')
   verdict: deny
   reason: DENIED_FUNCTION

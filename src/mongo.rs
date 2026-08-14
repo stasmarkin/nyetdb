@@ -1,5 +1,5 @@
 //! MongoDB layer 1: a parser for a **subset of the mongosh syntax** plus a
-//! closed allowlist over what it parsed. Pure (Д1/Д2) — it depends only on
+//! closed allowlist over what it parsed. Pure (D1/D2) — it depends only on
 //! `mongodb::bson` (+std), does no IO, and the golden corpus in
 //! `tests/corpus/mongo/` runs it without a live server.
 //!
@@ -8,7 +8,7 @@
 //! 1. **[`parse`]** turns the agent's text into a typed [`Request`]. It accepts
 //!    exactly the shapes listed in `ALLOWED_METHODS`/`ALLOWED_CHAIN`; anything
 //!    else — a method it does not know, an argument it cannot read, a stray
-//!    token — is a refusal, never a "let's send it and see". Д3: the text is
+//!    token — is a refusal, never a "let's send it and see". D3: the text is
 //!    untrusted input, so there is no `unwrap`, no panic and an explicit depth
 //!    limit on every recursion.
 //! 2. **[`classify`]** walks the whole parsed document and refuses any `$`-key
@@ -32,7 +32,7 @@ use std::str::FromStr;
 /// `error.reason` values this module can produce. Shared spellings with the SQL
 /// validator (`PARSE_FAILED`, `WRITE_OPERATION`, `DENIED_FUNCTION`) mean exactly
 /// what they mean there — a unit test pins that they stay identical strings.
-/// `DENIED_COMMAND` and `DENIED_OPERATOR` are new (append-only, Д7).
+/// `DENIED_COMMAND` and `DENIED_OPERATOR` are new (append-only, D7).
 pub const PARSE_FAILED: &str = "PARSE_FAILED";
 pub const WRITE_OPERATION: &str = "WRITE_OPERATION";
 pub const DENIED_FUNCTION: &str = "DENIED_FUNCTION";
@@ -72,7 +72,7 @@ fn refuse<T>(
     })
 }
 
-/// The generic hint for a syntax refusal (Д10: what happened -> why -> what to
+/// The generic hint for a syntax refusal (D10: what happened -> why -> what to
 /// do instead). Every parse refusal ends here, so the agent always learns the
 /// accepted shape.
 fn syntax_hint() -> String {
@@ -465,7 +465,7 @@ pub fn check_with_pii(text: &str, pii: &crate::validator::PiiRules) -> Result<Re
 
 /// Hard ceiling on nesting, for BOTH the parser and the classifier. The parser
 /// recurses per `{`/`[`/`(`, so without it a few thousand braces would overflow
-/// the stack — an abort, which is not a refusal (Д3). Set to MongoDB's own BSON
+/// the stack — an abort, which is not a refusal (D3). Set to MongoDB's own BSON
 /// nesting limit, so nyet refuses exactly what the server would and no
 /// legitimate document is caught by it.
 const MAX_DEPTH: usize = 100;
@@ -605,7 +605,7 @@ impl Parser {
 }
 
 /// Parse the mongosh subset. Every failure is a refusal with an actionable
-/// hint; no input can panic (Д3).
+/// hint; no input can panic (D3).
 fn parse(text: &str) -> Result<Request, Refusal> {
     if text.len() > MAX_INPUT_BYTES {
         return refuse(
@@ -932,7 +932,7 @@ fn build_op(method: &str, mut args: Vec<Bson>) -> Result<Op, Refusal> {
             Ok(Op::Distinct { key, filter })
         }
         // Unreachable: ALLOWED_METHODS is checked above and every entry is
-        // handled here. Refuse rather than panic (Д3).
+        // handled here. Refuse rather than panic (D3).
         _ => refuse(
             DENIED_COMMAND,
             format!("nyet: `{method}` is not on nyet's read allowlist for MongoDB"),
@@ -2771,7 +2771,7 @@ mod tests {
     }
 
     /// The three reasons MongoDB shares with the SQL validator must stay the
-    /// SAME strings: they are one closed list in the contract (Д7), and an
+    /// SAME strings: they are one closed list in the contract (D7), and an
     /// agent that learned `WRITE_OPERATION` from Postgres must recognize it
     /// here.
     #[test]
@@ -2945,7 +2945,7 @@ mod tests {
         }
     }
 
-    /// Golden corpus (Д6) — the public specification of what MongoDB layer 1
+    /// Golden corpus (D6) — the public specification of what MongoDB layer 1
     /// accepts. Lives in `tests/corpus/mongo/` (a SUBdirectory, so the SQL
     /// corpus runner, which reads `tests/corpus/*.yaml`, does not try to parse
     /// mongosh with sqlparser) and uses the same tiny line format.
@@ -3010,7 +3010,7 @@ mod tests {
                     Err(r) => {
                         assert_eq!(verdict, "deny", "{at}: got deny ({})", r.message);
                         assert_eq!(reason.as_deref(), Some(r.reason), "{at}: wrong reason");
-                        // Д10: a refusal without an actionable hint does not ship.
+                        // D10: a refusal without an actionable hint does not ship.
                         assert!(!r.message.is_empty(), "{at}: empty message");
                         assert!(!r.hint.is_empty(), "{at}: empty hint");
                     }
@@ -3021,7 +3021,7 @@ mod tests {
         assert!(total >= 220, "corpus suspiciously small: {total} cases");
     }
 
-    /// Д3: the parser sits on untrusted input, so NOTHING may panic — not
+    /// D3: the parser sits on untrusted input, so NOTHING may panic — not
     /// truncation at every byte boundary, not random punctuation, not a
     /// thousand nested braces (which without the depth limit would overflow
     /// the stack, and an abort is not a refusal).

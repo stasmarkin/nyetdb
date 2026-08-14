@@ -15,7 +15,7 @@ on:
 permissions:
   contents: read
 
-# All actions are pinned to full commit SHAs (supply chain, Д8).
+# All actions are pinned to full commit SHAs (supply chain, D8).
 jobs:
   analyze:
     runs-on: ubuntu-latest

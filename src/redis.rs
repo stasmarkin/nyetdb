@@ -426,7 +426,7 @@ pub fn check(
 
 /// The hint for a command the server does not call a read. Split out because
 /// the useful half is naming the read-only twin where one exists — a refusal
-/// that only says no is a refusal that teaches nothing (Д10).
+/// that only says no is a refusal that teaches nothing (D10).
 fn read_hint(name: &str) -> String {
     let twin = match name {
         "getex" => Some(("GET", "GETEX moves the key's TTL, which is a write")),
@@ -699,7 +699,7 @@ mod corpus {
     use super::*;
     use std::path::Path;
 
-    /// Golden corpus (Д6) — the public specification of what Redis layer 1
+    /// Golden corpus (D6) — the public specification of what Redis layer 1
     /// accepts. Lives in `tests/corpus/redis/` (a SUBdirectory, so the SQL
     /// corpus runner, which reads `tests/corpus/*.yaml`, does not hand Redis
     /// commands to sqlparser) and uses the same tiny line format, plus one key
@@ -783,7 +783,7 @@ mod corpus {
                             Some(r.reason.as_str()),
                             "{at}: wrong reason"
                         );
-                        // Д10: a refusal without an actionable hint does not ship.
+                        // D10: a refusal without an actionable hint does not ship.
                         assert!(!r.message.is_empty(), "{at}: empty message");
                         assert!(!r.hint.is_empty(), "{at}: empty hint");
                     }

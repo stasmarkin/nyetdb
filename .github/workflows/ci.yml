@@ -5,14 +5,14 @@ on:
     branches: [main]
   pull_request:
 
-# Security tool: least privilege for the workflow token (Д8).
+# Security tool: least privilege for the workflow token (D8).
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
-# All actions are pinned to full commit SHAs (supply chain, Д8).
+# All actions are pinned to full commit SHAs (supply chain, D8).
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -51,7 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo check --all-targets
 
-  # Supply chain gates (Д8): licenses/bans/advisories + RustSec audit.
+  # Supply chain gates (D8): licenses/bans/advisories + RustSec audit.
   deny:
     runs-on: ubuntu-latest
     timeout-minutes: 15

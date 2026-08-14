@@ -1523,7 +1523,7 @@ mod tests {
             match parse(&with(mode), &env_of(&[])).unwrap_err() {
                 ConfigError::GuardrailInvalid { alias, message } => {
                     assert_eq!(alias, "m");
-                    // Д10: the message says WHY, not just "no".
+                    // D10: the message says WHY, not just "no".
                     assert!(message.contains("executionStats"), "{message}");
                 }
                 other => panic!("{mode}: expected GuardrailInvalid, got {other:?}"),
@@ -1658,7 +1658,7 @@ mod tests {
             let cfg = parse(&with(&format!("mode = \"{value}\"")), &env_of(&[])).unwrap();
             assert_eq!(pii("a", &cfg.connections["a"]).unwrap().mode(), want);
         }
-        // A typo must not silently pick either sanction (Д3): loud, with the
+        // A typo must not silently pick either sanction (D3): loud, with the
         // two accepted values in the message.
         for bad in ["Mask", "redact", "off", ""] {
             let text = with(&format!("mode = \"{bad}\""));

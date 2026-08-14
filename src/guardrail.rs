@@ -1,7 +1,7 @@
 //! Auto-guardrail: estimate what a query will cost from its PLAN, before the
 //! database runs it, and refuse the monsters (ROADMAP v0.3).
 //!
-//! Pure (Д1/Д2): plan parsing, the threshold comparison and the refusal texts
+//! Pure (D1/D2): plan parsing, the threshold comparison and the refusal texts
 //! live here and are unit-tested on fixture plans without a live database. The
 //! engines only do the IO — run the EXPLAIN, hand the rows/JSON over — and the
 //! cli decides what to do with the verdict. The comparison strategy is
@@ -80,7 +80,7 @@ pub const DEFAULT_MAX_COST: f64 = 1_000_000.0;
 pub const DEFAULT_MAX_ROWS: u64 = 10_000_000;
 
 /// A connection's resolved guardrail: the mode plus the threshold it compares
-/// against. Built once from the config (validated at config parse, Д3).
+/// against. Built once from the config (validated at config parse, D3).
 #[derive(Debug)]
 pub struct Guardrail {
     mode: Mode,
@@ -248,7 +248,7 @@ impl Guardrail {
         }
     }
 
-    /// The refusal texts (Д10: what happened -> why -> what to do instead).
+    /// The refusal texts (D10: what happened -> why -> what to do instead).
     /// The way out names the HUMAN's config key on purpose: the threshold
     /// belongs to the config owner, and nyet ships no CLI override (UX-7 — an
     /// agent that can lift its own guardrail is theatre).
@@ -312,7 +312,7 @@ fn engine_modes(engine: &str) -> (Mode, &'static [Mode]) {
     }
 }
 
-/// The honest reason a mode is missing, so the config error teaches (Д10).
+/// The honest reason a mode is missing, so the config error teaches (D10).
 fn why_unsupported(engine: &str) -> &'static str {
     match engine {
         "mysql" | "mariadb" => {
@@ -347,7 +347,7 @@ fn compare(value: Option<f64>, threshold: f64) -> Check {
 }
 
 /// A plan number as f64, or None when it is absent/not a number/not finite. The
-/// plan is EXTERNAL input (Д3): a surprising shape must never panic, it just
+/// plan is EXTERNAL input (D3): a surprising shape must never panic, it just
 /// means "no estimate".
 ///
 /// A numeric STRING counts as a number too: MariaDB 11.4 sends the classic
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(pg("cost").check(&est), Check::Ok);
     }
 
-    /// Д3: the plan is external input — a surprising shape degrades to "no
+    /// D3: the plan is external input — a surprising shape degrades to "no
     /// estimate", never a panic and never an invented number.
     #[test]
     fn a_surprising_postgres_plan_is_no_estimate_not_a_panic() {
@@ -1049,7 +1049,7 @@ mod tests {
         );
     }
 
-    /// Д10: the refusal says what happened, and the way out is the HUMAN's
+    /// D10: the refusal says what happened, and the way out is the HUMAN's
     /// config key — nyet ships no override flag on purpose (UX-7).
     #[test]
     fn refusal_texts_name_the_number_and_the_config_key() {

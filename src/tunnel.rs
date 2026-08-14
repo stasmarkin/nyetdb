@@ -5,10 +5,10 @@
 //! failures) is the only IO. Depends only on std (net/process/fs) — no sqlx,
 //! no config.
 //!
-//! We never speak the SSH protocol ourselves (Д8: no `russh`): the system
+//! We never speak the SSH protocol ourselves (D8: no `russh`): the system
 //! binary inherits `~/.ssh/config`, keys, agent and `ProxyJump` for free, and
 //! `ControlMaster=auto`/`ControlPersist` over a stable `ControlPath` reuse the
-//! master between runs so the second `nyet` call pays no handshake (Д9).
+//! master between runs so the second `nyet` call pays no handshake (D9).
 //!
 //! LIFECYCLE — the forward is a shared, recorded resource, not a per-process one.
 //! A `-L` forward opened through a `ControlMaster` is owned by the *master* and
@@ -457,7 +457,7 @@ fn shell_quote(arg: &str) -> String {
 
 /// The registry record of the forward nyet left running for one (destination,
 /// remote) pair. Deliberately a plain `key=value` text file: the last-resort
-/// discovery tool is `cat`, and this module owes nothing to serde (Д2).
+/// discovery tool is `cat`, and this module owes nothing to serde (D2).
 #[derive(Debug, PartialEq)]
 struct Entry {
     /// The loopback port the forward listens on.

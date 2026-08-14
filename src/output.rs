@@ -44,7 +44,7 @@ struct ErrorBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
     message: &'a str,
-    // Mandatory: an error without an actionable hint does not ship (Д10).
+    // Mandatory: an error without an actionable hint does not ship (D10).
     hint: &'a str,
 }
 
@@ -74,10 +74,10 @@ pub struct SchemaMeta {
 /// kinds only (plus a `SCHEMA_TRUNCATED` warning): a full dump of a 500-table
 /// database would burn the agent's context for nothing (UX-4). An output
 /// policy, so it lives with the output model; not configurable on purpose
-/// (Д5) — `nyet schema <alias> <table>` is the escape hatch.
+/// (D5) — `nyet schema <alias> <table>` is the escape hatch.
 pub const DETAIL_LIMIT: usize = 50;
 
-/// `nyet schema` payload. The shape is the contract (Д7): fields are only
+/// `nyet schema` payload. The shape is the contract (D7): fields are only
 /// added, never renamed or dropped without a `v` bump.
 #[derive(Serialize)]
 pub struct Schema {
@@ -203,7 +203,7 @@ pub fn mark_pii(schema: &mut Schema, mode: &'static str, protects: impl Fn(&str,
 }
 
 /// What a masked cell reads as (`[connections.X.pii] mode = "mask"`). Deliberately
-/// NOT configurable (Д5) and deliberately not a partial mask: `j***@gmail.com`
+/// NOT configurable (D5) and deliberately not a partial mask: `j***@gmail.com`
 /// leaks the value piece by piece and a stable token is an equality oracle over
 /// it, so the whole cell goes, in every type.
 pub const REDACTED: &str = "[REDACTED]";
@@ -738,7 +738,7 @@ pub fn query_jsonl(columns: &[String], rows: &[Vec<Value>]) -> String {
 /// csv data stream: header + rows, RFC 4180 quoting (commas, quotes and
 /// newlines in values), NULL as an empty field, \n record separator, plus
 /// spreadsheet formula-injection defense (CWE-1236). ~20 lines by hand —
-/// a csv crate is not worth the supply-chain surface (Д8).
+/// a csv crate is not worth the supply-chain surface (D8).
 pub fn query_csv(columns: &[String], rows: &[Vec<Value>]) -> String {
     if columns.is_empty() {
         return String::new();
@@ -903,7 +903,7 @@ impl Serialize for CheckStatus {
     }
 }
 
-/// One diagnostic line. The shape is the contract (Д7): fields are only added,
+/// One diagnostic line. The shape is the contract (D7): fields are only added,
 /// never renamed or dropped without a `v` bump; `status` values are the closed
 /// list above.
 #[derive(Serialize)]
@@ -911,7 +911,7 @@ pub struct DoctorCheck {
     pub name: &'static str,
     pub status: CheckStatus,
     pub message: String,
-    /// Present for every `warn`/`fail` (Д10 — a diagnostic with no way forward
+    /// Present for every `warn`/`fail` (D10 — a diagnostic with no way forward
     /// is not a diagnostic) and omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -1176,7 +1176,7 @@ fn fail_check(
 }
 
 /// The full per-connection diagnosis (`nyet doctor <alias>`): compare the facts
-/// with the expectation and build the verdicts. PURE (Д1) — unit-tested with no
+/// with the expectation and build the verdicts. PURE (D1) — unit-tested with no
 /// database. Order is the contract's presentation order.
 pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
     vec![
@@ -1188,7 +1188,7 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<DoctorCheck> {
     .into_iter()
     // Engine-specific checks are emitted only where they mean something: a
     // `na` line on every other engine would be noise (UX-4), and the closed
-    // list of check NAMES is append-only either way (Д7).
+    // list of check NAMES is append-only either way (D7).
     .chain((input.engine == EngineKind::Mongo).then(|| server_side_js_check(input)))
     .chain((input.engine == EngineKind::Clickhouse).then(|| readonly_setting_check(input)))
     .chain((input.engine == EngineKind::Redis).then(|| read_only_session_check(input)))
@@ -1770,7 +1770,7 @@ fn server_side_js_check(input: &DoctorInput) -> DoctorCheck {
     }
 }
 
-/// The MongoDB layer-3 remedy (Д10), straight from the README recipe.
+/// The MongoDB layer-3 remedy (D10), straight from the README recipe.
 fn mongo_read_only_hint() -> String {
     "create a read-only user for exactly this database and point the url at it:\n\
      use <db>\n\
@@ -1810,7 +1810,7 @@ fn not_superuser_check(input: &DoctorInput) -> DoctorCheck {
                 "check connectivity and re-run nyet doctor, or verify the role's privileges by hand",
             ),
             // Roles/proxy grants nyet does not resolve: honestly incomplete, not
-            // a false pass (Д5 — no role resolver, just flag the gap).
+            // a false pass (D5 — no role resolver, just flag the gap).
             SuperuserFact::Unresolved(detail) => warn_check(
                 "not_superuser",
                 detail.clone(),
@@ -1911,7 +1911,7 @@ fn permissions_check(permissions: &Permissions) -> DoctorCheck {
     }
 }
 
-/// The layer-3 remedy per engine, straight from the README recipe (Д10).
+/// The layer-3 remedy per engine, straight from the README recipe (D10).
 fn read_only_role_hint(engine: EngineKind) -> String {
     match engine {
         EngineKind::Postgres => {
@@ -2044,7 +2044,7 @@ pub fn doctor_text(checks: &[DoctorCheck]) -> String {
 }
 
 fn to_json<T: Serialize>(value: &T) -> String {
-    // Internal invariant (fail-fast, Д3): serde_json only fails on non-string
+    // Internal invariant (fail-fast, D3): serde_json only fails on non-string
     // map keys / failing Serialize impls; ours are plain structs.
     serde_json::to_string(value).expect("envelope serialization cannot fail")
 }
@@ -2243,7 +2243,7 @@ mod tests {
         assert_eq!(rows[0][3], Value::Null);
         assert_eq!(rows[1][3], serde_json::json!({"k": "v"}));
         assert_eq!(rows[2][3], Value::from("keep"));
-        // An index past the row width cannot panic (Д3).
+        // An index past the row width cannot panic (D3).
         redact(&mut rows, &[99]);
         // No indexes = no edit.
         let before = rows.clone();
@@ -2719,7 +2719,7 @@ mod tests {
 
     /// A worst-case Postgres setup: the role can write and is a superuser, the
     /// transport is insecure and the config file is loose. Every warn/fail
-    /// carries an actionable hint (Д10); every ok/na does not.
+    /// carries an actionable hint (D10); every ok/na does not.
     /// W7: the two engines answer different questions, and the wording must
     /// not promise more than was checked — PostgreSQL scopes the list to what
     /// the role may read, MongoDB cannot and says so.
@@ -3196,7 +3196,7 @@ mod tests {
         assert_eq!(by(&none, "config_permissions").status, CheckStatus::Warn);
     }
 
-    /// Contract shape (Д7): keys and order are pinned, `hint` omitted when
+    /// Contract shape (D7): keys and order are pinned, `hint` omitted when
     /// absent, `connection` omitted in the config-level (meta-only) envelope.
     #[test]
     fn doctor_envelope_is_compact_and_stable() {

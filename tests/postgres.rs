@@ -1,7 +1,7 @@
 //! PostgreSQL end-to-end: drive the real binary against a throwaway Postgres
 //! container (testcontainers + Docker/colima). Requires a reachable Docker
 //! daemon; these tests fail (not skip) without one, so CI with a docker
-//! service runs them. Pins exit codes and envelope structure (Д7).
+//! service runs them. Pins exit codes and envelope structure (D7).
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -563,7 +563,7 @@ fn postgres_guardrail_and_explain_end_to_end() {
             .iter()
             .find(|w| w["code"] == "GUARDRAIL_SKIPPED")
             .unwrap_or_else(|| panic!("no GUARDRAIL_SKIPPED: {v}"));
-        // Д10: the warning says what to do about it.
+        // D10: the warning says what to do about it.
         assert!(
             skipped["message"].as_str().unwrap().contains("WHERE/LIMIT"),
             "{skipped}"
@@ -761,7 +761,7 @@ fn postgres_doctor_end_to_end() {
         assert_eq!(v["ok"], true);
         assert_eq!(by(&v, "connectivity")["status"], "ok");
         assert_eq!(by(&v, "read_only_role")["status"], "fail", "{v}");
-        // The fail hint carries the actual SQL to create a read-only role (Д10).
+        // The fail hint carries the actual SQL to create a read-only role (D10).
         assert!(by(&v, "read_only_role")["hint"]
             .as_str()
             .unwrap()
