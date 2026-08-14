@@ -15,7 +15,12 @@
 //! - `doctor` tells `readonly = 1` and `readonly = 2` apart, and does not
 //!   report the second as the first;
 //! - a failed query is never a cheerful empty result — ClickHouse writes the
-//!   exception INSIDE a well-formed JSON body, and that must not read as ok.
+//!   exception INSIDE a well-formed JSON body, and that must not read as ok;
+//! - **the `[pii]` net this engine has instead of provenance.** ClickHouse
+//!   reports no origin for a column, so net B compares result column NAMES
+//!   (`validator::check_result_names`): a view that KEEPS the name is caught, a
+//!   view that RENAMES it is not, and both halves are asserted against the
+//!   server rather than argued from the code.
 //!
 //! Everything runs in ONE container: starting one costs seconds, and the cases
 //! are independent.
@@ -110,6 +115,11 @@ async fn start_and_seed() -> (ContainerAsync<GenericImage>, u16) {
         "INSERT INTO events SELECT number, concat('u', toString(number), '@example.com'), 'n' \
          FROM numbers(50000)",
         "CREATE VIEW v_events AS SELECT id, email FROM events",
+        // The two views the PII test needs, and the reason it needs both: net B
+        // here compares result column NAMES, so a view that KEEPS the name is
+        // caught and one that RENAMES it is not. Seeded next to each other so
+        // the difference is one word of SQL.
+        "CREATE VIEW v_renamed AS SELECT id, email AS contact FROM events",
         &format!(
             "CREATE USER ro IDENTIFIED WITH plaintext_password BY '{PW}' SETTINGS readonly = 1"
         ),
@@ -451,6 +461,150 @@ fn clickhouse_layer2_refuses_what_the_validator_never_saw() {
             bypass.trim_end().ends_with("[]"),
             "layer 2 let a CREATE through: {bypass}"
         );
+        drop(container);
+    });
+}
+
+/// The `[pii]` policy against a live ClickHouse. Net A is engine-independent and
+/// the corpus pins it; what only a server can settle is **net B**, which on this
+/// engine is `validator::check_result_names` — the HTTP interface reports no
+/// column provenance, so the result column NAMES are the whole signal. Both
+/// halves of the README's promise are asserted here, the hole included: a
+/// boundary that is only argued in prose is a boundary nothing notices moving.
+#[test]
+fn clickhouse_pii_end_to_end() {
+    multi_thread_rt().block_on(async {
+        let (container, port) = start_and_seed().await;
+        let tmp = tempfile::tempdir().unwrap();
+        // A seeded cell value: any appearance in either stream is a leak.
+        const VALUE: &str = "u0@example.com";
+        let no_leak = |out: &Output, sql: &str| {
+            assert!(!stdout(out).contains(VALUE), "{sql}: leaked to stdout");
+            assert!(!stderr(out).contains(VALUE), "{sql}: leaked to stderr");
+        };
+        let cfg = config(
+            tmp.path(),
+            port,
+            "ro",
+            "[connections.ch.pii]\ncolumns = [\"events.email\"]\n",
+        );
+
+        // 1) Net A on the real dialect: the rule names the table, so naming the
+        // column — or the whole row, or the query log that quotes somebody
+        // else's WHERE — refuses before anything reaches the server.
+        for sql in [
+            "SELECT email FROM events",
+            "SELECT * FROM events",
+            "SELECT count() FROM events WHERE email LIKE 'u0%'",
+            "SELECT query FROM system.query_log",
+        ] {
+            let out = run(tmp.path(), &cfg, &["query", "ch", sql]);
+            assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+            assert_eq!(json(&out)["error"]["reason"], "PII_COLUMN", "{sql}");
+            no_leak(&out, sql);
+        }
+
+        // 2) Net B, the half this engine has. `v_events` appears in no rule, so
+        // net A lets the query through — and the column comes back under the
+        // protected NAME, which is the one thing the reply does carry.
+        let sql = "SELECT email FROM v_events ORDER BY id LIMIT 1";
+        let out = run(tmp.path(), &cfg, &["query", "ch", sql]);
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+        let v = json(&out);
+        assert_eq!(v["error"]["reason"], "PII_COLUMN", "{v}");
+        // The wording is net B's, not net A's ("the query references ..."):
+        // this is the assertion that goes red if the refusal ever comes from
+        // the pre-execution net instead, which would prove nothing about the
+        // net under test.
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("result column 'email' carries the name"),
+            "{v}"
+        );
+        assert!(v["rows"].is_null(), "a refused query returned rows: {v}");
+        no_leak(&out, sql);
+
+        // 3) THE DOCUMENTED HOLE, asserted as a hole. `v_renamed` returns the
+        // very same cells under a name no rule mentions, and nothing on the wire
+        // ties it back to `events.email` — so it runs, and the value comes out.
+        // This assertion exists to go red if that ever changes in EITHER
+        // direction: silently closed is a behaviour change, silently widened is
+        // a leak.
+        let sql = "SELECT contact FROM v_renamed ORDER BY id LIMIT 1";
+        let out = run(tmp.path(), &cfg, &["query", "ch", sql]);
+        assert_eq!(out.status.code(), Some(0), "{sql}: {}", stderr(&out));
+        assert_eq!(json(&out)["rows"][0]["contact"], VALUE);
+
+        // ...and what closes it short of a column-level GRANT: name the view's
+        // own column in the policy, and net A refuses it before it ever runs.
+        let cfg_view = config(
+            tmp.path(),
+            port,
+            "ro",
+            "[connections.ch.pii]\ncolumns = [\"v_renamed.contact\"]\n",
+        );
+        let out = run(tmp.path(), &cfg_view, &["query", "ch", sql]);
+        assert_eq!(out.status.code(), Some(5), "{sql}: {}", stdout(&out));
+        assert_eq!(json(&out)["error"]["reason"], "PII_COLUMN");
+        no_leak(&out, sql);
+
+        // 4) mode = "mask" is ENFORCED by net B here, so the redaction itself
+        // rides on the name match: net A sanctions the bare projection, net B
+        // has to find it under the protected name and blank it.
+        let cfg_mask = config(
+            tmp.path(),
+            port,
+            "ro",
+            "[connections.ch.pii]\ncolumns = [\"events.email\"]\nmode = \"mask\"\n",
+        );
+        let sql = "SELECT id, email FROM events ORDER BY id LIMIT 3";
+        let out = run(tmp.path(), &cfg_mask, &["query", "ch", sql]);
+        assert_eq!(out.status.code(), Some(0), "{sql}: {}", stdout(&out));
+        let v = json(&out);
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{v}");
+        for row in rows {
+            assert_eq!(row["email"], "[REDACTED]", "{v}");
+        }
+        // The agent must know it is looking at a mask (UX-2).
+        assert_eq!(v["warnings"][0]["code"], "PII_MASKED", "{v}");
+        no_leak(&out, sql);
+        assert_no_password_leak(&out);
+
+        // 5) doctor on a connection WITH a policy. `ro` holds SELECT on the
+        // whole database, so the honest answer is that the DATABASE does not
+        // enforce what the policy does — and the views that walk around the rule
+        // are named, the renaming one included: doctor is the layer that CAN see
+        // it, precisely because net B cannot.
+        let out = run(tmp.path(), &cfg, &["doctor", "ch", "--format", "json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let v = json(&out);
+        let checks = v["checks"].as_array().unwrap();
+        let by = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap_or_else(|| panic!("no {name} check in {v}"))
+        };
+        let columns = by("pii_columns");
+        assert_eq!(columns["status"], "warn", "{columns}");
+        assert!(
+            columns["message"]
+                .as_str()
+                .unwrap()
+                .contains("events.email"),
+            "{columns}"
+        );
+        let views = by("pii_views");
+        assert_eq!(views["status"], "warn", "{views}");
+        let message = views["message"].as_str().unwrap();
+        assert!(message.contains("v_events"), "{views}");
+        assert!(message.contains("v_renamed"), "{views}");
+        no_leak(&out, "doctor");
+        assert_no_password_leak(&out);
+
         drop(container);
     });
 }

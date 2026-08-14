@@ -3505,6 +3505,80 @@ mod tests {
         assert_eq!(check_origins(&rules, &cols, &kept, &[1]).unwrap(), vec![1]);
     }
 
+    /// Net B where the wire carries NO provenance (ClickHouse): the only signal
+    /// left is the result column NAME. Both halves of what the README promises
+    /// are asserted here — the view that KEPT the name is caught, the one that
+    /// RENAMED it is not. The second is a documented boundary, so it is pinned
+    /// by a test rather than by prose alone.
+    #[test]
+    fn net_b_by_name_catches_the_protected_name_and_not_a_rename() {
+        let rules = PiiRules::parse(&["events.email".to_string()], PiiMode::Deny).unwrap();
+        // The name came back through a view no rule names, so net A had nothing
+        // to refuse — this is the whole reason net B exists on this engine.
+        // Case folds, like every other comparison in the policy.
+        for label in ["email", "EMAIL"] {
+            match check_result_names(&rules, &[label.to_string()], &[]) {
+                Err(Refusal {
+                    reason,
+                    message,
+                    hint,
+                }) => {
+                    assert_eq!(reason, DenyReason::PiiColumn);
+                    assert!(message.contains(label), "{message}");
+                    // The LAYER hint, not the generic one: only the config owner
+                    // can fix a view that reaches the column.
+                    assert!(hint.contains("config"), "{hint}");
+                }
+                Ok(masked) => panic!("'{label}' must be refused, masked {masked:?}"),
+            }
+        }
+        // The documented hole: a renamed column carries nothing to match, and
+        // the reply says nothing about where it came from. The boundary for this
+        // one is a column-level GRANT (README), not a silent widening here.
+        assert!(check_result_names(&rules, &["contact".to_string()], &[])
+            .unwrap()
+            .is_empty());
+        // A column of an unprotected NAME on a protected table is not the same
+        // column, and must not be dragged in by the table's rule.
+        assert!(check_result_names(&rules, &["note".to_string()], &[])
+            .unwrap()
+            .is_empty());
+        // No policy -> no work at all, whatever the columns are called.
+        assert!(
+            check_result_names(&PiiRules::default(), &["email".to_string()], &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The mask promise on the name-only net, both halves. The second one is
+    /// load-bearing: without it `mask` would hand over what `deny` refused.
+    #[test]
+    fn net_b_by_name_keeps_the_mask_promise() {
+        let rules = PiiRules::parse(&["events.email".to_string()], PiiMode::Mask).unwrap();
+        let cols = vec!["id".to_string(), "email".to_string()];
+        assert_eq!(check_result_names(&rules, &cols, &[1]).unwrap(), vec![1]);
+        // Masked ONLY where net A sanctioned it: an unpromised protected name
+        // refuses exactly as it does under deny.
+        match check_result_names(&rules, &cols, &[]) {
+            Err(Refusal { reason, .. }) => assert_eq!(reason, DenyReason::PiiColumn),
+            Ok(masked) => panic!("an unsanctioned protected name must refuse, masked {masked:?}"),
+        }
+        // The promise UNKEPT: net A exempted column 1 on the promise of a
+        // redaction, and it came back under a name no rule protects (a renaming
+        // layer), so nothing masked it — refuse rather than return it.
+        let renamed = vec!["id".to_string(), "contact".to_string()];
+        match check_result_names(&rules, &renamed, &[1]) {
+            Err(Refusal {
+                reason, message, ..
+            }) => {
+                assert_eq!(reason, DenyReason::PiiUnprovable);
+                assert!(message.contains("'contact'"), "{message}");
+            }
+            Ok(masked) => panic!("an unkept promise must refuse, masked {masked:?}"),
+        }
+    }
+
     /// The mask relaxation is per OCCURRENCE, not per name: the very same
     /// `email` is allowed in the projection and refused in the WHERE of one
     /// statement — and the refusal has to teach the mask (Д10).
