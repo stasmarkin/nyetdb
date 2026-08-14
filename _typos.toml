@@ -26,3 +26,9 @@ ECT = "ECT"
 SELEC = "SELEC"
 # "ALLOWlists" — stylized "allowlists"; typos splits the leading uppercase run.
 ALLO = "ALLO"
+# PostgreSQL BRIN index maintenance functions (brin_summarize_new_values,
+# brin_desummarize_range) — a real function-name prefix, not "bring".
+brin = "brin"
+# Deliberate misspelling of the `keychain` secret reference in tests/cli.rs:
+# the test asserts an unknown key is rejected, not read as "no password".
+keychian = "keychian"

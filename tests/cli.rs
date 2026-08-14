@@ -239,7 +239,7 @@ fn the_config_location_never_reaches_the_output() {
         assert!(!help.contains(leak), "--help leaks {leak}:\n{help}");
     }
 
-    // Every config-error path: unreadable, unparseable, unknown alias.
+    // Every config-error path: unreadable, unparsable, unknown alias.
     let missing = tmp.path().join("nowhere/config.toml");
     let broken = write_config(
         tmp.path(),
