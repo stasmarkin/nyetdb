@@ -48,10 +48,10 @@ jobs:
           persist-credentials: false
       # Nightly is a hard requirement of cargo-fuzz (-Z sanitizer). It lives in
       # THIS workflow only: nothing in ci.yml may come to depend on it.
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master 2026-07
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07
         with:
           toolchain: nightly
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # The fuzz crate is its own workspace (fuzz/Cargo.toml is not a member
           # of the root package), so its target dir needs naming separately.
@@ -59,7 +59,7 @@ jobs:
             . -> target
             fuzz -> fuzz/target
           key: ${{ matrix.target }}
-      - uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
+      - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
         with:
           tool: cargo-fuzz
 
