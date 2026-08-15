@@ -40,3 +40,16 @@ pr-run-mode = "skip"
 # docs/DEV.md), so it intentionally differs from dist's output. Without this,
 # the release pipeline's own `dist plan` job would fail its out-of-date check.
 allow-dirty = ["ci"]
+
+# dist 0.28 assigns `macos-13` to BOTH Apple targets, and GitHub retired that
+# image in December 2025: the label resolves to no runner at all, so those jobs
+# sit queued until they time out instead of failing loudly (v0.1.0's first
+# attempt died exactly there). `macos-15-intel` is the last x86_64 macOS image
+# Actions offers — through August 2027, after which x86_64 macOS ends and this
+# target has to go or be cross-built. `macos-14` is the oldest Apple-silicon
+# image still supported. Both jobs only build; nothing here needs a specific
+# Xcode. The release pipeline's own `plan` job reads this matrix at run time,
+# so changing it needs no `dist generate` and re-applies no hardenings.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-14"
+x86_64-apple-darwin = "macos-15-intel"
