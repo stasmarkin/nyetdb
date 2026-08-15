@@ -1,6 +1,6 @@
 [package]
 name = "nyetdb"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Actual MSRV, driven by sqlx 0.9 (rust-version 1.94). Bumped freely; the only
 # promise is that it is stated here and checked in CI (msrv job).
