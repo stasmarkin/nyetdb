@@ -195,6 +195,20 @@ enum Command {
         item: String,
     },
 
+    /// Open the config file in your editor ($VISUAL, then $EDITOR, then vi)
+    ///
+    /// The same file every other command reads: `--config`, then $NYET_CONFIG,
+    /// then the default location. nyet creates it owner-only (0600) if it is
+    /// missing, and removes it again if you quit without saving.
+    ///
+    /// The editor value is split on whitespace (`code -w` works), NOT parsed
+    /// like a shell: quoting is not honored, so an editor whose PATH contains
+    /// a space needs a symlink or a wrapper script. No shell is invoked.
+    ///
+    /// nyet does not check what you saved — run `nyet doctor` after.
+    #[command(verbatim_doc_comment)]
+    Settings,
+
     /// Turn another tool's saved connections into nyet config sections
     ///
     ///   nyet import datagrip                 # print the sections
@@ -841,6 +855,12 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
     if let Command::SecretSet { item } = &cli.command {
         return secret_set(item);
     }
+    // And again: editing the config is how a broken — or absent — one gets
+    // fixed, so reading it first would lock the user out of the only command
+    // that repairs it.
+    if let Command::Settings = &cli.command {
+        return settings(cli.config);
+    }
     // And the same again: an import reads somebody else's files to PRODUCE a
     // config, so requiring a valid one first would make the command useless to
     // the person who has none yet.
@@ -1359,6 +1379,7 @@ fn run(cli: Cli, route_format: &mut Format) -> Result<(), Failure> {
         // read), so this arm is dead — it exists only for match exhaustiveness.
         Command::AgentSetup { .. } => unreachable!("agent-setup is short-circuited above"),
         Command::SecretSet { .. } => unreachable!("secret-set is short-circuited above"),
+        Command::Settings => unreachable!("settings is short-circuited above"),
         Command::Import { .. } => unreachable!("import is short-circuited above"),
     }
 }
@@ -3096,6 +3117,9 @@ fn command_format_flag(command: &Command) -> Option<Format> {
         // secret-set writes one line to stderr and no envelope; like
         // agent-setup it never reaches the format-routed error paths.
         Command::SecretSet { .. } => None,
+        // settings hands the terminal to an editor and prints nothing of its
+        // own; only its failures are envelopes, routed by the default below.
+        Command::Settings => None,
         // import routes like agent-setup's markdown: generated text on stdout,
         // envelope on stderr. It sets that itself before any error path.
         Command::Import { .. } => None,
@@ -3109,9 +3133,10 @@ fn default_format(command: &Command) -> Format {
         Command::Doctor { .. } => Format::Table,
         // Markdown default routes like a data format (stderr envelope);
         // agent_setup overrides this before any error path anyway.
-        Command::AgentSetup { .. } | Command::SecretSet { .. } | Command::Import { .. } => {
-            Format::Table
-        }
+        Command::AgentSetup { .. }
+        | Command::SecretSet { .. }
+        | Command::Import { .. }
+        | Command::Settings => Format::Table,
         _ => Format::Json,
     }
 }
@@ -3311,6 +3336,87 @@ fn secret_set(item: &str) -> Result<(), Failure> {
         io::stderr(),
         "stored \"{item}\" in the login keychain, readable by this build of nyet only"
     );
+    Ok(())
+}
+
+/// Hand the config file to the user's editor. The path stays out of every
+/// message here for the reason `read_config` states — the editor shows it to
+/// the human, the envelope does not show it to the agent.
+fn settings(flag: Option<PathBuf>) -> Result<(), Failure> {
+    let path = config_path(flag)?;
+    let make = |e: std::io::Error| {
+        Failure::new(
+            ErrorCode::ConfigInvalid,
+            format!("the config file could not be created: {e}"),
+            "check that the parent directory is writable by the current user",
+        )
+    };
+    // The editor is resolved before anything is created: a refusal here must
+    // not leave an empty config behind.
+    let editor = std::env::var_os("VISUAL")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("EDITOR").filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| "vi".into());
+    // $EDITOR carries arguments as often as not (`code -w`, `emacsclient -nw`),
+    // and splitting on whitespace is what the value means to every other tool
+    // that reads it. No shell: a config path never goes through one.
+    let editor = editor.to_string_lossy().into_owned();
+    let mut words = editor.split_whitespace();
+    let Some(program) = words.next() else {
+        return Err(Failure::new(
+            ErrorCode::ConfigInvalid,
+            "$VISUAL/$EDITOR is set to whitespace",
+            "set it to an editor command, or unset it to fall back to vi",
+        ));
+    };
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(make)?;
+        }
+    }
+    // nyet creates the file ITSELF rather than leaving it to the editor, which
+    // would create it at the umask (0644 typically) — a config carrying
+    // credentials is owner-only from birth here as it is in `import --write`
+    // and the audit log. `append` so an existing file keeps both its content
+    // and its mode (see the comment in `append_to_config`).
+    let existed = path.exists();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    drop(opts.open(&path).map_err(make)?);
+    let status = std::process::Command::new(program)
+        .args(words)
+        .arg(&path)
+        .status()
+        .map_err(|e| {
+            Failure::new(
+                ErrorCode::Internal,
+                format!("the editor \"{program}\" could not be started: {e}"),
+                "set $EDITOR to a command that exists on PATH",
+            )
+        })?;
+    // An editor that saves and THEN fails (`:cq`, a crash) leaves credentials on
+    // disk, and an editor that saves atomically (write-rename) leaves them at
+    // ITS mode, not the 0600 above — so the check runs before the exit code is
+    // judged, not after.
+    warn_loose_permissions(&path, "the config file");
+    // Quit without saving and the file nyet just created is still empty. Leaving
+    // it would answer every later command with "no connections" where "no
+    // config" is the truth (see `read_config`).
+    if !existed && std::fs::metadata(&path).is_ok_and(|md| md.len() == 0) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if !status.success() {
+        return Err(Failure::new(
+            ErrorCode::Internal,
+            format!("the editor exited with {status}"),
+            "nyet changed nothing; whatever the editor saved before it failed is still there",
+        ));
+    }
     Ok(())
 }
 

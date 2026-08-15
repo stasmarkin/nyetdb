@@ -109,7 +109,8 @@ you need it.
 
 There is deliberately no per-project config file in the repository: a file in
 a repo could be created by an agent or arrive via PR, and the config must be
-authored by the user only.
+authored by the user only. `nyet settings` opens that file in your editor (see
+below).
 
 Full annotated example:
 
@@ -2135,6 +2136,29 @@ not invent a metric where there is none.
 connections reachable from the current directory (a named alias, by contrast, is
 diagnosed regardless of `allowed_dirs` — you own the config and may be testing
 it from anywhere).
+
+### nyet settings
+
+```sh
+nyet settings                          # open the config in $VISUAL / $EDITOR / vi
+NYET_CONFIG=./work.toml nyet settings  # the same file that config would resolve to
+```
+
+Opens **the** config file — the one resolved exactly as every other command
+resolves it (see [Configuration](#configuration)) — in your editor. The
+directory is created if missing, and so is the file: nyet creates it itself,
+owner-only (`0600`), rather than letting the editor create it at your umask;
+an existing file keeps its own mode. Quit without saving and the empty file
+nyet just created is removed again, so a later command still says "the config
+file does not exist" instead of "no connections".
+
+The editor value is split on whitespace, so `EDITOR="code -w"` works, but it is
+**not** shell-parsed: quoting is not honored (an editor whose path contains a
+space needs a symlink or a wrapper), and no shell is invoked on the config path.
+If the editor exits non-zero, nyet says so — whatever it saved before failing is
+still on disk.
+
+nyet does not validate what you saved: run `nyet doctor` after.
 
 ### nyet agent-setup
 

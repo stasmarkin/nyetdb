@@ -3910,3 +3910,89 @@ fn import_datagrip_names_the_drivers_it_skips() {
     assert!(err.contains(r#"skipped "legacy""#), "{err}");
     assert!(err.contains("oracle"), "{err}");
 }
+
+/// `settings` runs $EDITOR — arguments and all — against the path the rest of
+/// nyet reads, and creates that file owner-only rather than at the umask.
+#[test]
+#[cfg(unix)]
+fn settings_opens_the_config_path_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join(".config/nyet/config.toml");
+    // `cp <src> <path>` stands in for an editor that saves: it proves WHICH
+    // path nyet passed, and that the value was split into program + argument.
+    let src = tmp.path().join("edited.toml");
+    fs::write(&src, "[connections]\n").unwrap();
+    let out = nyet(tmp.path())
+        .arg("settings")
+        // env_clear() took PATH with it, and `cp` has to be found (tests/ssh.rs).
+        .env("PATH", "/usr/bin:/bin")
+        .env("EDITOR", format!("cp {}", src.display()))
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&cfg).unwrap(), "[connections]\n");
+    // 0600 from birth: `cp` onto an existing file keeps the target's mode, so
+    // this is the mode nyet created it with — and no warning was printed.
+    let mode = fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "config created as {mode:o}");
+    assert_eq!(stderr(&out), "");
+}
+
+/// The editor's failure reaches the agent as an envelope, and an editor that
+/// saved nothing leaves no empty config behind to be mistaken for a real one.
+#[test]
+fn settings_reports_a_failed_editor_and_keeps_no_empty_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join(".config/nyet/config.toml");
+
+    // $VISUAL wins over $EDITOR.
+    let out = nyet(tmp.path())
+        .arg("settings")
+        .env("PATH", "/usr/bin:/bin")
+        .env("VISUAL", "false")
+        .env("EDITOR", "true")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "out={:?} err={:?}",
+        stdout(&out),
+        stderr(&out)
+    );
+    // Nothing of nyet's own on stdout (secret-set's routing): the envelope for
+    // a command with no data stream goes to stderr.
+    assert_eq!(stdout(&out), "");
+    let v: serde_json::Value = serde_json::from_str(stderr(&out).trim()).unwrap();
+    assert_eq!(v["error"]["code"], "INTERNAL");
+    assert!(v["error"]["hint"].is_string(), "hint missing: {v}");
+    assert!(!cfg.exists(), "an empty config survived a failed editor");
+
+    // Quit without saving (`true` writes nothing): same cleanup, exit 0.
+    let out = nyet(tmp.path())
+        .arg("settings")
+        .env("PATH", "/usr/bin:/bin")
+        .env("EDITOR", "true")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        !cfg.exists(),
+        "an empty config survived an editor that saved nothing"
+    );
+
+    // Whitespace is not an editor — and not a program name either.
+    let out = nyet(tmp.path())
+        .arg("settings")
+        .env("EDITOR", " ")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(!cfg.exists(), "a refusal created a config anyway");
+}
