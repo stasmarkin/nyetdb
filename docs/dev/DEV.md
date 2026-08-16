@@ -2020,7 +2020,7 @@ The checks (order = presentation order): `connectivity`, `transport_encrypted`,
 `config_permissions`. `ssh_forward` and `pii_columns` are conditional — like
 `pii_columns` (emitted only with a `[pii]` section), `ssh_forward` is emitted
 only for a connection with an `[ssh]` section, from the live `Tunnel` guard's
-facts (port / reused / age / the `ssh -O cancel` line); on a connection without
+facts (port / reused / age / the `ssh -O exit` line); on a connection without
 a tunnel there is nothing to say and no `na` noise (UX-4).
 `transport_encrypted` reuses the same static rule as the `INSECURE_TRANSPORT`
 warning (`engine::transport_below_require`, ssh vs. sslmode >= require);

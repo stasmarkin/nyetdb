@@ -22,13 +22,13 @@ there are no backports to older tags. Track the latest release.
 
 `nyet` is a read-only layer for a **cooperative but fallible** agent, not a
 sandbox around a hostile one (see the threat model in
-[docs/DESIGN.md](docs/DESIGN.md)). The list below is deliberate: an unwritten
-boundary gets found anyway, and honesty beats obscurity. The *categories* below
-are accepted limits, not bugs — directory scoping as a UX barrier, prompt
-injection, the PII oracle as a class. But a **concrete, first-of-its-kind
-bypass** — a specific input that defeats the function denylist or a parser-vs-
-server divergence that slips a write past the validator — *is* a reportable bug:
-file it privately as above.
+[docs/dev/DESIGN.md](docs/dev/DESIGN.md)). The list below is deliberate: an
+unwritten boundary gets found anyway, and honesty beats obscurity. The
+*categories* below are accepted limits, not bugs — directory scoping as a UX
+barrier, prompt injection, the PII oracle as a class. But a **concrete,
+first-of-its-kind bypass** — a specific input that defeats the function
+denylist, or a parser-vs-server divergence that slips a write past the
+validator — *is* a reportable bug: file it privately as above.
 
 - **An agent with shell access can walk around `nyet`.** It can read the config
   and connect to the database directly (`psql`, `nc`, a driver). The durable

@@ -11,7 +11,7 @@ for slicing the steps:
   1. tests written and green (corpus / integration / snapshot — whichever the
      step calls for);
   2. README.md (the operating manual) extended for the new capability;
-  3. docs/DEV.md (the development manual) extended if the structure or the
+  3. DEV.md (the development manual) extended if the structure or the
      process changed;
   4. fmt + clippy (deny warnings) + cargo-deny clean;
   5. one step = one PR/commit into main with a meaningful message.
@@ -43,7 +43,7 @@ tests for the resolver (symlinks, `~`, nested paths), a snapshot of the `list`
 envelope.
 
 **Docs:** README: installation, a full config example, `nyet list`.
-docs/DEV.md is created: build, running tests, the module map (from PRINCIPLES
+DEV.md is created: build, running tests, the module map (from PRINCIPLES
 D2).
 
 ## Step 2 — `nyet query` for SQLite: the first end-to-end

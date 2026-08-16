@@ -545,7 +545,7 @@ owner marked as PII** (`[connections.X.pii]`).
   EXPLAIN (a plan estimate above the threshold → the query is not executed,
   `NYET`/`EXPENSIVE_QUERY`, exit 5). The guardrail is best effort against
   monsters, not a guarantee: an engine without estimates (SQLite, MongoDB,
-  Redis) and an unparsed plan both leave it off (see docs/DEV.md).
+  Redis) and an unparsed plan both leave it off (see DEV.md).
 - **Credentials reaching the LLM's context**: the agent works with aliases;
   passwords live only in the env or the config, and nyet never prints them to
   stdout, stderr or logs.
@@ -654,7 +654,7 @@ owner marked as PII** (`[connections.X.pii]`).
   listed separately.
 - **Views and other server-side renamings**: the rules act on the names nyet
   sees. Postgres and MySQL/MariaDB report the origin of a view's column as THE
-  VIEW ITSELF (measured, see docs/DEV.md), so a rule on the base table does not
+  VIEW ITSELF (measured, see DEV.md), so a rule on the base table does not
   cover the view — its columns are listed separately. The same holds for
   materialized views, **set-returning functions** (`RETURNS SETOF users` —
   `SELECT * FROM f()` returns everything, and net B reports the function, not
@@ -671,7 +671,7 @@ owner marked as PII** (`[connections.X.pii]`).
   them apart in the AST IS possible (`Query.with` carries the CTE names), but
   doing it correctly needs lexical scoping of names, while `PiiScope` is a
   single flat one for the whole statement; the naive exclusion fails open, see
-  the counterexample in docs/DEV.md. The workaround is to rename the CTE.
+  the counterexample in DEV.md. The workaround is to rename the CTE.
 - **The real confidentiality boundary is the database layer**: column-level
   GRANTs, views and RLS apply to ANY client, including an agent that went
   around nyet. The `[pii]` section is a fast, local, reviewable layer on top,

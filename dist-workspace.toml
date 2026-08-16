@@ -2,7 +2,7 @@
 members = ["cargo:."]
 
 # Config for 'dist': the release pipeline (GitHub Releases + shell installer +
-# Homebrew tap). Triggered by a `v*` tag; see docs/DEV.md (release process).
+# Homebrew tap). Triggered by a `v*` tag; see docs/dev/DEV.md (release process).
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.28.7"
@@ -14,7 +14,7 @@ ci = "github"
 # `gh attestation verify <file> --repo <owner/repo>`. The shell installer and
 # Homebrew formula merely download those attested binaries; the source tarball
 # and sha256 sums are NOT covered. The permissions/step are hand-hardened in
-# release.yml (scoped to the build job, not workflow-wide) — see docs/DEV.md.
+# release.yml (scoped to the build job, not workflow-wide) — see docs/dev/DEV.md.
 github-attestations = true
 # The installers to generate for each app
 installers = ["shell", "homebrew", "npm"]
@@ -27,7 +27,7 @@ publish-jobs = ["homebrew"]
 # four more) under its name-similarity rule — a registry rule, not a claim
 # someone else holds, so those names are open to nobody.
 # NOT in publish-jobs: that job is what forces `dist generate`, and regenerating
-# release.yml costs the four hardenings a hand re-apply (see docs/DEV.md) plus
+# release.yml costs the four hardenings a hand re-apply (see docs/dev/DEV.md) plus
 # an npm automation token living in CI. The package rides along as a release
 # artifact instead, and a human runs `npm publish` on it — the same "a release
 # is a deliberate act" line the Homebrew tap repo sits on.
@@ -47,7 +47,7 @@ targets = [
 pr-run-mode = "skip"
 # The generated release.yml is hand-hardened AFTER `dist generate` (SHA-pinned
 # actions, least-privilege per-job permissions, `v`-prefixed tag trigger — see
-# docs/DEV.md), so it intentionally differs from dist's output. Without this,
+# docs/dev/DEV.md), so it intentionally differs from dist's output. Without this,
 # the release pipeline's own `dist plan` job would fail its out-of-date check.
 allow-dirty = ["ci"]
 

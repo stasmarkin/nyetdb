@@ -6,12 +6,19 @@ somewhere better.
 
 ## Where the truth is
 
+**The docs are split by audience.** `docs/` is the user guide — for a human
+using `nyet`, deliberately terse, facts without the argument. `docs/dev/` is for
+whoever works on the project, human or not. Keep them that way: a rationale that
+creeps into the guide belongs in `docs/dev/RATIONALE.md`, and a user-visible
+behaviour that changes has to change in both.
+
 | Question | File |
 |---|---|
-| How to build, test, fuzz, release | `docs/DEV.md` |
-| Why the design is what it is | `docs/DESIGN.md`, `docs/PRINCIPLES.md` |
-| What ships when | `ROADMAP.md`, `docs/PLAN.md` |
-| What the tool promises users | `README.md` (the error/warning code tables are contract) |
+| How to build, test, fuzz, release | `docs/dev/DEV.md` |
+| Why the design is what it is | `docs/dev/DESIGN.md`, `docs/dev/PRINCIPLES.md` |
+| What ships when | `ROADMAP.md`, `docs/dev/PLAN.md` |
+| What the tool promises users | the guide: `docs/GETTING-STARTED.md`, `docs/COMMANDS.md`, `docs/ENGINES.md`, `docs/SECURITY-MODEL.md` — its error/warning/exit-code tables are contract |
+| Why the guide says what it says | `docs/dev/RATIONALE.md` — the long-form prose it was condensed from |
 | What to run | `justfile` — `just` alone lists the recipes |
 
 ## Commands
@@ -37,7 +44,7 @@ somewhere better.
 
 ## Releasing
 
-`docs/DEV.md` has the process. Two things worth knowing before you touch it:
+`docs/dev/DEV.md` has the process. Two things worth knowing before you touch it:
 
 - **Order by irreversibility.** Tag → wait for the pipeline to go green → then
   `cargo publish` → then `just npm-publish <version>`. A tag can be re-cut and a

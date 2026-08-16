@@ -113,7 +113,7 @@ Items 1–5 are done (August 2026).
       `@stasmarkin/nyetdb` and ships from v0.3.0 on. `v0.1.0` was tagged and
       never announced — dist pointed the Apple builds at GitHub's retired
       `macos-13` image, which matches no runner and queues rather than fails
-      (see docs/DEV.md, release process)
+      (see docs/dev/DEV.md, release process)
 - [ ] README: the safety story + a token benchmark against MCP servers
       (material for HN). The safety story is written in full (Status,
       Security, the read-only layers, warning codes, the audit log); the token
@@ -521,7 +521,7 @@ conventional-commits lint.
 The goal is open source, so the whole public surface has to be in English. As
 of July 2026 `README.md` was already fully English, and so were nearly all the
 code comments; about 1100 lines of Cyrillic remained, concentrated in
-`docs/DESIGN.md`, `docs/PLAN.md`, `docs/PRINCIPLES.md`, this `ROADMAP.md`,
+`docs/dev/DESIGN.md`, `docs/dev/PLAN.md`, `docs/dev/PRINCIPLES.md`, this `ROADMAP.md`,
 leftover comments in `src/*.rs` and `tests/*.rs`, and a couple of lines in
 `ci.yml` and `deny.toml`.
 
