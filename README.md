@@ -102,10 +102,12 @@ Prefer the installer or Homebrew where you have the choice.
 npm install -g @stasmarkin/nyetdb
 ```
 
-Or from crates.io / source, on any platform with a Rust toolchain:
+Or through cargo, on any platform with a Rust toolchain. `binstall` fetches the
+same release archive the installer does, in seconds; the other two compile:
 
 ```sh
-cargo install nyetdb        # from crates.io
+cargo binstall nyetdb       # prebuilt, from the GitHub release
+cargo install nyetdb        # from crates.io, compiled here
 cargo install --path .      # from a checkout
 ```
 
