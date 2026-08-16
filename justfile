@@ -61,6 +61,35 @@ fuzz target time="120":
 install:
     cargo install --path . --locked
 
+# Why this is not just `npm publish` on the release artifact: dist ships an
+# `npm-shrinkwrap.json` pinning axios 1.7.9 and its 2024 dependency tree, and a
+# shrinkwrap is authoritative for whoever installs — so every user would get
+# 1 critical + 4 high advisories that `npm audit fix` in THEIR project cannot
+# override. The caret ranges in package.json are fine; only the lockfile is
+# stale. This regenerates it, refuses to publish if anything is still
+# vulnerable, and publishes that. The tarball on npm therefore differs from the
+# one attached to the release — by its lockfile, and nothing else.
+#
+# --ignore-scripts: the package's own postinstall downloads a platform binary,
+# which has no business running here. The registry is spelled out because a
+# company registry in ~/.npmrc would otherwise quietly take this package.
+
+# Publishes the npm wrapper for an already-released tag (`just npm-publish 0.3.1`).
+npm-publish version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    gh release download "v{{ version }}" -R stasmarkin/nyetdb -p 'nyetdb-npm-package.tar.gz' -D "$work"
+    tar xf "$work/nyetdb-npm-package.tar.gz" -C "$work"
+    cd "$work/package"
+    test "$(jq -r .version package.json)" = "{{ version }}"
+    rm -f npm-shrinkwrap.json
+    npm install --registry https://registry.npmjs.org --ignore-scripts --no-audit --no-fund
+    npm audit --registry https://registry.npmjs.org --audit-level=low
+    npm shrinkwrap
+    npm publish --registry https://registry.npmjs.org --access public
+
 # Readable line instead of a testcontainers stack trace when Docker is down.
 [private]
 _docker:

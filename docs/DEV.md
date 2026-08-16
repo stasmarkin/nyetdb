@@ -3660,7 +3660,9 @@ table) and the generated pipeline in `.github/workflows/release.yml`.
   Note what this channel gives up: dist's package downloads the platform
   archive in a `postinstall` and verifies **no checksum** — unlike the shell
   installer and the formula, both of which pin a SHA-256. Said plainly in the
-  README's install section.
+  README's install section. Its lockfile is the other half of that story, and
+  the reason npm is published through `just npm-publish` rather than by hand
+  (see the release steps below).
 
 Regenerate the workflow after editing `[dist]` config: `dist init --yes` (writes
 config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
@@ -3716,10 +3718,16 @@ config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
    pipeline is green. Not automated and not first: the tag can be re-cut, a
    crates.io version cannot be taken back — `yank` hides a version from
    resolution and deletes nothing.
-5. **npm:** download `nyetdb-npm-package.tar.gz` from the Release and
-   `npm publish --registry https://registry.npmjs.org --access public` it. The
-   explicit registry is not decoration: an `~/.npmrc` pointing at a company
-   registry will otherwise take a personal package there without asking.
+5. **npm:** `just npm-publish 0.3.1`. It takes the package the release built,
+   throws away the `npm-shrinkwrap.json` dist put in it, resolves the same
+   caret ranges fresh, refuses to go on if `npm audit` finds anything, and
+   publishes that. Do not shortcut it to a bare `npm publish`: dist's shrinkwrap
+   pins axios 1.7.9 and its 2024 tree — 1 critical and 4 high advisories at the
+   time of writing — and a shrinkwrap binds whoever installs, so `npm audit fix`
+   in their project cannot lift it. The published tarball differs from the
+   release artifact by that lockfile alone. The recipe also spells the registry
+   out, because an `~/.npmrc` pointing at a company registry otherwise takes a
+   personal package there without asking.
 6. First release only (done for v0.2.0): create the `stasmarkin/homebrew-tap`
    repo **with an initial commit** — the publish job checks it out, and a repo
    with no commits fails that step — and add the `HOMEBREW_TAP_TOKEN` secret
