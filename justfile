@@ -27,7 +27,9 @@ build:
 test-fast:
     # --lib as well as --bins: the modules, and their unit tests, live in the
     # lib target since src/lib.rs; only the cli layer is left in the binary.
-    cargo test --lib --bins --test cli -- {{ container_units }}
+    # --test docs reads markdown and nothing else, so the docs stay in the fast
+    # loop: a rename that breaks a cross-reference fails here, not in review.
+    cargo test --lib --bins --test cli --test docs -- {{ container_units }}
 
 # Everything, containers included (~40s): needs a Docker daemon.
 test: _docker
