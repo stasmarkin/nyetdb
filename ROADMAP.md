@@ -9,12 +9,12 @@ the like) and at harnesses.
 (the ripgrep→`rg` pattern: the brand is unique and searchable, the command is
 short). Claimed (July 2026): GitHub (stasmarkin/nyetdb), crates.io (`nyetdb`
 plus the `nyet` alias).
-**Backlog:** register the `nyetdb` and `nyet` npm packages (the names are
-free, placeholders sit in `packaging/npm/`; publishing ran into npm's
-browser-based 2FA flow — run an interactive `npm publish
---registry=https://registry.npmjs.org/ --access public` from each directory,
-or get a granular token that bypasses 2FA). Domains are deferred (decision:
-not buying any for now).
+On npm neither short name is obtainable, and not by anyone: the registry's
+name-similarity rule refuses `nyetdb` (too close to `nedb`) and `nyet` (`nyc`,
+`net`, `ret`, `nuxt`, `next`, `nopt`, `uyat`). There is accordingly nothing to
+reserve there — the package is scoped, `@stasmarkin/nyetdb`, and exists to be
+installable rather than to hold a name. Domains are deferred (decision: not
+buying any for now).
 
 **Positioning:** a safety-first CLI. The differentiation is not the breadth of
 database support (Google's MCP Toolbox covers ~47 sources) but the combination
@@ -106,13 +106,14 @@ Items 1–5 are done (August 2026).
 ### v0.2 — sqlx breadth + release
 
 - [x] MySQL/MariaDB, SQLite (they reuse the pipeline)
-- [ ] dist: the release pipeline, installers, a Homebrew tap, an npm package.
-      The pipeline is ready and hand-hardened (`dist-workspace.toml`,
-      `.github/workflows/release.yml`, the shell installer plus the homebrew
-      publish job), but **nothing has been published**: the version is
-      `0.0.1`, there are no `v*` tags, the tap repository does not exist,
-      `HOMEBREW_TAP_TOKEN` has not been created, and the npm wrapper
-      (`packaging/npm/`) is not wired into dist
+- [x] dist: the release pipeline, installers, a Homebrew tap, an npm package.
+      Shipped as **v0.2.0** (August 2026): GitHub Release with four attested
+      archives, the shell installer, `stasmarkin/homebrew-tap` with the formula,
+      and `nyetdb` on crates.io. The npm wrapper is wired into dist as
+      `@stasmarkin/nyetdb` and ships from v0.3.0 on. `v0.1.0` was tagged and
+      never announced — dist pointed the Apple builds at GitHub's retired
+      `macos-13` image, which matches no runner and queues rather than fails
+      (see docs/DEV.md, release process)
 - [ ] README: the safety story + a token benchmark against MCP servers
       (material for HN). The safety story is written in full (Status,
       Security, the read-only layers, warning codes, the audit log); the token

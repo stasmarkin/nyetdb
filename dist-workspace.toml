@@ -17,11 +17,21 @@ ci = "github"
 # release.yml (scoped to the build job, not workflow-wide) — see docs/DEV.md.
 github-attestations = true
 # The installers to generate for each app
-installers = ["shell", "homebrew"]
+installers = ["shell", "homebrew", "npm"]
 # The Homebrew tap to publish the formula to (repo NOT created/pushed here — a
 # release act; needs a HOMEBREW_TAP_TOKEN secret with write access to the tap).
 tap = "stasmarkin/homebrew-tap"
 publish-jobs = ["homebrew"]
+# The npm package dist generates is scoped because it has to be: npm refuses
+# both `nyetdb` (too close to `nedb`) and `nyet` (to `nyc`, `net`, `next` and
+# four more) under its name-similarity rule — a registry rule, not a claim
+# someone else holds, so those names are open to nobody.
+# NOT in publish-jobs: that job is what forces `dist generate`, and regenerating
+# release.yml costs the four hardenings a hand re-apply (see docs/DEV.md) plus
+# an npm automation token living in CI. The package rides along as a release
+# artifact instead, and a human runs `npm publish` on it — the same "a release
+# is a deliberate act" line the Homebrew tap repo sits on.
+npm-scope = "@stasmarkin"
 # Target platforms to build apps for (Rust target-triple syntax). Unix only for
 # v0.1: SSH tunnels and several tests are unix-only, so Windows is not released
 # yet (documented in the README install section).

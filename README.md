@@ -74,9 +74,8 @@ with a password over TLS (see the connection sections below).
 
 ## Install
 
-Once a `v*` release is published, install a prebuilt binary with the shell
-installer or Homebrew (both produced by the release pipeline — see
-[docs/DEV.md](docs/DEV.md)):
+Install a prebuilt binary with the shell installer or Homebrew (both produced
+by the release pipeline — see [docs/DEV.md](docs/DEV.md)):
 
 ```sh
 # shell installer (macOS/Linux, x86_64 and aarch64)
@@ -86,10 +85,28 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/stasmarkin/nyetdb/relea
 brew install stasmarkin/tap/nyetdb
 ```
 
-Or build from source (any platform with a Rust toolchain):
+Both of these pin the archive by SHA-256 and install a binary carrying a
+GitHub build-provenance attestation, which you can check yourself:
 
 ```sh
-cargo install --path .
+gh attestation verify nyetdb-aarch64-apple-darwin.tar.xz --repo stasmarkin/nyetdb
+```
+
+There is also an npm wrapper, for machines that have Node and no Rust. It is
+scoped because npm's name-similarity rule refuses both `nyetdb` and `nyet` to
+everyone, and it is the weakest of the three: its `postinstall` downloads the
+platform archive over HTTPS at install time **without verifying a checksum**.
+Prefer the installer or Homebrew where you have the choice.
+
+```sh
+npm install -g @stasmarkin/nyetdb
+```
+
+Or from crates.io / source, on any platform with a Rust toolchain:
+
+```sh
+cargo install nyetdb        # from crates.io
+cargo install --path .      # from a checkout
 ```
 
 The minimum supported Rust version (MSRV) is stated as `rust-version` in

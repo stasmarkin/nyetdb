@@ -144,7 +144,9 @@ and docs:
 9. ~~`nyet doctor` — honest diagnostics of the setup (UX-7).~~ **done**
 10. ~~`nyet agent-setup` — generating a Claude Code skill (SKILL.md) for the agent (UX-3).~~ **done**
 11. ~~The audit log (UX-8).~~ **done**
-12. An npm wrapper via dist (closes the npm-name backlog item).
+12. ~~An npm wrapper via dist.~~ **done** — `@stasmarkin/nyetdb`, scoped because
+    npm's similarity rule leaves the short names to nobody; there was no name
+    to close a backlog on.
 13. The Redis engine (`COMMAND INFO`).
 14. The MongoDB engine (its own command allowlist).
 15. The ClickHouse engine (`readonly=1`).

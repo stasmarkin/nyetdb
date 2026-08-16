@@ -3634,14 +3634,33 @@ table) and the generated pipeline in `.github/workflows/release.yml`.
 - **Artifacts** (`dist plan` to preview): per-target `.tar.xz` for
   `{aarch64,x86_64}-{apple-darwin,unknown-linux-gnu}` (each with the `nyet`
   binary + `LICENSE-*` + `README.md` + a checksum), a shell installer
-  (`nyetdb-installer.sh`, `curl | sh`), and a Homebrew formula (`nyetdb.rb`).
+  (`nyetdb-installer.sh`, `curl | sh`), a Homebrew formula (`nyetdb.rb`) and an
+  npm package (`nyetdb-npm-package.tar.gz`).
   Windows is intentionally not released (SSH tunnels / some tests are unix-only).
+- **Runners:** dist 0.28 assigns `macos-13` to both Apple targets, and GitHub
+  retired that image in December 2025. A retired label does not fail — it
+  matches no runner, so those jobs queue until they time out and the pipeline
+  announces nothing (this ate the first `v0.1.0` tag). `[dist.github-custom-runners]`
+  overrides them to `macos-14` (aarch64) and `macos-15-intel` (x86_64, the last
+  x86_64 macOS image Actions offers — through August 2027). Check this whenever
+  dist is upgraded, and again before Fall 2027.
 - **Homebrew tap:** `tap = "stasmarkin/homebrew-tap"`, `publish-jobs = ["homebrew"]`.
   The tap repo is **not** created or pushed by this step (a release act); the
   publish job needs a `HOMEBREW_TAP_TOKEN` repo secret with write access to the tap.
-- **npm wrapper:** placeholders live in `packaging/npm/` but are **not** wired
-  into `dist` yet (backlog; ROADMAP v0.3 item 12) — connecting dist's npm
-  installer would generate its own package and needs an npm scope/token.
+- **npm wrapper:** `installers` includes `npm`, `npm-scope = "@stasmarkin"` —
+  the package is `@stasmarkin/nyetdb`. Scoped by necessity: npm's
+  name-similarity rule refuses `nyetdb` (too close to `nedb`) and `nyet` (to
+  `nyc`, `net`, `next` and four more) — a registry rule that leaves those names
+  open to nobody, so there is nothing to reserve. npm is deliberately **not** in
+  `publish-jobs`: that job is what forces a `dist generate`, which costs the four
+  hardenings below a hand re-apply and puts an npm automation token in CI. A
+  human publishes instead, from the artifact the release already built:
+  `npm publish --registry https://registry.npmjs.org --access public <tarball>`
+  (npm's browser 2FA works interactively; it does not from CI).
+  Note what this channel gives up: dist's package downloads the platform
+  archive in a `postinstall` and verifies **no checksum** — unlike the shell
+  installer and the formula, both of which pin a SHA-256. Said plainly in the
+  README's install section.
 
 Regenerate the workflow after editing `[dist]` config: `dist init --yes` (writes
 config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
@@ -3683,16 +3702,28 @@ config + `[profile.dist]`) then `dist generate` (rewrites `release.yml`).
 
 **What a human does to cut a release (not automated, on purpose):**
 
-1. **Bump `version` in `Cargo.toml` to the release version (e.g. `0.1.0`)
-   *before* tagging** and update `Cargo.lock`; commit. dist requires the package
-   version to equal the tag version — a tag `v0.1.0` on a `0.0.1` `Cargo.toml`
-   fails the `plan` job. *(nyet ships at `0.0.1`; the `0.1.0` bump is the release
-   act — do not bump it ahead of time.)*
-2. `git tag v0.1.0 && git push origin v0.1.0`.
+1. **Bump `version` in `Cargo.toml` *before* tagging** and update `Cargo.lock`;
+   commit. dist requires the package version to equal the tag version — a tag
+   `v0.3.0` on a `0.2.0` `Cargo.toml` fails the `plan` job before anything is
+   built. A published version is spent: crates.io never takes it twice, so the
+   bump is the release act and belongs to the release, not to the work before it.
+2. `git tag v0.3.0 && git push origin v0.3.0` — on a commit whose CI is green.
+   `main` is protected but `enforce_admins` is off, so an admin push lands
+   before the checks run; tag what has already passed them.
 3. The `release.yml` pipeline builds the artifacts, creates the GitHub Release,
    and (with `HOMEBREW_TAP_TOKEN` set) opens/updates the formula in the tap.
-4. First release only: create the `stasmarkin/homebrew-tap` repo and add the
-   `HOMEBREW_TAP_TOKEN` secret; publish crates.io / npm separately if desired.
+4. **crates.io:** `cargo publish --locked` from the tagged commit, once the
+   pipeline is green. Not automated and not first: the tag can be re-cut, a
+   crates.io version cannot be taken back — `yank` hides a version from
+   resolution and deletes nothing.
+5. **npm:** download `nyetdb-npm-package.tar.gz` from the Release and
+   `npm publish --registry https://registry.npmjs.org --access public` it. The
+   explicit registry is not decoration: an `~/.npmrc` pointing at a company
+   registry will otherwise take a personal package there without asking.
+6. First release only (done for v0.2.0): create the `stasmarkin/homebrew-tap`
+   repo **with an initial commit** — the publish job checks it out, and a repo
+   with no commits fails that step — and add the `HOMEBREW_TAP_TOKEN` secret
+   (fine-grained PAT, Contents: read and write, that repo only).
 
 ## Error codes (closed list, part of the contract)
 
