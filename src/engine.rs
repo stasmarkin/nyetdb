@@ -857,7 +857,7 @@ async fn sqlite_columns(
             // As declared: SQLite's rowid-alias PRIMARY KEY (`id INTEGER
             // PRIMARY KEY`) carries no NOT NULL, so it reads back nullable
             // here — build_table normalizes a pk column to false so the three
-            // engines agree (see docs/DEV.md).
+            // engines agree (see docs/dev/DEV.md).
             nullable: notnull == 0,
             pk: false,
             unique: false,
@@ -1003,7 +1003,7 @@ pub struct Postgres {
     /// columns (only the oid+attnum are filled in). Preparing the statement
     /// FIRST resolves the names and caches them on the connection, so the
     /// following fetch reports `Table(table, column)` — verified against
-    /// postgres:16-alpine, see docs/DEV.md.
+    /// postgres:16-alpine, see docs/dev/DEV.md.
     pub resolve_column_origins: bool,
 }
 
@@ -4611,7 +4611,7 @@ mod tests {
     }
 
     /// The two failure modes of a guarded EXPLAIN are NOT the same, and the
-    /// difference is the whole fail-open/fail-closed rule (docs/DEV.md): a
+    /// difference is the whole fail-open/fail-closed rule (docs/dev/DEV.md): a
     /// database that will not plan the statement is fail OPEN (the agent cannot
     /// summon that on demand, and the query would often work), while planning
     /// that outruns its budget is fail CLOSED (planning time IS

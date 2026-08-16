@@ -1,5 +1,5 @@
 # Golden corpus — legitimate reads that must pass (MySQL/MariaDB dialect).
-# Dialect defaults to `mysql` from the filename prefix (see docs/DEV.md).
+# Dialect defaults to `mysql` from the filename prefix (see docs/dev/DEV.md).
 # Format: one case per `- query:` line.
 
 - query: SELECT 1

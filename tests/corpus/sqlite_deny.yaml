@@ -163,7 +163,7 @@
   verdict: deny
   reason: LOCKING_CLAUSE
 
-# --- function denylist (DESIGN §3 step 7; rationale in docs/DEV.md) ---
+# --- function denylist (DESIGN §3 step 7; rationale in docs/dev/DEV.md) ---
 - query: SELECT load_extension('/tmp/evil.so')
   verdict: deny
   reason: DENIED_FUNCTION

@@ -1,5 +1,5 @@
 # Golden corpus — legitimate reads that must pass (SQLite dialect).
-# Format: docs/DEV.md ("Validator corpus"). One case per `- query:` line.
+# Format: docs/dev/DEV.md ("Validator corpus"). One case per `- query:` line.
 
 - query: SELECT 1
   verdict: allow

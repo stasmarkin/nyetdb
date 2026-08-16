@@ -1921,14 +1921,16 @@ fn read_only_role_hint(engine: EngineKind) -> String {
              GRANT USAGE ON SCHEMA public TO nyet_ro;\n\
              GRANT SELECT ON ALL TABLES IN SCHEMA public TO nyet_ro;\n\
              ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO nyet_ro;\n\
-             (see the README layer-3 recipe)"
+             (the layer-3 recipes: \
+             https://github.com/stasmarkin/nyetdb/blob/main/docs/ENGINES.md)"
         }
         EngineKind::Mysql => {
             "create a SELECT-only user and point the url at it:\n\
              CREATE USER 'nyet_ro'@'%' IDENTIFIED BY '...';\n\
              GRANT SELECT ON app.* TO 'nyet_ro'@'%';\n\
              FLUSH PRIVILEGES;\n\
-             (see the README layer-3 recipe)"
+             (the layer-3 recipes: \
+             https://github.com/stasmarkin/nyetdb/blob/main/docs/ENGINES.md)"
         }
         EngineKind::Redis => {
             "give the account an ACL that cannot write, and point the url at it:\n\
@@ -1936,14 +1938,16 @@ fn read_only_role_hint(engine: EngineKind) -> String {
              +command|info +info\n\
              (or point the connection at a REPLICA, where replica-read-only refuses writes for \
              every account at once — Redis has no read-only session, so layer 3 is the only \
-             layer under nyet's own; see the README)"
+             layer under nyet's own; see \
+             https://github.com/stasmarkin/nyetdb/blob/main/docs/ENGINES.md)"
         }
         EngineKind::Clickhouse => {
             "create a SELECT-only account WITH a read-only settings profile — ClickHouse needs \
              both, and they answer different questions:\n\
              CREATE USER nyet_ro IDENTIFIED BY '...' SETTINGS readonly = 1;\n\
              GRANT SELECT ON app.* TO nyet_ro;\n\
-             (see the README layer-3 recipe)"
+             (the layer-3 recipes: \
+             https://github.com/stasmarkin/nyetdb/blob/main/docs/ENGINES.md)"
         }
         // Never reached: MongoDB answers through `mongo_grants_check`, which
         // carries its own recipe, and SQLite short-circuits to `na` above.
@@ -1958,7 +1962,8 @@ fn not_superuser_hint(engine: EngineKind) -> String {
     match engine {
         EngineKind::Postgres => {
             "use a dedicated NOSUPERUSER role with only the SELECT grants the agent needs \
-             (see the read-only role recipe in the README), not a superuser"
+             (see the read-only role recipes at \
+             https://github.com/stasmarkin/nyetdb/blob/main/docs/ENGINES.md), not a superuser"
         }
         EngineKind::Mysql => {
             "grant only SELECT on the specific database(s) the agent needs; do not use an \

@@ -1,5 +1,5 @@
 # Golden corpus — statements that must be ALLOWED (ClickHouse dialect).
-# Dialect defaults to `clickhouse` from the filename prefix (see docs/DEV.md).
+# Dialect defaults to `clickhouse` from the filename prefix (see docs/dev/DEV.md).
 #
 # This file is half the specification. The other half is what nyet does NOT
 # swallow: a denylist that ate ClickHouse's introspection would push people to

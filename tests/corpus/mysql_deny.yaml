@@ -1,5 +1,5 @@
 # Golden corpus — statements that must be denied (MySQL/MariaDB dialect).
-# Dialect defaults to `mysql` from the filename prefix (see docs/DEV.md).
+# Dialect defaults to `mysql` from the filename prefix (see docs/dev/DEV.md).
 # reason is from the closed list: PARSE_FAILED | MULTI_STATEMENT |
 # WRITE_OPERATION | TXN_CONTROL | LOCKING_CLAUSE | DENIED_FUNCTION.
 
@@ -90,7 +90,7 @@
   verdict: deny
   reason: WRITE_OPERATION
 
-# --- function denylist (rationale in docs/DEV.md) ---
+# --- function denylist (rationale in docs/dev/DEV.md) ---
 - query: SELECT sleep(10)
   verdict: deny
   reason: DENIED_FUNCTION

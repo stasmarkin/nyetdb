@@ -18,7 +18,7 @@
 //!    list we wrote.
 //!
 //! There is no layer 2 here (MongoDB has no read-only session — see
-//! docs/DEV.md), so this module is the only thing between the agent and the
+//! docs/dev/DEV.md), so this module is the only thing between the agent and the
 //! server other than the credentials' own privileges (layer 3).
 
 /// Reading the server's METADATA replies (schema/explain/doctor). Split out on
@@ -168,7 +168,7 @@ const ALLOWED_CHAIN: &[&str] = &["limit", "skip", "sort", "toArray"];
 /// Aggregation pipeline stages that only READ. Sorted — `is_allowed` binary
 /// searches, and `lists_are_sorted` pins it.
 ///
-/// Deliberately absent, each for a stated reason (docs/DEV.md):
+/// Deliberately absent, each for a stated reason (docs/dev/DEV.md):
 /// `$out`/`$merge` (write), `$where`/`$function`/`$accumulator` (server JS),
 /// `$changeStream` (an unbounded cursor that would hang the CLI),
 /// `$search`/`$vectorSearch` (Atlas-only sub-languages nyet cannot classify),

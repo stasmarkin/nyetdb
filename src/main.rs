@@ -1791,7 +1791,7 @@ fn run_attempt(
     };
     // The guardrail was on but reached no verdict — the database would
     // not plan the statement (no estimate at all), or the plan carried
-    // no number it could judge. Fail open by design (see docs/DEV.md),
+    // no number it could judge. Fail open by design (see docs/dev/DEV.md),
     // but never silently: the timeout and the row limit are what is left.
     if guardrail.plans()
         && estimate.is_none_or(|e| guardrail.check(&e) == guardrail::Check::NoEstimate)
@@ -3581,7 +3581,9 @@ fn config_failure(e: config::ConfigError) -> Failure {
     let (message, hint) = match e {
         config::ConfigError::Invalid(msg) => (
             format!("the config file is invalid: {msg}"),
-            "fix the config file; see README for a full annotated example".to_string(),
+            "fix the config file; there is a full annotated example at \
+             https://github.com/stasmarkin/nyetdb/blob/main/docs/GETTING-STARTED.md"
+                .to_string(),
         ),
         config::ConfigError::MissingEnvVar(name) => (
             format!(
@@ -3661,7 +3663,8 @@ fn config_failure(e: config::ConfigError) -> Failure {
             format!(
                 "set [connections.{alias}.guardrail] mode to \"cost\", \"rows\" or \"off\" \
                  (which modes an engine supports depends on what its planner publishes — \
-                 see the README), with max_cost / max_rows as positive numbers"
+                 see https://github.com/stasmarkin/nyetdb/blob/main/docs/COMMANDS.md), \
+                 with max_cost / max_rows as positive numbers"
             ),
         ),
         config::ConfigError::SshInvalid { alias, message } => (
@@ -3749,7 +3752,8 @@ fn read_config(path: &Path) -> Result<String, Failure> {
             std::io::ErrorKind::NotFound => (
                 "the config file does not exist".to_string(),
                 "ask the human who owns this setup to create a nyet config \
-                 (the nyet README has an annotated example)"
+                 (an annotated example: \
+                 https://github.com/stasmarkin/nyetdb/blob/main/docs/GETTING-STARTED.md)"
                     .to_string(),
             ),
             std::io::ErrorKind::InvalidData => (

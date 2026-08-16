@@ -73,7 +73,7 @@ impl Mode {
 /// Default cost ceiling (PostgreSQL cost units). Deliberately generous — the
 /// guardrail exists to stop obvious monsters, not to second-guess legitimate
 /// analytics (UX-1: a false refusal is annoying, and a guardrail nobody trusts
-/// gets turned off). See docs/DEV.md for the arithmetic behind the number.
+/// gets turned off). See docs/dev/DEV.md for the arithmetic behind the number.
 pub const DEFAULT_MAX_COST: f64 = 1_000_000.0;
 
 /// Default row ceiling (estimated rows examined / produced). Same spirit.
@@ -96,7 +96,7 @@ pub enum Check {
     /// Over the threshold — do not run it.
     Expensive { value: f64 },
     /// Nothing to compare: the mode is `off`, or the plan carried no usable
-    /// number. Best effort by design — see `docs/DEV.md`.
+    /// number. Best effort by design — see `docs/dev/DEV.md`.
     NoEstimate,
 }
 

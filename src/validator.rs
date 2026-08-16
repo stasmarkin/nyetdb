@@ -578,7 +578,7 @@ fn judge_result_names(
     Ok(mask)
 }
 
-/// Built-in SQLite denylist (rationale in docs/DEV.md). All defense in
+/// Built-in SQLite denylist (rationale in docs/dev/DEV.md). All defense in
 /// depth: nyet's own bundled SQLite ships without extension loading, but
 /// the validator is engine-independent and must hold on any SQLite build.
 const SQLITE_DENIED_FUNCTIONS: &[&str] = &[
@@ -589,7 +589,7 @@ const SQLITE_DENIED_FUNCTIONS: &[&str] = &[
     "edit",           // sqlite3 CLI function: spawns an editor process
 ];
 
-/// Built-in PostgreSQL denylist (DESIGN §3 step 7; rationale in docs/DEV.md):
+/// Built-in PostgreSQL denylist (DESIGN §3 step 7; rationale in docs/dev/DEV.md):
 /// functions that act OUTSIDE the read-only transaction — layer 2 does not
 /// stop them, so the validator is the only guard. Exact names here; the
 /// file-read and dblink families are prefix-matched (see below).
@@ -755,7 +755,7 @@ const POSTGRES_DENIED_FUNCTIONS: &[&str] = &[
 ///   which is pure introspection, the reset half has no legitimate agent use.
 const POSTGRES_DENIED_PREFIXES: &[&str] = &["dblink", "pg_read_", "pg_ls_", "pg_stat_reset"];
 
-/// Built-in MySQL/MariaDB denylist (rationale in docs/DEV.md): functions that
+/// Built-in MySQL/MariaDB denylist (rationale in docs/dev/DEV.md): functions that
 /// act OUTSIDE the read-only transaction (filesystem, connection-tie-up DoS,
 /// UDF code execution), so layer 2 does not stop them — the validator is the
 /// only guard. Config-tunable via `allow_functions` / `deny_functions`.
@@ -2784,7 +2784,7 @@ mod tests {
     }
 
     /// Golden corpus (D6): every yaml file in tests/corpus is the public
-    /// security specification. Format — see docs/DEV.md; parsed here by a
+    /// security specification. Format — see docs/dev/DEV.md; parsed here by a
     /// deliberately tiny line-based reader instead of a yaml dependency (D8).
     #[derive(Debug)]
     struct Case {
